@@ -1,0 +1,56 @@
+use crate::chunk::{Chunk, OpCode};
+
+pub fn disassemble_chunk(chunk: &Chunk, name: &str) {
+    println!("== {} ==", name);
+
+    let mut offset = 0;
+    while offset < chunk.code.len() {
+        offset = disassemble_instruction(chunk, offset);
+    }
+}
+
+pub fn simple_instruction(name: &str, offset: usize) -> usize {
+    println!("{}", name);
+    return offset + 1;
+}
+
+pub fn constant_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+    let constant = chunk.code[offset + 1] as usize;
+    println!(
+        "{:-16} {:4} '{}'",
+        name, constant, chunk.constants[constant]
+    );
+    offset + 2
+}
+
+pub fn constant_long_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+    let index = chunk.code[offset + 1] as usize
+        | ((chunk.code[offset + 2] as usize) << 8)
+        | ((chunk.code[offset + 3] as usize) << 16);
+    println!("{:-16} {:4} '{}'", name, index, chunk.constants[index]);
+    offset + 4 // opcode + 3 bytes
+}
+
+pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
+    print!("{:04} ", offset);
+
+    let line = chunk.get_line(offset);
+    if offset > 0 && line == chunk.get_line(offset - 1) {
+        print!("   | ");
+    } else {
+        print!("{:04} ", line);
+    }
+
+    let instruction = chunk.code[offset];
+    match instruction {
+        x if x == OpCode::Constant as u8 => constant_instruction("OP_CONSTANT", chunk, offset),
+        x if x == OpCode::ConstantLong as u8 => {
+            constant_long_instruction("OP_CONSTANT_LONG", chunk, offset)
+        }
+        x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
+        _ => {
+            println!("Unknown opcode {}", instruction);
+            offset + 1
+        }
+    }
+}

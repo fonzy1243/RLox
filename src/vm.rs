@@ -1,0 +1,88 @@
+use crate::chunk::{Chunk, OpCode};
+use crate::value::Value;
+
+#[cfg(feature = "debug_trace_execution")]
+use crate::debug::disassemble_instruction;
+
+macro_rules! read_byte {
+    ($vm:expr, $chunk:expr) => {{
+        let byte = $chunk.code[$vm.ip];
+        $vm.ip += 1;
+        byte
+    }};
+}
+
+macro_rules! read_constant {
+    ($vm:expr, $chunk:expr) => {
+        $chunk.constants[read_byte!($vm, $chunk) as usize]
+    };
+}
+
+pub struct VM<'a> {
+    chunk: Option<&'a Chunk>,
+    ip: usize,
+    stack: Vec<Value>,
+}
+
+pub enum InterpretResult {
+    Ok,
+    CompileError,
+    RuntimeError,
+}
+
+impl<'a> VM<'a> {
+    pub fn new() -> Self {
+        VM {
+            chunk: None,
+            ip: 0,
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn interpret(&mut self, chunk: &'a Chunk) -> InterpretResult {
+        self.chunk = Some(chunk);
+        self.ip = 0;
+        run(self)
+    }
+
+    pub fn push(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
+    pub fn pop(&mut self) -> Value {
+        self.stack.pop().expect("Stack underflow")
+    }
+}
+
+fn run(vm: &mut VM) -> InterpretResult {
+    let chunk = vm.chunk.unwrap();
+
+    loop {
+        #[cfg(feature = "debug_trace_execution")]
+        {
+            print!("          ");
+            for value in &vm.stack {
+                print!("[ {} ]", value);
+            }
+            println!();
+            disassemble_instruction(chunk, vm.ip);
+        }
+
+        let instruction = read_byte!(vm, chunk);
+
+        match instruction {
+            x if x == OpCode::Constant as u8 => {
+                let constant = read_constant!(vm, chunk);
+                vm.push(constant);
+            }
+            x if x == OpCode::Return as u8 => {
+                println!("{}", vm.pop());
+                return InterpretResult::Ok;
+            }
+            _ => {
+                println!("Unknown opcode {}", instruction);
+                return InterpretResult::RuntimeError;
+            }
+        }
+    }
+}
