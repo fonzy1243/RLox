@@ -1,4 +1,5 @@
 use crate::chunk::{Chunk, OpCode};
+use crate::compiler::compile;
 use crate::value::Value;
 
 #[cfg(feature = "debug_trace_execution")]
@@ -47,10 +48,9 @@ impl<'a> VM<'a> {
         }
     }
 
-    pub fn interpret(&mut self, chunk: &'a Chunk) -> InterpretResult {
-        self.chunk = Some(chunk);
-        self.ip = 0;
-        run(self)
+    pub fn interpret(&mut self, source: &str) -> InterpretResult {
+        compile(source);
+        InterpretResult::Ok
     }
 
     pub fn push(&mut self, value: Value) {
