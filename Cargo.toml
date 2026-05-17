@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 
 [features]
+debug_print_code = []
 debug_trace_execution = []
