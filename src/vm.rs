@@ -18,6 +18,14 @@ macro_rules! read_constant {
     };
 }
 
+macro_rules! binary_op {
+    ($vm:expr, $op:tt) => {{
+        let b = $vm.pop();
+        let a = $vm.pop();
+        $vm.push(a $op b);
+    }};
+}
+
 pub struct VM<'a> {
     chunk: Option<&'a Chunk>,
     ip: usize,
@@ -74,6 +82,14 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Constant as u8 => {
                 let constant = read_constant!(vm, chunk);
                 vm.push(constant);
+            }
+            x if x == OpCode::Add as u8 => binary_op!(vm, +),
+            x if x == OpCode::Subtract as u8 => binary_op!(vm, -),
+            x if x == OpCode::Multiply as u8 => binary_op!(vm, *),
+            x if x == OpCode::Divide as u8 => binary_op!(vm, /),
+            x if x == OpCode::Negate as u8 => {
+                let value = vm.pop();
+                vm.push(-value);
             }
             x if x == OpCode::Return as u8 => {
                 println!("{}", vm.pop());

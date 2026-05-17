@@ -5,6 +5,11 @@ use crate::value::Value;
 pub enum OpCode {
     Constant,
     ConstantLong,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Negate,
     Return,
 }
 
