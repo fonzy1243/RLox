@@ -70,7 +70,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn is_alpha(c: char) -> bool {
-        c.is_ascii_alphabetic()
+        c.is_ascii_alphabetic() || c == '_'
     }
 
     fn is_digit(c: char) -> bool {
@@ -78,6 +78,7 @@ impl<'a> Scanner<'a> {
     }
 
     pub fn scan_token(&mut self) -> Token<'a> {
+        self.skip_whitespace();
         self.start = self.current;
 
         if self.is_at_end() {
@@ -85,6 +86,10 @@ impl<'a> Scanner<'a> {
         }
 
         let c = self.advance();
+
+        if Self::is_alpha(c) {
+            return self.identifier();
+        }
 
         if Self::is_digit(c) {
             return self.number();
@@ -171,7 +176,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn make_token(&self, token_type: TokenType) -> Token<'a> {
-        let length = self.current.len() - self.start.len();
+        let length = self.start.len() - self.current.len();
         Token {
             token_type,
             start: self.start,
