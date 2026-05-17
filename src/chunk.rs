@@ -5,10 +5,17 @@ use crate::value::Value;
 pub enum OpCode {
     Constant,
     ConstantLong,
+    Nil,
+    True,
+    False,
+    Equal,
+    Greater,
+    Less,
     Add,
     Subtract,
     Multiply,
     Divide,
+    Not,
     Negate,
     Return,
 }

@@ -47,10 +47,17 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::ConstantLong as u8 => {
             constant_long_instruction("OP_CONSTANT_LONG", chunk, offset)
         }
+        x if x == OpCode::Nil as u8 => simple_instruction("OP_NIL", offset),
+        x if x == OpCode::True as u8 => simple_instruction("OP_TRUE", offset),
+        x if x == OpCode::False as u8 => simple_instruction("OP_FALSE", offset),
+        x if x == OpCode::Equal as u8 => simple_instruction("OP_EQUAL", offset),
+        x if x == OpCode::Greater as u8 => simple_instruction("OP_GREATER", offset),
+        x if x == OpCode::Less as u8 => simple_instruction("OP_LESS", offset),
         x if x == OpCode::Add as u8 => simple_instruction("OP_ADD", offset),
         x if x == OpCode::Subtract as u8 => simple_instruction("OP_SUBTRACT", offset),
         x if x == OpCode::Multiply as u8 => simple_instruction("OP_MULTIPLY", offset),
         x if x == OpCode::Divide as u8 => simple_instruction("OP_DIVIDE", offset),
+        x if x == OpCode::Not as u8 => simple_instruction("OP_NOT", offset),
         x if x == OpCode::Negate as u8 => simple_instruction("OP_NEGATE", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {

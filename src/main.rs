@@ -14,11 +14,11 @@ use std::fs;
 use std::io::{self, Write};
 
 fn repl(vm: &mut VM) {
-    let mut line = String::new();
-
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
+
+        let mut line = String::new();
 
         if io::stdin().read_line(&mut line).unwrap() == 0 {
             println!();
