@@ -88,8 +88,8 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Multiply as u8 => binary_op!(vm, *),
             x if x == OpCode::Divide as u8 => binary_op!(vm, /),
             x if x == OpCode::Negate as u8 => {
-                let value = vm.pop();
-                vm.push(-value);
+                let top = vm.stack.last_mut().expect("Stack underflow");
+                *top = -*top;
             }
             x if x == OpCode::Return as u8 => {
                 println!("{}", vm.pop());
