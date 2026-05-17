@@ -21,8 +21,8 @@ macro_rules! read_constant {
 macro_rules! binary_op {
     ($vm:expr, $op:tt) => {{
         let b = $vm.pop();
-        let a = $vm.pop();
-        $vm.push(a $op b);
+        let top = $vm.stack.last_mut().expect("Stack underflow");
+        *top = *top $op b;
     }};
 }
 
