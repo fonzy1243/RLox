@@ -1,8 +1,10 @@
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
 use crate::debug::disassemble_chunk;
+use crate::object::{Obj, copy_string};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
+use crate::vm::VM;
 
 struct Parser<'a> {
     current: Token<'a>,
@@ -27,7 +29,7 @@ enum Precedence {
     Primary,
 }
 
-type ParseFn = for<'a> fn(&mut Parser<'a>, &mut Scanner<'a>, &mut Chunk);
+type ParseFn = for<'a> fn(&mut Parser<'a>, &mut Scanner<'a>, &mut Chunk, &mut VM);
 
 struct ParseRule {
     prefix: Option<ParseFn>,
@@ -158,7 +160,7 @@ static RULES: &[ParseRule] = &[
     },
     // String
     ParseRule {
-        prefix: None,
+        prefix: Some(string),
         infix: None,
         precedence: Precedence::None,
     },
@@ -310,7 +312,7 @@ fn error_at_current(parser: &mut Parser, message: &str) {
     error_at(parser, &token, message);
 }
 
-pub fn compile(source: &str, chunk: &mut Chunk) -> bool {
+pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
     let mut scanner = Scanner::new(source);
     let dummy = Token {
         token_type: TokenType::Eof,
@@ -326,7 +328,7 @@ pub fn compile(source: &str, chunk: &mut Chunk) -> bool {
     };
 
     advance(&mut parser, &mut scanner);
-    expression(&mut parser, &mut scanner, chunk);
+    expression(&mut parser, &mut scanner, chunk, vm);
     consume(
         &mut parser,
         &mut scanner,
@@ -351,8 +353,13 @@ fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
     }
 }
 
-fn expression<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk) {
-    parse_precedence(parser, scanner, chunk, Precedence::Assignment);
+fn expression<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    parse_precedence(parser, scanner, chunk, Precedence::Assignment, vm);
 }
 
 fn consume<'a>(
@@ -407,13 +414,13 @@ fn end_compiler(parser: &Parser, chunk: &mut Chunk) {
     }
 }
 
-fn binary<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk) {
+fn binary<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk, vm: &mut VM) {
     let operator_type = parser.previous.token_type;
 
     let rule = get_rule(operator_type);
     let next_precedence =
         unsafe { std::mem::transmute::<u8, Precedence>(rule.precedence as u8 + 1) };
-    parse_precedence(parser, scanner, chunk, next_precedence);
+    parse_precedence(parser, scanner, chunk, next_precedence, vm);
 
     match operator_type {
         TokenType::BangEqual => emit_bytes(parser, chunk, OpCode::Equal as u8, OpCode::Not as u8),
@@ -430,7 +437,7 @@ fn binary<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Ch
     }
 }
 
-fn literal<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk) {
+fn literal<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk, _: &mut VM) {
     match parser.previous.token_type {
         TokenType::False => emit_byte(parser, chunk, OpCode::False as u8),
         TokenType::Nil => emit_byte(parser, chunk, OpCode::Nil as u8),
@@ -439,8 +446,13 @@ fn literal<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk) 
     }
 }
 
-fn grouping<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk) {
-    expression(parser, scanner, chunk);
+fn grouping<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    expression(parser, scanner, chunk, vm);
     consume(
         parser,
         scanner,
@@ -449,17 +461,23 @@ fn grouping<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut 
     );
 }
 
-fn number<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk) {
+fn number<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk, _: &mut VM) {
     let value: f64 = parser.previous.start[..parser.previous.length]
         .parse()
         .unwrap();
     emit_constant(parser, chunk, Value::Number(value));
 }
 
-fn unary<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk) {
+fn string<'a>(parser: &mut Parser<'a>, _: &mut Scanner<'a>, chunk: &mut Chunk, vm: &mut VM) {
+    let s = &parser.previous.start[1..parser.previous.length - 1];
+    let ptr = copy_string(vm, s);
+    emit_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
+}
+
+fn unary<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk, vm: &mut VM) {
     let operator_type = parser.previous.token_type;
 
-    parse_precedence(parser, scanner, chunk, Precedence::Unary);
+    parse_precedence(parser, scanner, chunk, Precedence::Unary, vm);
 
     match operator_type {
         TokenType::Bang => emit_byte(parser, chunk, OpCode::Not as u8),
@@ -473,6 +491,7 @@ fn parse_precedence<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     precedence: Precedence,
+    vm: &mut VM,
 ) {
     advance(parser, scanner);
 
@@ -482,14 +501,14 @@ fn parse_precedence<'a>(
             error(parser, "Expect expression.");
             return;
         }
-        Some(prefix_fn) => prefix_fn(parser, scanner, chunk),
+        Some(prefix_fn) => prefix_fn(parser, scanner, chunk, vm),
     }
 
     while precedence <= get_rule(parser.current.token_type).precedence {
         advance(parser, scanner);
         let infix_rule = get_rule(parser.previous.token_type).infix;
         if let Some(infix_fn) = infix_rule {
-            infix_fn(parser, scanner, chunk);
+            infix_fn(parser, scanner, chunk, vm);
         }
     }
 }
