@@ -1,6 +1,6 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
-use crate::object::{Obj, allocate_string, free_object};
+use crate::object::{Obj, ObjString, ObjType, allocate_string, free_object};
 use crate::value::{Value, values_equal};
 
 #[cfg(feature = "debug_trace_execution")]
@@ -86,10 +86,33 @@ impl VM {
 
         let b = b_val.as_cstring();
         let a = a_val.as_cstring();
+        let len = a.len() + b.len();
 
-        let new_string = format!("{}{}", a, b);
+        let layout = std::alloc::Layout::from_size_align(
+            std::mem::size_of::<crate::object::ObjString>() + len,
+            std::mem::align_of::<crate::object::ObjString>(),
+        )
+        .unwrap();
 
-        let result_ptr = allocate_string(self, new_string);
+        let result_ptr = unsafe {
+            let ptr = std::alloc::alloc(layout) as *mut crate::object::ObjString;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+
+            (*ptr).obj = Obj {
+                obj_type: ObjType::String,
+                next: self.objects,
+            };
+            (*ptr).length = len;
+            self.objects = ptr as *mut Obj;
+
+            let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
+            std::ptr::copy_nonoverlapping(a.as_ptr(), chars_ptr, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), chars_ptr.add(a.len()), b.len());
+
+            ptr
+        };
 
         self.push(Value::Obj(result_ptr as *mut Obj));
     }

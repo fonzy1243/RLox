@@ -66,7 +66,7 @@ impl Value {
         unsafe { &*(self.as_obj() as *const ObjString) }
     }
     pub fn as_cstring(&self) -> &str {
-        &self.as_string().value
+        ObjString::as_str(self.as_obj() as *const ObjString)
     }
 }
 
