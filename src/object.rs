@@ -3,6 +3,7 @@ use std::{
     fmt,
 };
 
+use crate::value::Value;
 use crate::vm::VM;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,6 +22,7 @@ pub struct Obj {
 pub struct ObjString {
     pub obj: Obj,
     pub length: usize,
+    pub hash: u32,
 }
 
 impl Obj {
@@ -65,7 +67,7 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     ptr
 }
 
-pub fn allocate_string(vm: &mut VM, chars: &str) -> *mut ObjString {
+pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
     let len = chars.len();
 
     let layout = Layout::from_size_align(
@@ -85,6 +87,7 @@ pub fn allocate_string(vm: &mut VM, chars: &str) -> *mut ObjString {
             next: vm.objects,
         };
         (*ptr).length = len;
+        (*ptr).hash = hash;
         vm.objects = ptr as *mut Obj;
 
         let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
@@ -94,8 +97,37 @@ pub fn allocate_string(vm: &mut VM, chars: &str) -> *mut ObjString {
     }
 }
 
+fn hash_string(key: &str) -> u32 {
+    let mut hash = 2166136261u32;
+    for byte in key.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
 pub fn copy_string(vm: &mut VM, chars: &str) -> *mut ObjString {
-    allocate_string(vm, chars)
+    let hash = hash_string(chars);
+
+    if let Some(interned) = vm.strings.find_string(chars, hash) {
+        return interned;
+    }
+
+    let result = allocate_string(vm, chars, hash);
+    vm.strings.set(result, Value::Nil);
+    result
+}
+
+pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
+    let hash = hash_string(&chars);
+
+    if let Some(interned) = vm.strings.find_string(&chars, hash) {
+        return interned;
+    }
+
+    let result = allocate_string(vm, &chars, hash);
+    vm.strings.set(result, Value::Nil);
+    result
 }
 
 pub fn free_object(object: *mut Obj) {

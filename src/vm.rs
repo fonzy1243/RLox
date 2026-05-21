@@ -1,6 +1,7 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{Obj, ObjString, ObjType, allocate_string, free_object};
+use crate::table::Table;
 use crate::value::{Value, values_equal};
 
 #[cfg(feature = "debug_trace_execution")]
@@ -37,6 +38,7 @@ pub struct VM {
     ip: usize,
     stack: Vec<Value>,
     pub objects: *mut Obj,
+    pub strings: Table,
 }
 
 pub enum InterpretResult {
@@ -52,6 +54,7 @@ impl VM {
             ip: 0,
             stack: Vec::new(),
             objects: std::ptr::null_mut(),
+            strings: Table::new(),
         }
     }
 
@@ -88,6 +91,12 @@ impl VM {
         let a = a_val.as_cstring();
         let len = a.len() + b.len();
 
+        let mut hash = 2166136261u32;
+        for byte in a.bytes().chain(b.bytes()) {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(16777619);
+        }
+
         let layout = std::alloc::Layout::from_size_align(
             std::mem::size_of::<crate::object::ObjString>() + len,
             std::mem::align_of::<crate::object::ObjString>(),
@@ -105,6 +114,7 @@ impl VM {
                 next: self.objects,
             };
             (*ptr).length = len;
+            (*ptr).hash = hash;
             self.objects = ptr as *mut Obj;
 
             let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());

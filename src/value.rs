@@ -91,13 +91,7 @@ pub fn values_equal(a: Value, b: Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Nil, Value::Nil) => true,
         (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::Obj(_), Value::Obj(_)) => {
-            if a.is_string() && b.is_string() {
-                a.as_cstring() == b.as_cstring()
-            } else {
-                false
-            }
-        }
+        (Value::Obj(a_ptr), Value::Obj(b_ptr)) => a_ptr == b_ptr,
         _ => false,
     }
 }
