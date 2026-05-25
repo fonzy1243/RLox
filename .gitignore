@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+long_test.py
+test.lox
+test.lox
