@@ -158,6 +158,16 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let constant = read_constant!(vm, chunk);
                 vm.push(constant);
             }
+            x if x == OpCode::ConstantLong as u8 => {
+                let lo = read_byte!(vm, chunk) as usize;
+                let mi = read_byte!(vm, chunk) as usize;
+                let hi = read_byte!(vm, chunk) as usize;
+
+                let index = lo | (mi << 8) | (hi << 16);
+
+                let constant = chunk.constants[index];
+                vm.push(constant);
+            }
             x if x == OpCode::Nil as u8 => vm.push(Value::Nil),
             x if x == OpCode::True as u8 => vm.push(Value::Bool(true)),
             x if x == OpCode::False as u8 => vm.push(Value::Bool(false)),

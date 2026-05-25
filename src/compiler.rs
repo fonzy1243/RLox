@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
 use crate::debug::disassemble_chunk;
@@ -48,6 +50,7 @@ struct Compiler<'a> {
     locals: Vec<Local<'a>>,
     local_count: usize,
     scope_depth: i32,
+    locals_map: HashMap<&'a str, Vec<usize>>,
 }
 
 fn current_chunk<'a>(chunk: &'a mut Chunk) -> &'a mut Chunk {
@@ -98,6 +101,7 @@ pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
         locals: vec![dummy_local; u16::MAX as usize],
         local_count: 0,
         scope_depth: 0,
+        locals_map: HashMap::new(),
     };
     let mut parser = Parser {
         current: dummy,
@@ -165,6 +169,18 @@ fn end_scope(parser: &mut Parser, chunk: &mut Chunk) {
         && parser.compiler.locals[parser.compiler.local_count - 1].depth
             > parser.compiler.scope_depth
     {
+        // Remove variable from map
+        let index = parser.compiler.local_count - 1;
+        let local = parser.compiler.locals[index];
+        let name_str = &local.name.start[..local.name.length];
+
+        if let Some(stack) = parser.compiler.locals_map.get_mut(name_str) {
+            stack.pop();
+            if stack.is_empty() {
+                parser.compiler.locals_map.remove(name_str);
+            }
+        }
+
         // Clean off the stack at runtime
         emit_byte(parser, chunk, OpCode::Pop as u8);
         parser.compiler.local_count -= 1;
@@ -328,18 +344,21 @@ fn emit_return(parser: &Parser, chunk: &mut Chunk) {
     emit_byte(parser, chunk, OpCode::Return as u8);
 }
 
-fn make_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) -> u8 {
-    let constant = chunk.add_constant(value);
-    if constant > u8::MAX as usize {
-        error(parser, "Too many constants in one chunk.");
-        return 0;
-    }
-    constant as u8
+fn make_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) -> usize {
+    chunk.add_constant(value)
 }
 
 fn emit_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) {
     let constant = make_constant(parser, chunk, value);
-    emit_bytes(parser, chunk, OpCode::Constant as u8, constant);
+
+    if constant <= 255 {
+        emit_bytes(parser, chunk, OpCode::Constant as u8, constant as u8);
+    } else {
+        emit_byte(parser, chunk, OpCode::ConstantLong as u8);
+        emit_byte(parser, chunk, (constant & 0xFF) as u8);
+        emit_byte(parser, chunk, ((constant >> 8) & 0xFF) as u8);
+        emit_byte(parser, chunk, ((constant >> 16) & 0xFF) as u8);
+    }
 }
 
 fn end_compiler(parser: &Parser, chunk: &mut Chunk) {
@@ -562,7 +581,14 @@ fn identifier_constant<'a>(
 ) -> u8 {
     let s = &name.start[..name.length];
     let ptr = copy_string(vm, s);
-    make_constant(parser, chunk, Value::Obj(ptr as *mut Obj))
+    let constant = make_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
+
+    if constant > u8::MAX as usize {
+        error(parser, "Too many globals in one chunk.");
+        return 0;
+    }
+
+    constant as u8
 }
 
 fn identifiers_equal(a: &Token, b: &Token) -> bool {
@@ -573,14 +599,15 @@ fn identifiers_equal(a: &Token, b: &Token) -> bool {
 }
 
 fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
-    for i in (0..parser.compiler.local_count).rev() {
-        let local = parser.compiler.locals[i];
+    let name_str = &name.start[..name.length];
 
-        if identifiers_equal(name, &local.name) {
+    if let Some(stack) = parser.compiler.locals_map.get(name_str) {
+        if let Some(&index) = stack.last() {
+            let local = parser.compiler.locals[index];
             if local.depth == -1 {
                 error(parser, "Can't read local variable in its own initializer.");
             }
-            return Some(i);
+            return Some(index);
         }
     }
 
@@ -593,9 +620,19 @@ fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
         return;
     }
 
+    let index = parser.compiler.local_count;
     let local = &mut parser.compiler.locals[parser.compiler.local_count];
     local.name = name;
     local.depth = -1;
+
+    let name_str = &name.start[..name.length];
+    parser
+        .compiler
+        .locals_map
+        .entry(name_str)
+        .or_default()
+        .push(index);
+
     parser.compiler.local_count += 1;
 }
 
@@ -605,16 +642,14 @@ fn declare_variable<'a>(parser: &mut Parser<'a>) {
     }
 
     let name = parser.previous;
+    let name_str = &name.start[..name.length];
 
-    for i in (0..parser.compiler.local_count).rev() {
-        let local = parser.compiler.locals[i];
-
-        if local.depth != -1 && local.depth < parser.compiler.scope_depth {
-            break;
-        }
-
-        if identifiers_equal(&name, &local.name) {
-            error(parser, "Already a variable with this name in this scope.");
+    if let Some(stack) = parser.compiler.locals_map.get(name_str) {
+        if let Some(&index) = stack.last() {
+            let local = parser.compiler.locals[index];
+            if local.depth == -1 || local.depth == parser.compiler.scope_depth {
+                error(parser, "Already a variable with this name in this scope.");
+            }
         }
     }
 
