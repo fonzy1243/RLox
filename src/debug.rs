@@ -14,6 +14,12 @@ pub fn simple_instruction(name: &str, offset: usize) -> usize {
     return offset + 1;
 }
 
+pub fn byte_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+    let slot = chunk.code[offset + 1];
+    println!("{:-16} {:4}", name, slot);
+    offset + 2
+}
+
 pub fn constant_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
     let constant = chunk.code[offset + 1] as usize;
     println!(
@@ -59,6 +65,15 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Divide as u8 => simple_instruction("OP_DIVIDE", offset),
         x if x == OpCode::Not as u8 => simple_instruction("OP_NOT", offset),
         x if x == OpCode::Negate as u8 => simple_instruction("OP_NEGATE", offset),
+        x if x == OpCode::Pop as u8 => simple_instruction("OP_POP", offset),
+        x if x == OpCode::GetLocal as u8 => byte_instruction("OP_GET_LOCAL", chunk, offset),
+        x if x == OpCode::SetLocal as u8 => byte_instruction("OP_SET_LOCAL", chunk, offset),
+        x if x == OpCode::GetGlobal as u8 => constant_instruction("OP_GET_GLOBAL", chunk, offset),
+        x if x == OpCode::DefineGlobal as u8 => {
+            constant_instruction("OP_DEFINE_GLOBAL", chunk, offset)
+        }
+        x if x == OpCode::SetGlobal as u8 => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        x if x == OpCode::Print as u8 => simple_instruction("OP_PRINT", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {
             println!("Unknown opcode {}", instruction);

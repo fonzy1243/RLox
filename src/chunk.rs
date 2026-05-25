@@ -1,4 +1,4 @@
-use crate::value::Value;
+use crate::value::{Value, values_equal};
 
 #[derive(Debug)]
 #[repr(u8)]
@@ -8,6 +8,12 @@ pub enum OpCode {
     Nil,
     True,
     False,
+    Pop,
+    GetLocal,
+    SetLocal,
+    GetGlobal,
+    DefineGlobal,
+    SetGlobal,
     Equal,
     Greater,
     Less,
@@ -17,6 +23,7 @@ pub enum OpCode {
     Divide,
     Not,
     Negate,
+    Print,
     Return,
 }
 
@@ -66,6 +73,12 @@ impl Chunk {
     }
 
     pub fn add_constant(&mut self, value: Value) -> usize {
+        for (i, constant) in self.constants.iter().enumerate() {
+            if values_equal(*constant, value) {
+                return i;
+            }
+        }
+
         self.constants.push(value);
         self.constants.len() - 1
     }

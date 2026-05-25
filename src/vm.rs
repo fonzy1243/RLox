@@ -1,6 +1,6 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
-use crate::object::{Obj, ObjString, ObjType, allocate_string, free_object};
+use crate::object::{Obj, ObjString, ObjType, allocate_string, free_object, take_string};
 use crate::table::Table;
 use crate::value::{Value, values_equal};
 
@@ -21,6 +21,13 @@ macro_rules! read_constant {
     };
 }
 
+macro_rules! read_string {
+    ($vm:expr, $chunk:expr) => {{
+        let constant = read_constant!($vm, $chunk);
+        constant.as_obj() as *mut ObjString
+    }};
+}
+
 macro_rules! binary_op {
     ($vm:expr, $wrap:expr, $op:tt) => {{
         if !$vm.peek(0).is_number() || !$vm.peek(1).is_number() {
@@ -39,6 +46,7 @@ pub struct VM {
     stack: Vec<Value>,
     pub objects: *mut Obj,
     pub strings: Table,
+    pub globals: Table,
 }
 
 pub enum InterpretResult {
@@ -55,6 +63,7 @@ impl VM {
             stack: Vec::new(),
             objects: std::ptr::null_mut(),
             strings: Table::new(),
+            globals: Table::new(),
         }
     }
 
@@ -89,42 +98,12 @@ impl VM {
 
         let b = b_val.as_cstring();
         let a = a_val.as_cstring();
-        let len = a.len() + b.len();
 
-        let mut hash = 2166136261u32;
-        for byte in a.bytes().chain(b.bytes()) {
-            hash ^= byte as u32;
-            hash = hash.wrapping_mul(16777619);
-        }
+        let chars = format!("{}{}", a, b);
 
-        let layout = std::alloc::Layout::from_size_align(
-            std::mem::size_of::<crate::object::ObjString>() + len,
-            std::mem::align_of::<crate::object::ObjString>(),
-        )
-        .unwrap();
+        let result = take_string(self, chars);
 
-        let result_ptr = unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut crate::object::ObjString;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-
-            (*ptr).obj = Obj {
-                obj_type: ObjType::String,
-                next: self.objects,
-            };
-            (*ptr).length = len;
-            (*ptr).hash = hash;
-            self.objects = ptr as *mut Obj;
-
-            let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
-            std::ptr::copy_nonoverlapping(a.as_ptr(), chars_ptr, a.len());
-            std::ptr::copy_nonoverlapping(b.as_ptr(), chars_ptr.add(a.len()), b.len());
-
-            ptr
-        };
-
-        self.push(Value::Obj(result_ptr as *mut Obj));
+        self.push(Value::Obj(result as *mut Obj));
     }
 
     fn runtime_error(&mut self, message: &str) {
@@ -208,8 +187,53 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let top = vm.stack.last_mut().expect("Stack underflow");
                 *top = Value::Number(-top.as_number())
             }
-            x if x == OpCode::Return as u8 => {
+            x if x == OpCode::Pop as u8 => {
+                vm.pop();
+            }
+            x if x == OpCode::GetLocal as u8 => {
+                let slot = read_byte!(vm, chunk) as usize;
+                let value = vm.stack[slot];
+                vm.push(value);
+            }
+            x if x == OpCode::SetLocal as u8 => {
+                let slot = read_byte!(vm, chunk) as usize;
+                vm.stack[slot] = vm.peek(0);
+            }
+            x if x == OpCode::GetGlobal as u8 => {
+                let name = read_string!(vm, chunk);
+
+                if let Some(value) = vm.globals.get(name) {
+                    vm.push(value);
+                } else {
+                    let name_str = ObjString::as_str(name);
+                    vm.runtime_error(&format!("Undefined variable '{}'.", name_str));
+                    return InterpretResult::RuntimeError;
+                }
+            }
+            x if x == OpCode::DefineGlobal as u8 => {
+                let name = read_string!(vm, chunk);
+                let value = vm.peek(0);
+
+                vm.globals.set(name, value);
+
+                vm.pop();
+            }
+            x if x == OpCode::SetGlobal as u8 => {
+                let name = read_string!(vm, chunk);
+                let value = vm.peek(0);
+
+                if vm.globals.set(name, value) {
+                    vm.globals.delete(name);
+
+                    let name_str = ObjString::as_str(name);
+                    vm.runtime_error(&format!("Undefined variable '{}'.", name_str));
+                    return InterpretResult::RuntimeError;
+                }
+            }
+            x if x == OpCode::Print as u8 => {
                 println!("{}", vm.pop());
+            }
+            x if x == OpCode::Return as u8 => {
                 return InterpretResult::Ok;
             }
             _ => {

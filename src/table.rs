@@ -70,8 +70,6 @@ impl Table {
             ptr
         };
 
-        self.entries = entries;
-        self.capacity = capacity;
         self.count = 0;
 
         for i in 0..self.capacity {
@@ -83,7 +81,6 @@ impl Table {
                 }
 
                 let dest = find_entry(entries, capacity, (*entry).key);
-
                 (*dest).key = (*entry).key;
                 (*dest).value = (*entry).value;
 
@@ -97,6 +94,9 @@ impl Table {
                 std::alloc::dealloc(self.entries as *mut u8, old_layout);
             }
         }
+
+        self.entries = entries;
+        self.capacity = capacity;
     }
 
     pub fn add_all(&mut self, from: &Table) {
