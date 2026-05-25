@@ -15,6 +15,14 @@ macro_rules! read_byte {
     }};
 }
 
+macro_rules! read_short {
+    ($vm:expr, $chunk:expr) => {{
+        let lo = read_byte!($vm, $chunk) as u16;
+        let hi = read_byte!($vm, $chunk) as u16;
+        (hi << 8) | lo
+    }};
+}
+
 macro_rules! read_constant {
     ($vm:expr, $chunk:expr) => {
         $chunk.constants[read_byte!($vm, $chunk) as usize]
@@ -197,6 +205,15 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::SetLocal as u8 => {
                 let slot = read_byte!(vm, chunk) as usize;
+                vm.stack[slot] = vm.peek(0);
+            }
+            x if x == OpCode::GetLocalLong as u8 => {
+                let slot = read_short!(vm, chunk) as usize;
+                let value = vm.stack[slot];
+                vm.push(value);
+            }
+            x if x == OpCode::SetLocalLong as u8 => {
+                let slot = read_short!(vm, chunk) as usize;
                 vm.stack[slot] = vm.peek(0);
             }
             x if x == OpCode::GetGlobal as u8 => {

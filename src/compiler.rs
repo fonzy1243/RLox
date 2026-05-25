@@ -45,7 +45,7 @@ struct Local<'a> {
 }
 
 struct Compiler<'a> {
-    locals: [Local<'a>; 256],
+    locals: Vec<Local<'a>>,
     local_count: usize,
     scope_depth: i32,
 }
@@ -95,7 +95,7 @@ pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
         depth: -1,
     };
     let compiler = Compiler {
-        locals: [dummy_local; 256],
+        locals: vec![dummy_local; u16::MAX as usize],
         local_count: 0,
         scope_depth: 0,
     };
@@ -457,18 +457,47 @@ fn named_variable<'a>(
     name: Token<'a>,
     can_assign: bool,
 ) {
-    let (arg, get_op, set_op) = if let Some(local_arg) = resolve_local(parser, &name) {
-        (local_arg, OpCode::GetLocal as u8, OpCode::SetLocal as u8)
-    } else {
-        let global_arg = identifier_constant(parser, chunk, vm, name);
-        (global_arg, OpCode::GetGlobal as u8, OpCode::SetGlobal as u8)
-    };
+    let mut is_local = false;
+    let mut arg = 0;
 
-    if can_assign && match_token(parser, scanner, TokenType::Equal) {
-        expression(parser, scanner, chunk, vm);
-        emit_bytes(parser, chunk, OpCode::SetGlobal as u8, arg);
+    if let Some(local_arg) = resolve_local(parser, &name) {
+        is_local = true;
+        arg = local_arg;
     } else {
-        emit_bytes(parser, chunk, OpCode::GetGlobal as u8, arg);
+        arg = identifier_constant(parser, chunk, vm, name) as usize;
+    }
+
+    let is_assignment = can_assign && match_token(parser, scanner, TokenType::Equal);
+    if is_assignment {
+        expression(parser, scanner, chunk, vm);
+    }
+
+    if is_local {
+        if arg <= 255 {
+            let op = if is_assignment {
+                OpCode::SetLocal
+            } else {
+                OpCode::GetLocal
+            };
+            emit_bytes(parser, chunk, op as u8, arg as u8);
+        } else {
+            let op = if is_assignment {
+                OpCode::SetLocalLong
+            } else {
+                OpCode::GetLocalLong
+            };
+            emit_byte(parser, chunk, op as u8);
+            // Emit the 16-bit int as two little-endian bytes
+            emit_byte(parser, chunk, (arg & 0xFF) as u8);
+            emit_byte(parser, chunk, ((arg >> 8) & 0xFF) as u8);
+        }
+    } else {
+        let op = if is_assignment {
+            OpCode::SetGlobal
+        } else {
+            OpCode::GetGlobal
+        };
+        emit_bytes(parser, chunk, op as u8, arg as u8);
     }
 }
 
@@ -543,7 +572,7 @@ fn identifiers_equal(a: &Token, b: &Token) -> bool {
     &a.start[..a.length] == &b.start[..b.length]
 }
 
-fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<u8> {
+fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
     for i in (0..parser.compiler.local_count).rev() {
         let local = parser.compiler.locals[i];
 
@@ -551,7 +580,7 @@ fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<u8> {
             if local.depth == -1 {
                 error(parser, "Can't read local variable in its own initializer.");
             }
-            return Some(i as u8);
+            return Some(i);
         }
     }
 
@@ -559,7 +588,7 @@ fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<u8> {
 }
 
 fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
-    if parser.compiler.local_count == 256 {
+    if parser.compiler.local_count == u16::MAX as usize {
         error(parser, "Too many local variables in function.");
         return;
     }
