@@ -86,6 +86,12 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
             constant_instruction("OP_DEFINE_GLOBAL", chunk, offset)
         }
         x if x == OpCode::SetGlobal as u8 => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        x if x == OpCode::BuildList as u8 => byte_instruction("OP_BUILD_LIST", chunk, offset),
+        x if x == OpCode::BuildListLong as u8 => {
+            local_long_instruction("OP_BUILD_LIST_LONG", chunk, offset)
+        }
+        x if x == OpCode::GetIndex as u8 => simple_instruction("OP_GET_INDEX", offset),
+        x if x == OpCode::SetIndex as u8 => simple_instruction("OP_SET_INDEX", offset),
         x if x == OpCode::Print as u8 => simple_instruction("OP_PRINT", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {

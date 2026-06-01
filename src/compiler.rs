@@ -458,6 +458,68 @@ fn string<'a>(
     emit_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
 }
 
+fn list<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _: bool,
+) {
+    let mut item_count = 0;
+
+    if !check(parser, TokenType::RightBracket) {
+        loop {
+            expression(parser, scanner, chunk, vm);
+            item_count += 1;
+
+            if item_count > 255 {
+                error(parser, "Error processing list literal.");
+            }
+            if !match_token(parser, scanner, TokenType::Comma) {
+                break;
+            }
+        }
+    }
+
+    consume(
+        parser,
+        scanner,
+        TokenType::RightBracket,
+        "Expect ']' after list elements.",
+    );
+
+    if item_count <= 255 {
+        emit_bytes(parser, chunk, OpCode::BuildList as u8, item_count as u8);
+    } else {
+        emit_byte(parser, chunk, OpCode::BuildListLong as u8);
+        emit_byte(parser, chunk, (item_count & 0xFF) as u8);
+        emit_byte(parser, chunk, ((item_count >> 8) & 0xFF) as u8);
+    }
+}
+
+fn index<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    can_assign: bool,
+) {
+    expression(parser, scanner, chunk, vm);
+    consume(
+        parser,
+        scanner,
+        TokenType::RightBracket,
+        "Expect ']' after index.",
+    );
+
+    if can_assign && match_token(parser, scanner, TokenType::Equal) {
+        expression(parser, scanner, chunk, vm);
+        emit_byte(parser, chunk, OpCode::SetIndex as u8);
+    } else {
+        emit_byte(parser, chunk, OpCode::GetIndex as u8);
+    }
+}
+
 fn variable<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -701,6 +763,11 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: None,
             precedence: Precedence::None,
         },
+        TokenType::LeftBracket => ParseRule {
+            prefix: Some(list),
+            infix: Some(index),
+            precedence: Precedence::Call,
+        },
         TokenType::Minus => ParseRule {
             prefix: Some(unary),
             infix: Some(binary),
@@ -786,6 +853,7 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         TokenType::RightParen
         | TokenType::LeftBrace
         | TokenType::RightBrace
+        | TokenType::RightBracket
         | TokenType::GreaterGreater
         | TokenType::GreaterGreaterGreater
         | TokenType::Comma

@@ -1,4 +1,4 @@
-use crate::object::{Obj, ObjString, ObjType};
+use crate::object::{Obj, ObjList, ObjString, ObjType};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
@@ -42,6 +42,9 @@ impl Value {
     pub fn is_string(&self) -> bool {
         self.is_obj_type(ObjType::String)
     }
+    pub fn is_list(&self) -> bool {
+        self.is_obj_type(ObjType::List)
+    }
 
     // AS_ macros
     pub fn as_bool(&self) -> bool {
@@ -67,6 +70,12 @@ impl Value {
     }
     pub fn as_cstring(&self) -> &str {
         ObjString::as_str(self.as_obj() as *const ObjString)
+    }
+    pub fn as_list(&self) -> *mut ObjList {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjList,
+            _ => panic!("Value is not a list"),
+        }
     }
 }
 

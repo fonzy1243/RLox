@@ -1,6 +1,8 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
-use crate::object::{Obj, ObjString, ObjType, allocate_string, free_object, take_string};
+use crate::object::{
+    Obj, ObjString, ObjType, allocate_list, allocate_string, free_object, take_string,
+};
 use crate::table::Table;
 use crate::value::{Value, values_equal};
 
@@ -268,6 +270,79 @@ fn run(vm: &mut VM) -> InterpretResult {
                     vm.runtime_error(&format!("Undefined variable '{}'.", name_str));
                     return InterpretResult::RuntimeError;
                 }
+            }
+            x if x == OpCode::BuildList as u8 => {
+                let item_count = read_byte!(vm, chunk) as usize;
+                let mut items = Vec::with_capacity(item_count);
+
+                for _ in 0..item_count {
+                    items.push(vm.pop());
+                }
+                items.reverse();
+
+                let list_ptr = crate::object::allocate_list(vm, items);
+                vm.push(Value::Obj(list_ptr as *mut Obj));
+            }
+            x if x == OpCode::BuildListLong as u8 => {
+                let item_count = read_short!(vm, chunk) as usize;
+                let mut items = Vec::with_capacity(item_count);
+
+                for _ in 0..item_count {
+                    items.push(vm.pop());
+                }
+                items.reverse();
+
+                let list_ptr = allocate_list(vm, items);
+                vm.push(Value::Obj(list_ptr as *mut Obj));
+            }
+            x if x == OpCode::GetIndex as u8 => {
+                let index_val = vm.pop();
+                let list_val = vm.pop();
+
+                if !list_val.is_list() {
+                    vm.runtime_error("Only lists can be subscripted.");
+                    return InterpretResult::RuntimeError;
+                }
+                if !index_val.is_number() {
+                    vm.runtime_error("List index must be a number.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let list = unsafe { &*list_val.as_list() };
+                let index = index_val.as_number() as usize;
+
+                if index >= list.items.len() {
+                    vm.runtime_error("List index out of bounds.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                vm.push(list.items[index]);
+            }
+            x if x == OpCode::SetIndex as u8 => {
+                let value = vm.pop();
+                let index_val = vm.pop();
+                let list_val = vm.pop();
+
+                if !list_val.is_list() {
+                    vm.runtime_error("Only lists can be subscripted.");
+                    return InterpretResult::RuntimeError;
+                }
+                if !index_val.is_number() {
+                    vm.runtime_error("List index must be a number.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let list = unsafe { &mut *list_val.as_list() };
+                let index = index_val.as_number() as usize;
+
+                if index >= list.items.len() {
+                    vm.runtime_error("List index out of bounds.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                list.items[index] = value;
+
+                vm.push(value);
             }
             x if x == OpCode::Print as u8 => {
                 println!("{}", vm.pop());

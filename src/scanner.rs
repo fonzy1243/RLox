@@ -3,6 +3,8 @@ pub enum TokenType {
     // Single-character tokens
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
     LeftBrace,
     RightBrace,
     Comma,
@@ -102,6 +104,8 @@ impl<'a> Scanner<'a> {
         match c {
             '(' => self.make_token(TokenType::LeftParen),
             ')' => self.make_token(TokenType::RightParen),
+            '[' => self.make_token(TokenType::LeftBracket),
+            ']' => self.make_token(TokenType::RightBracket),
             '{' => self.make_token(TokenType::LeftBrace),
             '}' => self.make_token(TokenType::RightBrace),
             ';' => self.make_token(TokenType::Semicolon),

@@ -10,6 +10,7 @@ use crate::vm::VM;
 #[repr(u8)]
 pub enum ObjType {
     String,
+    List,
 }
 
 #[repr(C)]
@@ -23,6 +24,12 @@ pub struct ObjString {
     pub obj: Obj,
     pub length: usize,
     pub hash: u32,
+}
+
+#[repr(C)]
+pub struct ObjList {
+    pub obj: Obj,
+    pub items: Vec<Value>,
 }
 
 impl Obj {
@@ -49,6 +56,18 @@ impl fmt::Display for Obj {
             ObjType::String => {
                 let s = ObjString::as_str(self as *const Obj as *const ObjString);
                 write!(f, "{}", s)
+            }
+            ObjType::List => {
+                let list = unsafe { &*(self as *const Obj as *const ObjList) };
+
+                write!(f, "[]")?;
+                for (i, item) in list.items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
             }
         }
     }
@@ -95,6 +114,20 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
 
         ptr
     }
+}
+
+pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
+    let list = ObjList {
+        obj: Obj {
+            obj_type: ObjType::List,
+            next: vm.objects,
+        },
+        items,
+    };
+
+    let ptr = Box::into_raw(Box::new(list));
+    vm.objects = ptr as *mut Obj;
+    ptr
 }
 
 fn hash_string(key: &str) -> u32 {
@@ -144,6 +177,10 @@ pub fn free_object(object: *mut Obj) {
                 .unwrap();
 
                 dealloc(object as *mut u8, layout);
+            }
+            ObjType::List => {
+                // Rebox drops Vec memory
+                let _ = Box::from_raw(object as *mut ObjList);
             }
         }
     }
