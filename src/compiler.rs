@@ -397,6 +397,7 @@ fn binary<'a>(
         TokenType::Minus => emit_byte(parser, chunk, OpCode::Subtract as u8),
         TokenType::Star => emit_byte(parser, chunk, OpCode::Multiply as u8),
         TokenType::Slash => emit_byte(parser, chunk, OpCode::Divide as u8),
+        TokenType::Backslash => emit_byte(parser, chunk, OpCode::IntDivide as u8),
         _ => unreachable!(),
     }
 }
@@ -715,6 +716,11 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: Some(binary),
             precedence: Precedence::Factor,
         },
+        TokenType::Backslash => ParseRule {
+            prefix: None,
+            infix: Some(binary),
+            precedence: Precedence::Factor,
+        },
         TokenType::Star => ParseRule {
             prefix: None,
             infix: Some(binary),
@@ -780,6 +786,8 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         TokenType::RightParen
         | TokenType::LeftBrace
         | TokenType::RightBrace
+        | TokenType::GreaterGreater
+        | TokenType::GreaterGreaterGreater
         | TokenType::Comma
         | TokenType::Dot
         | TokenType::Semicolon

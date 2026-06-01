@@ -11,6 +11,7 @@ pub enum TokenType {
     Plus,
     Semicolon,
     Slash,
+    Backslash,
     Star,
     // One or two character tokens
     Bang,
@@ -18,6 +19,8 @@ pub enum TokenType {
     Equal,
     EqualEqual,
     Greater,
+    GreaterGreater,
+    GreaterGreaterGreater,
     GreaterEqual,
     Less,
     LessEqual,
@@ -107,6 +110,7 @@ impl<'a> Scanner<'a> {
             '-' => self.make_token(TokenType::Minus),
             '+' => self.make_token(TokenType::Plus),
             '/' => self.make_token(TokenType::Slash),
+            '\\' => self.make_token(TokenType::Backslash),
             '*' => self.make_token(TokenType::Star),
             '!' => {
                 let t = if self.match_char('=') {
@@ -135,6 +139,12 @@ impl<'a> Scanner<'a> {
             '>' => {
                 let t = if self.match_char('=') {
                     TokenType::GreaterEqual
+                } else if self.match_char('>') {
+                    if self.match_char('>') {
+                        TokenType::GreaterGreaterGreater
+                    } else {
+                        TokenType::GreaterGreater
+                    }
                 } else {
                     TokenType::Greater
                 };

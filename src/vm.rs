@@ -193,6 +193,18 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Subtract as u8 => binary_op!(vm, Value::Number, -),
             x if x == OpCode::Multiply as u8 => binary_op!(vm, Value::Number, *),
             x if x == OpCode::Divide as u8 => binary_op!(vm, Value::Number, /),
+            x if x == OpCode::IntDivide as u8 => {
+                if !vm.peek(0).is_number() || !vm.peek(1).is_number() {
+                    vm.runtime_error("Operands must be numbers.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let b = vm.pop().as_number();
+                let top = vm.stack.last_mut().expect("Stack underflow");
+                let a = top.as_number();
+
+                *top = Value::Number((a / b).trunc());
+            }
             x if x == OpCode::Not as u8 => {
                 let top = vm.stack.last_mut().expect("Stack underflow");
                 *top = Value::Bool(top.is_falsy());

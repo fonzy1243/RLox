@@ -23,6 +23,7 @@ pub enum OpCode {
     Subtract,
     Multiply,
     Divide,
+    IntDivide,
     Not,
     Negate,
     Print,

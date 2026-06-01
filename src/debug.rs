@@ -69,6 +69,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Subtract as u8 => simple_instruction("OP_SUBTRACT", offset),
         x if x == OpCode::Multiply as u8 => simple_instruction("OP_MULTIPLY", offset),
         x if x == OpCode::Divide as u8 => simple_instruction("OP_DIVIDE", offset),
+        x if x == OpCode::IntDivide as u8 => simple_instruction("OP_INT_DIVIDE", offset),
         x if x == OpCode::Not as u8 => simple_instruction("OP_NOT", offset),
         x if x == OpCode::Negate as u8 => simple_instruction("OP_NEGATE", offset),
         x if x == OpCode::Pop as u8 => simple_instruction("OP_POP", offset),
