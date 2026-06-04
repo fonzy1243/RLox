@@ -1,6 +1,4 @@
-var arr = [1, 2, "hello"];
-print arr[0];
-print arr[2];
-
-arr[1] = "world";
-print arr[1];
+var my_list = [6, 7, "six seven"];
+for (var i = 0; i < 3; i = i + 1) {
+    print my_list[i];
+}

@@ -347,6 +347,20 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Print as u8 => {
                 println!("{}", vm.pop());
             }
+            x if x == OpCode::Jump as u8 => {
+                let offset = read_short!(vm, chunk) as usize;
+                vm.ip += offset;
+            }
+            x if x == OpCode::JumpIfFalse as u8 => {
+                let offset = read_short!(vm, chunk) as usize;
+                if vm.peek(0).is_falsy() {
+                    vm.ip += offset;
+                }
+            }
+            x if x == OpCode::Loop as u8 => {
+                let offset = read_short!(vm, chunk) as usize;
+                vm.ip -= offset;
+            }
             x if x == OpCode::Return as u8 => {
                 return InterpretResult::Ok;
             }

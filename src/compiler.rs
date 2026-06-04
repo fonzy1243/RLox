@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::exit;
 
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
@@ -227,6 +228,107 @@ fn expression_statement<'a>(
     emit_byte(parser, chunk, OpCode::Pop as u8);
 }
 
+fn for_statement<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    begin_scope(parser);
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftParen,
+        "Expect '(' after 'for'.",
+    );
+    // Initializer
+    if match_token(parser, scanner, TokenType::Semicolon) {
+        // No initializer
+    } else if match_token(parser, scanner, TokenType::Var) {
+        var_declaration(parser, scanner, chunk, vm);
+    } else {
+        expression_statement(parser, scanner, chunk, vm);
+    }
+    let mut loop_start = chunk.code.len();
+    let mut exit_jump: Option<usize> = None;
+    // Condition
+    if !match_token(parser, scanner, TokenType::Semicolon) {
+        expression(parser, scanner, chunk, vm);
+        consume(
+            parser,
+            scanner,
+            TokenType::Semicolon,
+            "Expect ';' after loop condition.",
+        );
+
+        // Jump out of the loop if the condition is false.
+        exit_jump = Some(emit_jump(parser, chunk, OpCode::JumpIfFalse as u8));
+        emit_byte(parser, chunk, OpCode::Pop as u8);
+    }
+    // Increment
+    if !match_token(parser, scanner, TokenType::RightParen) {
+        let body_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+        let increment_start = chunk.code.len();
+        expression(parser, scanner, chunk, vm);
+        emit_byte(parser, chunk, OpCode::Pop as u8);
+        consume(
+            parser,
+            scanner,
+            TokenType::RightParen,
+            "Expect ')' after for clauses.",
+        );
+
+        emit_loop(parser, chunk, loop_start);
+        loop_start = increment_start;
+        patch_jump(parser, chunk, body_jump);
+    }
+    // Body
+    statement(parser, scanner, chunk, vm);
+    emit_loop(parser, chunk, loop_start);
+
+    if let Some(jump) = exit_jump {
+        patch_jump(parser, chunk, jump);
+        emit_byte(parser, chunk, OpCode::Pop as u8);
+    }
+
+    end_scope(parser, chunk);
+}
+
+fn if_statement<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftParen,
+        "Expect '(' after 'if'.",
+    );
+    expression(parser, scanner, chunk, vm);
+    consume(
+        parser,
+        scanner,
+        TokenType::RightParen,
+        "Expect '(' after condition.",
+    );
+
+    let then_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+    statement(parser, scanner, chunk, vm);
+
+    let else_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+
+    patch_jump(parser, chunk, then_jump);
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+
+    if match_token(parser, scanner, TokenType::Else) {
+        statement(parser, scanner, chunk, vm);
+    }
+    patch_jump(parser, chunk, else_jump);
+}
+
 fn print_statement<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -241,6 +343,36 @@ fn print_statement<'a>(
         "Expect ';' after value.",
     );
     emit_byte(parser, chunk, OpCode::Print as u8);
+}
+
+fn while_statement<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    let loop_start = chunk.code.len();
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftParen,
+        "Expect '(' after 'while'.",
+    );
+    expression(parser, scanner, chunk, vm);
+    consume(
+        parser,
+        scanner,
+        TokenType::RightParen,
+        "Expect ')' after condition.",
+    );
+
+    let exit_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+    statement(parser, scanner, chunk, vm);
+    emit_loop(parser, chunk, loop_start);
+
+    patch_jump(parser, chunk, exit_jump);
+    emit_byte(parser, chunk, OpCode::Pop as u8);
 }
 
 fn synchronize<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -292,6 +424,12 @@ fn statement<'a>(
 ) {
     if match_token(parser, scanner, TokenType::Print) {
         print_statement(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::For) {
+        for_statement(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::If) {
+        if_statement(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::While) {
+        while_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::LeftBrace) {
         begin_scope(parser);
         block(parser, scanner, chunk, vm);
@@ -340,6 +478,27 @@ fn emit_bytes(parser: &Parser, chunk: &mut Chunk, byte1: u8, byte2: u8) {
     emit_byte(parser, chunk, byte2);
 }
 
+fn emit_loop(parser: &mut Parser, chunk: &mut Chunk, loop_start: usize) {
+    emit_byte(parser, chunk, OpCode::Loop as u8);
+
+    let offset = chunk.code.len() - loop_start + 2;
+    if offset > u16::MAX as usize {
+        error(parser, "Loop body too large");
+    }
+
+    emit_byte(parser, chunk, (offset & 0xff) as u8);
+    emit_byte(parser, chunk, ((offset >> 8) & 0xff) as u8);
+}
+
+fn emit_jump(parser: &mut Parser, chunk: &mut Chunk, instruction: u8) -> usize {
+    emit_byte(parser, chunk, instruction);
+    // Placeholder offset
+    emit_byte(parser, chunk, 0xff);
+    emit_byte(parser, chunk, 0xff);
+
+    chunk.code.len() - 2
+}
+
 fn emit_return(parser: &Parser, chunk: &mut Chunk) {
     emit_byte(parser, chunk, OpCode::Return as u8);
 }
@@ -359,6 +518,18 @@ fn emit_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) {
         emit_byte(parser, chunk, ((constant >> 8) & 0xFF) as u8);
         emit_byte(parser, chunk, ((constant >> 16) & 0xFF) as u8);
     }
+}
+
+fn patch_jump(parser: &mut Parser, chunk: &mut Chunk, offset: usize) {
+    // -2 to adjust for the bytecode for the jump offset itself
+    let jump = chunk.code.len() - offset - 2;
+
+    if jump > u16::MAX as usize {
+        error(parser, "Too much code to jump over.");
+    }
+
+    chunk.code[offset] = (jump & 0xff) as u8;
+    chunk.code[offset + 1] = ((jump >> 8) & 0xff) as u8;
 }
 
 fn end_compiler(parser: &Parser, chunk: &mut Chunk) {
@@ -444,6 +615,23 @@ fn number<'a>(
         .parse()
         .unwrap();
     emit_constant(parser, chunk, Value::Number(value));
+}
+
+fn or<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _: bool,
+) {
+    let else_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+    let end_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+
+    patch_jump(parser, chunk, else_jump);
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+
+    parse_precedence(parser, scanner, chunk, Precedence::Or, vm);
+    patch_jump(parser, chunk, end_jump);
 }
 
 fn string<'a>(
@@ -756,6 +944,21 @@ fn define_variable(parser: &mut Parser, chunk: &mut Chunk, global: u8) {
     emit_bytes(parser, chunk, OpCode::DefineGlobal as u8, global);
 }
 
+fn and<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _: bool,
+) {
+    let end_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+    parse_precedence(parser, scanner, chunk, Precedence::And, vm);
+
+    patch_jump(parser, chunk, end_jump);
+}
+
 fn get_rule(token_type: TokenType) -> ParseRule {
     match token_type {
         TokenType::LeftParen => ParseRule {
@@ -843,6 +1046,16 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: None,
             precedence: Precedence::None,
         },
+        TokenType::And => ParseRule {
+            prefix: None,
+            infix: Some(and),
+            precedence: Precedence::And,
+        },
+        TokenType::Or => ParseRule {
+            prefix: None,
+            infix: Some(or),
+            precedence: Precedence::Or,
+        },
         TokenType::False | TokenType::Nil | TokenType::True => ParseRule {
             prefix: Some(literal),
             infix: None,
@@ -860,7 +1073,6 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         | TokenType::Dot
         | TokenType::Semicolon
         | TokenType::Equal
-        | TokenType::And
         | TokenType::Class
         | TokenType::Else
         | TokenType::For

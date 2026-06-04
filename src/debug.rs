@@ -43,6 +43,16 @@ pub fn constant_long_instruction(name: &str, chunk: &Chunk, offset: usize) -> us
     offset + 4 // opcode + 3 bytes
 }
 
+pub fn jump_instruction(name: &str, sign: isize, chunk: &Chunk, offset: usize) -> usize {
+    let mut jump = chunk.code[offset + 1] as u16;
+    jump |= (chunk.code[offset + 2] as u16) << 8;
+
+    let target = (offset as isize + 3 + sign * (jump as isize)) as usize;
+    println!("{:-16} {:4} -> {}", name, offset, target);
+
+    offset + 3
+}
+
 pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
     print!("{:04} ", offset);
 
@@ -93,6 +103,11 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::GetIndex as u8 => simple_instruction("OP_GET_INDEX", offset),
         x if x == OpCode::SetIndex as u8 => simple_instruction("OP_SET_INDEX", offset),
         x if x == OpCode::Print as u8 => simple_instruction("OP_PRINT", offset),
+        x if x == OpCode::Jump as u8 => jump_instruction("OP_JUMP", 1, chunk, offset),
+        x if x == OpCode::JumpIfFalse as u8 => {
+            jump_instruction("OP_JUMP_IF_FALSE", 1, chunk, offset)
+        }
+        x if x == OpCode::Loop as u8 => jump_instruction("OP_LOOP", -1, chunk, offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {
             println!("Unknown opcode {}", instruction);
