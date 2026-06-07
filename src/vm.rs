@@ -13,6 +13,7 @@ use crate::value::{Value, values_equal};
 use crate::debug::disassemble_instruction;
 
 const FRAMES_MAX: usize = 256;
+const STACK_MAX: usize = FRAMES_MAX * 256;
 
 macro_rules! read_byte {
     ($vm:expr, $chunk:expr) => {{
@@ -55,7 +56,8 @@ macro_rules! binary_op {
             return InterpretResult::RuntimeError;
         }
         let b = $vm.pop().as_number();
-        let top = $vm.stack.last_mut().expect("Stack underflow");
+        let stack_top = $vm.stack_top;
+        let top = &mut $vm.stack[stack_top - 1];
         *top = $wrap(top.as_number() $op b);
     }};
 }
@@ -70,7 +72,8 @@ pub struct CallFrame {
 pub struct VM {
     pub frames: [CallFrame; FRAMES_MAX],
     pub frame_count: usize,
-    stack: Vec<Value>,
+    pub stack: Box<[Value; STACK_MAX]>,
+    pub stack_top: usize,
     pub objects: *mut Obj,
     pub strings: Table,
     pub globals: Table,
@@ -93,7 +96,8 @@ impl VM {
         let mut vm = VM {
             frames: [dummy_frame; FRAMES_MAX],
             frame_count: 0,
-            stack: Vec::new(),
+            stack: vec![Value::Nil; STACK_MAX].try_into().unwrap(),
+            stack_top: 0,
             objects: std::ptr::null_mut(),
             strings: Table::new(),
             globals: Table::new(),
@@ -117,15 +121,17 @@ impl VM {
     }
 
     pub fn push(&mut self, value: Value) {
-        self.stack.push(value);
+        self.stack[self.stack_top] = value;
+        self.stack_top += 1;
     }
 
     pub fn pop(&mut self) -> Value {
-        self.stack.pop().expect("Stack underflow")
+        self.stack_top -= 1;
+        self.stack[self.stack_top]
     }
 
     pub fn peek(&self, distance: usize) -> Value {
-        self.stack[self.stack.len() - 1 - distance]
+        self.stack[self.stack_top - 1 - distance]
     }
 
     fn call(&mut self, function: *mut ObjFunction, arg_count: usize) -> bool {
@@ -146,7 +152,7 @@ impl VM {
         self.frames[self.frame_count] = CallFrame {
             function,
             ip: 0,
-            slots: self.stack.len() - arg_count - 1,
+            slots: self.stack_top - arg_count - 1,
         };
 
         self.frame_count += 1;
@@ -158,9 +164,9 @@ impl VM {
             return self.call(callee.as_function(), arg_count);
         } else if callee.is_native() {
             let native = callee.as_native();
-            let args_start = self.stack.len() - arg_count;
+            let args_start = self.stack_top - arg_count;
             let result = unsafe { (*native).function }(arg_count, &self.stack[args_start..]);
-            self.stack.truncate(args_start - 1);
+            self.stack_top = args_start - 1;
             self.push(result);
             return true;
         }
@@ -199,7 +205,7 @@ impl VM {
             }
         }
 
-        self.stack.clear();
+        self.stack_top = 0;
         self.frame_count = 0;
     }
 
@@ -247,8 +253,8 @@ fn run(vm: &mut VM) -> InterpretResult {
         #[cfg(feature = "debug_trace_execution")]
         {
             print!("          ");
-            for value in &vm.stack {
-                print!("[ {} ]", value);
+            for i in 0..vm.stack_top {
+                print!("[ {} ]", vm.stack[i]);
             }
             println!();
             disassemble_instruction(vm.chunk.as_ref().unwrap(), vm.ip);
@@ -303,13 +309,13 @@ fn run(vm: &mut VM) -> InterpretResult {
                 }
 
                 let b = vm.pop().as_number();
-                let top = vm.stack.last_mut().expect("Stack underflow");
-                let a = top.as_number();
-
-                *top = Value::Number((a / b).trunc());
+                let stack_top = vm.stack_top;
+                let top = &mut vm.stack[stack_top - 1];
+                *top = Value::Number((top.as_number() / b).trunc());
             }
             x if x == OpCode::Not as u8 => {
-                let top = vm.stack.last_mut().expect("Stack underflow");
+                let stack_top = vm.stack_top;
+                let top = &mut vm.stack[stack_top - 1];
                 *top = Value::Bool(top.is_falsy());
             }
             x if x == OpCode::Negate as u8 => {
@@ -317,7 +323,8 @@ fn run(vm: &mut VM) -> InterpretResult {
                     vm.runtime_error("Operand must be a number.");
                     return InterpretResult::RuntimeError;
                 }
-                let top = vm.stack.last_mut().expect("Stack underflow");
+                let stack_top = vm.stack_top;
+                let top = &mut vm.stack[stack_top - 1];
                 *top = Value::Number(-top.as_number())
             }
             x if x == OpCode::Pop as u8 => {
@@ -488,7 +495,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 }
 
                 let slots = vm.frames[vm.frame_count].slots;
-                vm.stack.truncate(slots);
+                vm.stack_top = slots;
                 vm.push(result);
             }
             _ => {
