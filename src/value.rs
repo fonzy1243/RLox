@@ -1,4 +1,4 @@
-use crate::object::{Obj, ObjList, ObjString, ObjType};
+use crate::object::{Obj, ObjFunction, ObjList, ObjNative, ObjString, ObjType};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
@@ -45,6 +45,12 @@ impl Value {
     pub fn is_list(&self) -> bool {
         self.is_obj_type(ObjType::List)
     }
+    pub fn is_function(&self) -> bool {
+        self.is_obj_type(ObjType::Function)
+    }
+    pub fn is_native(&self) -> bool {
+        self.is_obj_type(ObjType::Native)
+    }
 
     // AS_ macros
     pub fn as_bool(&self) -> bool {
@@ -75,6 +81,18 @@ impl Value {
         match self {
             Value::Obj(ptr) => *ptr as *mut ObjList,
             _ => panic!("Value is not a list"),
+        }
+    }
+    pub fn as_function(&self) -> *mut ObjFunction {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjFunction,
+            _ => panic!("Value is not a function"),
+        }
+    }
+    pub fn as_native(&self) -> *mut ObjNative {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjNative,
+            _ => panic!("Value is not a native function"),
         }
     }
 }

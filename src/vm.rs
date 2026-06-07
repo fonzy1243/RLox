@@ -1,7 +1,10 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{
-    Obj, ObjString, ObjType, allocate_list, allocate_string, free_object, take_string,
+    NativeFn, Obj, ObjFunction, ObjString, ObjType, allocate_list, allocate_native,
+    allocate_string, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -11,16 +14,20 @@ use crate::debug::disassemble_instruction;
 
 macro_rules! read_byte {
     ($vm:expr, $chunk:expr) => {{
-        let byte = $chunk.code[$vm.ip];
-        $vm.ip += 1;
+        let frame = $vm.frames.last_mut().unwrap();
+        let byte = $chunk.code[frame.ip];
+        frame.ip += 1;
         byte
     }};
 }
 
 macro_rules! read_short {
     ($vm:expr, $chunk:expr) => {{
-        let lo = read_byte!($vm, $chunk) as u16;
-        let hi = read_byte!($vm, $chunk) as u16;
+        let frame = $vm.frames.last_mut().unwrap();
+        let lo = $chunk.code[frame.ip] as u16;
+        frame.ip += 1;
+        let hi = $chunk.code[frame.ip] as u16;
+        frame.ip += 1;
         (hi << 8) | lo
     }};
 }
@@ -50,9 +57,14 @@ macro_rules! binary_op {
     }};
 }
 
+pub struct CallFrame {
+    pub function: *mut ObjFunction,
+    pub ip: usize,
+    pub slots: usize,
+}
+
 pub struct VM {
-    chunk: Option<Chunk>,
-    ip: usize,
+    pub frames: Vec<CallFrame>,
     stack: Vec<Value>,
     pub objects: *mut Obj,
     pub strings: Table,
@@ -67,25 +79,27 @@ pub enum InterpretResult {
 
 impl VM {
     pub fn new() -> Self {
-        VM {
-            chunk: None,
-            ip: 0,
+        let mut vm = VM {
+            frames: Vec::new(),
             stack: Vec::new(),
             objects: std::ptr::null_mut(),
             strings: Table::new(),
             globals: Table::new(),
-        }
+        };
+
+        vm.define_native("clock", clock_native);
+        vm
     }
 
     pub fn interpret(&mut self, source: &str) -> InterpretResult {
-        let mut chunk = Chunk::new();
+        let function = match compile(source, self) {
+            Some(func) => func,
+            None => return InterpretResult::CompileError,
+        };
 
-        if !compile(source, &mut chunk, self) {
-            return InterpretResult::CompileError;
-        }
+        self.push(Value::Obj(function as *mut Obj));
 
-        self.chunk = Some(chunk);
-        self.ip = 0;
+        self.call(function, 0);
 
         run(self)
     }
@@ -100,6 +114,47 @@ impl VM {
 
     pub fn peek(&self, distance: usize) -> Value {
         self.stack[self.stack.len() - 1 - distance]
+    }
+
+    fn call(&mut self, function: *mut ObjFunction, arg_count: usize) -> bool {
+        let arity = unsafe { (*function).arity };
+        if arg_count != arity {
+            self.runtime_error(&format!(
+                "Expected {} arguments but got {}.",
+                arity, arg_count
+            ));
+            return false;
+        }
+
+        if self.frames.len() == 256 {
+            self.runtime_error("Stack overflow.");
+            return false;
+        }
+
+        let frame = CallFrame {
+            function,
+            ip: 0,
+            slots: self.stack.len() - arg_count - 1,
+        };
+
+        self.frames.push(frame);
+        true
+    }
+
+    fn call_value(&mut self, callee: Value, arg_count: usize) -> bool {
+        if callee.is_function() {
+            return self.call(callee.as_function(), arg_count);
+        } else if callee.is_native() {
+            let native = callee.as_native();
+            let args_start = self.stack.len() - arg_count;
+            let result = unsafe { (*native).function }(arg_count, &self.stack[args_start..]);
+            self.stack.truncate(args_start - 1);
+            self.push(result);
+            return true;
+        }
+
+        self.runtime_error("Can only call functions and classes.");
+        false
     }
 
     fn concatenate(&mut self) {
@@ -119,11 +174,33 @@ impl VM {
     fn runtime_error(&mut self, message: &str) {
         eprintln!("{}", message);
 
-        let instruction = self.ip - 1;
-        let line = self.chunk.as_ref().unwrap().get_line(instruction);
-        eprintln!("[line {}] in script", line);
+        for frame in self.frames.iter().rev() {
+            let instruction = frame.ip - 1;
+            let line = unsafe { (*frame.function).chunk.get_line(instruction) };
+
+            if unsafe { (*frame.function).name.is_null() } {
+                eprintln!("[line {}] in script", line);
+            } else {
+                let name = unsafe { ObjString::as_str((*frame.function).name) };
+                eprintln!("[line {}] in {}()", line, name);
+            }
+        }
 
         self.stack.clear();
+        self.frames.clear();
+    }
+
+    fn define_native(&mut self, name: &str, function: NativeFn) {
+        let name_obj = copy_string(self, name);
+        let native_obj = allocate_native(self, function);
+
+        self.push(Value::Obj(name_obj as *mut Obj));
+        self.push(Value::Obj(native_obj as *mut Obj));
+
+        self.globals.set(name_obj, self.stack[1]);
+
+        self.pop();
+        self.pop();
     }
 }
 
@@ -140,8 +217,20 @@ impl Drop for VM {
     }
 }
 
+// Native functions
+fn clock_native(_: usize, _: &[Value]) -> Value {
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    Value::Number(since_the_epoch.as_secs_f64())
+}
+// ----------------
+
 fn run(vm: &mut VM) -> InterpretResult {
     loop {
+        let chunk = unsafe { &(*vm.frames.last().unwrap().function).chunk };
+
         #[cfg(feature = "debug_trace_execution")]
         {
             print!("          ");
@@ -152,7 +241,6 @@ fn run(vm: &mut VM) -> InterpretResult {
             disassemble_instruction(vm.chunk.as_ref().unwrap(), vm.ip);
         }
 
-        let chunk = vm.chunk.as_ref().unwrap();
         let instruction = read_byte!(vm, chunk);
 
         match instruction {
@@ -222,23 +310,31 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Pop as u8 => {
                 vm.pop();
             }
+            x if x == OpCode::Dup as u8 => {
+                let value = vm.peek(0);
+                vm.push(value);
+            }
             x if x == OpCode::GetLocal as u8 => {
                 let slot = read_byte!(vm, chunk) as usize;
-                let value = vm.stack[slot];
+                let frame_slots = vm.frames.last().unwrap().slots;
+                let value = vm.stack[frame_slots + slot];
                 vm.push(value);
             }
             x if x == OpCode::SetLocal as u8 => {
                 let slot = read_byte!(vm, chunk) as usize;
-                vm.stack[slot] = vm.peek(0);
+                let frame_slots = vm.frames.last().unwrap().slots;
+                vm.stack[frame_slots + slot] = vm.peek(0);
             }
             x if x == OpCode::GetLocalLong as u8 => {
                 let slot = read_short!(vm, chunk) as usize;
-                let value = vm.stack[slot];
+                let frame_slots = vm.frames.last().unwrap().slots;
+                let value = vm.stack[frame_slots + slot];
                 vm.push(value);
             }
             x if x == OpCode::SetLocalLong as u8 => {
                 let slot = read_short!(vm, chunk) as usize;
-                vm.stack[slot] = vm.peek(0);
+                let frame_slots = vm.frames.last().unwrap().slots;
+                vm.stack[frame_slots + slot] = vm.peek(0);
             }
             x if x == OpCode::GetGlobal as u8 => {
                 let name = read_string!(vm, chunk);
@@ -349,20 +445,35 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::Jump as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
-                vm.ip += offset;
+                vm.frames.last_mut().unwrap().ip += offset;
             }
             x if x == OpCode::JumpIfFalse as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
                 if vm.peek(0).is_falsy() {
-                    vm.ip += offset;
+                    vm.frames.last_mut().unwrap().ip += offset;
                 }
             }
             x if x == OpCode::Loop as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
-                vm.ip -= offset;
+                vm.frames.last_mut().unwrap().ip -= offset;
+            }
+            x if x == OpCode::Call as u8 => {
+                let arg_count = read_byte!(vm, chunk) as usize;
+
+                if !vm.call_value(vm.peek(arg_count), arg_count) {
+                    return InterpretResult::RuntimeError;
+                }
             }
             x if x == OpCode::Return as u8 => {
-                return InterpretResult::Ok;
+                let result = vm.pop();
+                let frame = vm.frames.pop().unwrap();
+                if vm.frames.is_empty() {
+                    vm.pop();
+                    return InterpretResult::Ok;
+                }
+
+                vm.stack.truncate(frame.slots);
+                vm.push(result);
             }
             _ => {
                 println!("Unknown opcode {}", instruction);

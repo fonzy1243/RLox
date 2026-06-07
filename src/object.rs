@@ -3,12 +3,15 @@ use std::{
     fmt,
 };
 
+use crate::chunk::Chunk;
 use crate::value::Value;
 use crate::vm::VM;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ObjType {
+    Function,
+    Native,
     String,
     List,
 }
@@ -17,6 +20,21 @@ pub enum ObjType {
 pub struct Obj {
     pub obj_type: ObjType,
     pub next: *mut Obj,
+}
+
+#[repr(C)]
+pub struct ObjFunction {
+    pub obj: Obj,
+    pub arity: usize,
+    pub chunk: Chunk,
+    pub name: *mut ObjString,
+}
+
+pub type NativeFn = fn(arg_count: usize, args: &[Value]) -> Value;
+
+pub struct ObjNative {
+    pub obj: Obj,
+    pub function: NativeFn,
 }
 
 #[repr(C)]
@@ -53,6 +71,18 @@ impl ObjString {
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.obj_type {
+            ObjType::Function => {
+                let function = unsafe { &*(self as *const Obj as *const ObjFunction) };
+                if function.name.is_null() {
+                    write!(f, "<script>")
+                } else {
+                    let name = unsafe { ObjString::as_str(function.name) };
+                    write!(f, "<fn {}>", name)
+                }
+            }
+            ObjType::Native => {
+                write!(f, "<native fn>")
+            }
             ObjType::String => {
                 let s = ObjString::as_str(self as *const Obj as *const ObjString);
                 write!(f, "{}", s)
@@ -83,6 +113,30 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
         vm.objects = obj_ptr;
     }
 
+    ptr
+}
+
+pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
+    let function = ObjFunction {
+        obj: Obj {
+            obj_type: ObjType::Function,
+            next: vm.objects,
+        },
+        arity: 0,
+        chunk: Chunk::new(),
+        name: std::ptr::null_mut(),
+    };
+
+    let ptr = Box::into_raw(Box::new(function));
+    vm.objects = ptr as *mut Obj;
+    ptr
+}
+
+pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
+    let ptr = allocate_object(vm, ObjType::Native) as *mut ObjNative;
+    unsafe {
+        (*ptr).function = function;
+    }
     ptr
 }
 
@@ -166,6 +220,12 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
 pub fn free_object(object: *mut Obj) {
     unsafe {
         match (*object).obj_type {
+            ObjType::Function => {
+                let _ = Box::from_raw(object as *mut ObjFunction);
+            }
+            ObjType::Native => {
+                let _ = Box::from_raw(object as *mut ObjNative);
+            }
             ObjType::String => {
                 let string_ptr = object as *mut ObjString;
                 let len = (*string_ptr).length;

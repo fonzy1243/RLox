@@ -9,6 +9,7 @@ pub enum OpCode {
     True,
     False,
     Pop,
+    Dup,
     GetLocal,
     SetLocal,
     GetLocalLong,
@@ -34,6 +35,7 @@ pub enum OpCode {
     Jump,
     JumpIfFalse,
     Loop,
+    Call,
     Return,
 }
 

@@ -4,7 +4,7 @@ use std::process::exit;
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
 use crate::debug::disassemble_chunk;
-use crate::object::{Obj, copy_string};
+use crate::object::{Obj, ObjFunction, ObjString, allocate_function, copy_string};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::vm::VM;
@@ -47,11 +47,58 @@ struct Local<'a> {
     depth: i32,
 }
 
+#[derive(Copy, Clone, PartialEq)]
+pub enum FunctionType {
+    Function,
+    Script,
+}
+
 struct Compiler<'a> {
+    enclosing: Option<Box<Compiler<'a>>>,
+    function: *mut ObjFunction,
+    function_type: FunctionType,
+
     locals: Vec<Local<'a>>,
     local_count: usize,
     scope_depth: i32,
     locals_map: HashMap<&'a str, Vec<usize>>,
+}
+
+fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
+    let func_ptr = allocate_function(vm);
+
+    if func_type != FunctionType::Script {
+        let name_str = &parser.previous.start[..parser.previous.length];
+        let name_obj = copy_string(vm, name_str);
+        unsafe { (*func_ptr).name = name_obj };
+    }
+
+    let dummy = Token {
+        token_type: TokenType::Eof,
+        start: "",
+        length: 0,
+        line: 0,
+    };
+    let dummy_local = Local {
+        name: dummy,
+        depth: -1,
+    };
+
+    let mut new_compiler = Compiler {
+        enclosing: None,
+        function: func_ptr,
+        function_type: func_type,
+        locals: vec![dummy_local; u16::MAX as usize],
+        local_count: 1,
+        scope_depth: 0,
+        locals_map: HashMap::new(),
+    };
+    new_compiler.locals[0].depth = 0;
+    new_compiler.locals[0].name.start = "";
+    new_compiler.locals[0].name.length = 0;
+
+    let old_compiler = std::mem::replace(&mut parser.compiler, new_compiler);
+    parser.compiler.enclosing = Some(Box::new(old_compiler));
 }
 
 fn current_chunk<'a>(chunk: &'a mut Chunk) -> &'a mut Chunk {
@@ -86,7 +133,7 @@ fn error_at_current(parser: &mut Parser, message: &str) {
     error_at(parser, &token, message);
 }
 
-pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
+pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
     let mut scanner = Scanner::new(source);
     let dummy = Token {
         token_type: TokenType::Eof,
@@ -98,12 +145,23 @@ pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
         name: dummy,
         depth: -1,
     };
-    let compiler = Compiler {
+
+    let function = allocate_function(vm);
+
+    let mut compiler = Compiler {
+        enclosing: None,
+        function,
+        function_type: FunctionType::Script,
         locals: vec![dummy_local; u16::MAX as usize],
-        local_count: 0,
+        local_count: 1,
         scope_depth: 0,
         locals_map: HashMap::new(),
     };
+
+    compiler.locals[0].depth = 0;
+    compiler.locals[0].name.start = "";
+    compiler.locals[0].name.length = 0;
+
     let mut parser = Parser {
         current: dummy,
         previous: dummy,
@@ -114,12 +172,18 @@ pub fn compile(source: &str, chunk: &mut Chunk, vm: &mut VM) -> bool {
 
     advance(&mut parser, &mut scanner);
 
+    let chunk = unsafe { &mut (*function).chunk };
+
     while !match_token(&mut parser, &mut scanner, TokenType::Eof) {
         declaration(&mut parser, &mut scanner, chunk, vm);
     }
 
-    end_compiler(&parser, chunk);
-    !parser.had_error
+    let compiled_fn = end_compiler(&mut parser, chunk);
+    if parser.had_error {
+        None
+    } else {
+        Some(compiled_fn)
+    }
 }
 
 fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -155,6 +219,74 @@ fn block<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chu
         TokenType::RightBrace,
         "Expect '}' after block.",
     );
+}
+
+fn function<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    func_type: FunctionType,
+) {
+    init_compiler(parser, vm, func_type);
+    begin_scope(parser);
+
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftParen,
+        "Expect '(' after function name.",
+    );
+
+    let new_chunk = unsafe { &mut (*parser.compiler.function).chunk };
+
+    if !check(parser, TokenType::RightParen) {
+        loop {
+            unsafe {
+                (*parser.compiler.function).arity += 1;
+                if (*parser.compiler.function).arity > 255 {
+                    error_at_current(parser, "Cannot have more than 255 parameters.");
+                }
+            }
+
+            let constant = parse_variable(parser, scanner, new_chunk, vm, "Expect parameter name.");
+            define_variable(parser, chunk, constant);
+
+            if !match_token(parser, scanner, TokenType::Comma) {
+                break;
+            }
+        }
+    }
+
+    consume(
+        parser,
+        scanner,
+        TokenType::RightParen,
+        "Expect ')' after parameters.",
+    );
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftBrace,
+        "Expect '{' before function body.",
+    );
+
+    block(parser, scanner, new_chunk, vm);
+
+    let function_ptr = end_compiler(parser, new_chunk);
+    emit_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
+}
+
+fn fun_declaration<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    let global = parse_variable(parser, scanner, chunk, vm, "Expect function name.");
+    mark_initialized(parser);
+    function(parser, scanner, chunk, vm, FunctionType::Function);
+    define_variable(parser, chunk, global);
 }
 
 fn begin_scope(parser: &mut Parser) {
@@ -329,6 +461,112 @@ fn if_statement<'a>(
     patch_jump(parser, chunk, else_jump);
 }
 
+fn switch_statement<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftParen,
+        "Expect '(' after 'switch'",
+    );
+    expression(parser, scanner, chunk, vm);
+    consume(
+        parser,
+        scanner,
+        TokenType::RightParen,
+        "Expect ')' after condition.",
+    );
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftBrace,
+        "Expect '{' before switch case.",
+    );
+
+    begin_scope(parser);
+
+    let mut exit_jumps = Vec::new();
+    let mut has_default = false;
+
+    while !check(parser, TokenType::RightBrace) && !check(parser, TokenType::Eof) {
+        if match_token(parser, scanner, TokenType::Case) {
+            if has_default {
+                error(parser, "Cannot have 'case' after 'default'.");
+            }
+
+            emit_byte(parser, chunk, OpCode::Dup as u8);
+            expression(parser, scanner, chunk, vm);
+            consume(
+                parser,
+                scanner,
+                TokenType::Colon,
+                "Expect ':' after 'case' value.",
+            );
+
+            emit_byte(parser, chunk, OpCode::Equal as u8);
+            let next_case_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+
+            emit_byte(parser, chunk, OpCode::Pop as u8);
+
+            while !check(parser, TokenType::Case)
+                && !check(parser, TokenType::Default)
+                && !check(parser, TokenType::RightBrace)
+                && !check(parser, TokenType::Eof)
+            {
+                declaration(parser, scanner, chunk, vm);
+            }
+
+            let exit_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+            exit_jumps.push(exit_jump);
+
+            patch_jump(parser, chunk, next_case_jump);
+
+            emit_byte(parser, chunk, OpCode::Pop as u8);
+        } else if match_token(parser, scanner, TokenType::Default) {
+            if has_default {
+                error(parser, "Cannot have more than one 'default' case.");
+            }
+            has_default = true;
+            consume(
+                parser,
+                scanner,
+                TokenType::Colon,
+                "Expect ':' after 'default'.",
+            );
+
+            while !check(parser, TokenType::Case)
+                && !check(parser, TokenType::Default)
+                && !check(parser, TokenType::RightBrace)
+                && !check(parser, TokenType::Eof)
+            {
+                declaration(parser, scanner, chunk, vm);
+            }
+        } else {
+            error_at_current(parser, "Expect 'case' or 'default'.");
+            break;
+        }
+    }
+
+    consume(
+        parser,
+        scanner,
+        TokenType::RightBrace,
+        "Expect '}' after switch case.",
+    );
+
+    for jump in exit_jumps {
+        patch_jump(parser, chunk, jump);
+    }
+
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+
+    end_scope(parser, chunk);
+}
+
 fn print_statement<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -343,6 +581,30 @@ fn print_statement<'a>(
         "Expect ';' after value.",
     );
     emit_byte(parser, chunk, OpCode::Print as u8);
+}
+
+fn return_statement<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    if parser.compiler.function_type == FunctionType::Script {
+        error(parser, "Cannot return from top-level code.");
+    }
+
+    if match_token(parser, scanner, TokenType::Semicolon) {
+        emit_return(parser, chunk);
+    } else {
+        expression(parser, scanner, chunk, vm);
+        consume(
+            parser,
+            scanner,
+            TokenType::Semicolon,
+            "Expect ';' after return value.",
+        );
+        emit_byte(parser, chunk, OpCode::Return as u8);
+    }
 }
 
 fn while_statement<'a>(
@@ -405,7 +667,9 @@ fn declaration<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) {
-    if match_token(parser, scanner, TokenType::Var) {
+    if match_token(parser, scanner, TokenType::Fun) {
+        fun_declaration(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::Var) {
         var_declaration(parser, scanner, chunk, vm);
     } else {
         statement(parser, scanner, chunk, vm);
@@ -424,10 +688,14 @@ fn statement<'a>(
 ) {
     if match_token(parser, scanner, TokenType::Print) {
         print_statement(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::Return) {
+        return_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::For) {
         for_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::If) {
         if_statement(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::Switch) {
+        switch_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::While) {
         while_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::LeftBrace) {
@@ -500,6 +768,7 @@ fn emit_jump(parser: &mut Parser, chunk: &mut Chunk, instruction: u8) -> usize {
 }
 
 fn emit_return(parser: &Parser, chunk: &mut Chunk) {
+    emit_byte(parser, chunk, OpCode::Nil as u8);
     emit_byte(parser, chunk, OpCode::Return as u8);
 }
 
@@ -532,15 +801,29 @@ fn patch_jump(parser: &mut Parser, chunk: &mut Chunk, offset: usize) {
     chunk.code[offset + 1] = ((jump >> 8) & 0xff) as u8;
 }
 
-fn end_compiler(parser: &Parser, chunk: &mut Chunk) {
+fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> *mut ObjFunction {
     emit_return(parser, chunk);
+
+    let function = parser.compiler.function;
 
     #[cfg(feature = "debug_print_code")]
     {
         if !parser.had_error {
-            disassemble_chunk(chunk, "code");
+            let name = if unsafe { (*function).name.is_null() } {
+                "<script>"
+            } else {
+                unsafe { ObjString::as_str((*function).name) }
+            };
+
+            disassemble_chunk(chunk, name);
         }
     }
+
+    if let Some(enclosing) = parser.compiler.enclosing.take() {
+        parser.compiler = *enclosing;
+    }
+
+    function
 }
 
 fn binary<'a>(
@@ -571,6 +854,17 @@ fn binary<'a>(
         TokenType::Backslash => emit_byte(parser, chunk, OpCode::IntDivide as u8),
         _ => unreachable!(),
     }
+}
+
+fn call<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _: bool,
+) {
+    let arg_count = argument_list(parser, scanner, chunk, vm);
+    emit_bytes(parser, chunk, OpCode::Call as u8, arg_count);
 }
 
 fn literal<'a>(
@@ -927,9 +1221,9 @@ fn parse_variable<'a>(
 }
 
 fn mark_initialized(parser: &mut Parser) {
-    //if parser.compiler.scope_depth == 0 {
-    //   return;
-    //}
+    if parser.compiler.scope_depth == 0 {
+        return;
+    }
 
     let local_count = parser.compiler.local_count;
     parser.compiler.locals[local_count - 1].depth = parser.compiler.scope_depth;
@@ -942,6 +1236,36 @@ fn define_variable(parser: &mut Parser, chunk: &mut Chunk, global: u8) {
     }
 
     emit_bytes(parser, chunk, OpCode::DefineGlobal as u8, global);
+}
+
+fn argument_list<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> u8 {
+    let mut arg_count = 0;
+    if !check(parser, TokenType::RightParen) {
+        loop {
+            expression(parser, scanner, chunk, vm);
+            if arg_count == 255 {
+                error(parser, "Cannot have more than 255 arguments.");
+            }
+            arg_count += 1;
+
+            if !match_token(parser, scanner, TokenType::Comma) {
+                break;
+            }
+        }
+    }
+
+    consume(
+        parser,
+        scanner,
+        TokenType::RightParen,
+        "Expect ')' after arguments.",
+    );
+    arg_count
 }
 
 fn and<'a>(
@@ -963,8 +1287,8 @@ fn get_rule(token_type: TokenType) -> ParseRule {
     match token_type {
         TokenType::LeftParen => ParseRule {
             prefix: Some(grouping),
-            infix: None,
-            precedence: Precedence::None,
+            infix: Some(call),
+            precedence: Precedence::Call,
         },
         TokenType::LeftBracket => ParseRule {
             prefix: Some(list),
@@ -1058,6 +1382,12 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         },
         TokenType::False | TokenType::Nil | TokenType::True => ParseRule {
             prefix: Some(literal),
+            infix: None,
+            precedence: Precedence::None,
+        },
+        // For switch statement
+        TokenType::Colon | TokenType::Switch | TokenType::Case | TokenType::Default => ParseRule {
+            prefix: None,
             infix: None,
             precedence: Precedence::None,
         },

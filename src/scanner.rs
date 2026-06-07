@@ -12,6 +12,7 @@ pub enum TokenType {
     Minus,
     Plus,
     Semicolon,
+    Colon,
     Slash,
     Backslash,
     Star,
@@ -33,6 +34,8 @@ pub enum TokenType {
     // Keywords
     And,
     Class,
+    Case,
+    Default,
     Else,
     False,
     For,
@@ -43,6 +46,7 @@ pub enum TokenType {
     Print,
     Return,
     Super,
+    Switch,
     This,
     True,
     Var,
@@ -109,6 +113,7 @@ impl<'a> Scanner<'a> {
             '{' => self.make_token(TokenType::LeftBrace),
             '}' => self.make_token(TokenType::RightBrace),
             ';' => self.make_token(TokenType::Semicolon),
+            ':' => self.make_token(TokenType::Colon),
             ',' => self.make_token(TokenType::Comma),
             '.' => self.make_token(TokenType::Dot),
             '-' => self.make_token(TokenType::Minus),
@@ -246,7 +251,18 @@ impl<'a> Scanner<'a> {
     fn identifier_type(&self) -> TokenType {
         match self.start.chars().next().unwrap() {
             'a' => self.check_keyword(1, "nd", TokenType::And),
-            'c' => self.check_keyword(1, "lass", TokenType::Class),
+            'c' => {
+                if self.start.len() - self.current.len() > 1 {
+                    match self.start.chars().nth(1) {
+                        Some('a') => self.check_keyword(2, "se", TokenType::Case),
+                        Some('l') => self.check_keyword(2, "ass", TokenType::Class),
+                        _ => TokenType::Identifier,
+                    }
+                } else {
+                    TokenType::Identifier
+                }
+            }
+            'd' => self.check_keyword(1, "efault", TokenType::Default),
             'e' => self.check_keyword(1, "lse", TokenType::Else),
             'f' => {
                 if self.start.len() - self.current.len() > 1 {
@@ -265,7 +281,17 @@ impl<'a> Scanner<'a> {
             'o' => self.check_keyword(1, "r", TokenType::Or),
             'p' => self.check_keyword(1, "rint", TokenType::Print),
             'r' => self.check_keyword(1, "eturn", TokenType::Return),
-            's' => self.check_keyword(1, "uper", TokenType::Super),
+            's' => {
+                if self.start.len() - self.current.len() > 1 {
+                    match self.start.chars().nth(1) {
+                        Some('u') => self.check_keyword(2, "per", TokenType::Super),
+                        Some('w') => self.check_keyword(2, "itch", TokenType::Switch),
+                        _ => TokenType::Identifier,
+                    }
+                } else {
+                    TokenType::Identifier
+                }
+            }
             't' => {
                 if self.start.len() - self.current.len() > 1 {
                     match self.start.chars().nth(1) {

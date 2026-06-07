@@ -83,6 +83,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Not as u8 => simple_instruction("OP_NOT", offset),
         x if x == OpCode::Negate as u8 => simple_instruction("OP_NEGATE", offset),
         x if x == OpCode::Pop as u8 => simple_instruction("OP_POP", offset),
+        x if x == OpCode::Dup as u8 => simple_instruction("OP_DUP", offset),
         x if x == OpCode::GetLocal as u8 => byte_instruction("OP_GET_LOCAL", chunk, offset),
         x if x == OpCode::SetLocal as u8 => byte_instruction("OP_SET_LOCAL", chunk, offset),
         x if x == OpCode::GetLocalLong as u8 => {
@@ -108,6 +109,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
             jump_instruction("OP_JUMP_IF_FALSE", 1, chunk, offset)
         }
         x if x == OpCode::Loop as u8 => jump_instruction("OP_LOOP", -1, chunk, offset),
+        x if x == OpCode::Call as u8 => byte_instruction("OP_CALL", chunk, offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {
             println!("Unknown opcode {}", instruction);
