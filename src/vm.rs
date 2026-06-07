@@ -12,23 +12,26 @@ use crate::value::{Value, values_equal};
 #[cfg(feature = "debug_trace_execution")]
 use crate::debug::disassemble_instruction;
 
+const FRAMES_MAX: usize = 256;
+
 macro_rules! read_byte {
     ($vm:expr, $chunk:expr) => {{
-        let frame = $vm.frames.last_mut().unwrap();
-        let byte = $chunk.code[frame.ip];
+        let frame = &mut $vm.frames[$vm.frame_count - 1];
+        let ip = frame.ip;
         frame.ip += 1;
-        byte
+        $chunk.code[ip]
     }};
 }
 
 macro_rules! read_short {
     ($vm:expr, $chunk:expr) => {{
-        let frame = $vm.frames.last_mut().unwrap();
-        let lo = $chunk.code[frame.ip] as u16;
-        frame.ip += 1;
-        let hi = $chunk.code[frame.ip] as u16;
-        frame.ip += 1;
-        (hi << 8) | lo
+        let frame = &mut $vm.frames[$vm.frame_count - 1];
+        let ip = frame.ip;
+
+        frame.ip += 2;
+
+        let bytes: [u8; 2] = $chunk.code[ip..ip + 2].try_into().unwrap();
+        u16::from_le_bytes(bytes)
     }};
 }
 
@@ -57,6 +60,7 @@ macro_rules! binary_op {
     }};
 }
 
+#[derive(Clone, Copy)]
 pub struct CallFrame {
     pub function: *mut ObjFunction,
     pub ip: usize,
@@ -64,7 +68,8 @@ pub struct CallFrame {
 }
 
 pub struct VM {
-    pub frames: Vec<CallFrame>,
+    pub frames: [CallFrame; FRAMES_MAX],
+    pub frame_count: usize,
     stack: Vec<Value>,
     pub objects: *mut Obj,
     pub strings: Table,
@@ -79,8 +84,15 @@ pub enum InterpretResult {
 
 impl VM {
     pub fn new() -> Self {
+        let dummy_frame = CallFrame {
+            function: std::ptr::null_mut(),
+            ip: 0,
+            slots: 0,
+        };
+
         let mut vm = VM {
-            frames: Vec::new(),
+            frames: [dummy_frame; FRAMES_MAX],
+            frame_count: 0,
             stack: Vec::new(),
             objects: std::ptr::null_mut(),
             strings: Table::new(),
@@ -126,18 +138,18 @@ impl VM {
             return false;
         }
 
-        if self.frames.len() == 256 {
+        if self.frame_count == FRAMES_MAX {
             self.runtime_error("Stack overflow.");
             return false;
         }
 
-        let frame = CallFrame {
+        self.frames[self.frame_count] = CallFrame {
             function,
             ip: 0,
             slots: self.stack.len() - arg_count - 1,
         };
 
-        self.frames.push(frame);
+        self.frame_count += 1;
         true
     }
 
@@ -174,7 +186,8 @@ impl VM {
     fn runtime_error(&mut self, message: &str) {
         eprintln!("{}", message);
 
-        for frame in self.frames.iter().rev() {
+        for i in (0..self.frame_count).rev() {
+            let frame = &self.frames[i];
             let instruction = frame.ip - 1;
             let line = unsafe { (*frame.function).chunk.get_line(instruction) };
 
@@ -187,7 +200,7 @@ impl VM {
         }
 
         self.stack.clear();
-        self.frames.clear();
+        self.frame_count = 0;
     }
 
     fn define_native(&mut self, name: &str, function: NativeFn) {
@@ -229,7 +242,7 @@ fn clock_native(_: usize, _: &[Value]) -> Value {
 
 fn run(vm: &mut VM) -> InterpretResult {
     loop {
-        let chunk = unsafe { &(*vm.frames.last().unwrap().function).chunk };
+        let chunk = unsafe { &(*vm.frames[vm.frame_count - 1].function).chunk };
 
         #[cfg(feature = "debug_trace_execution")]
         {
@@ -316,24 +329,24 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::GetLocal as u8 => {
                 let slot = read_byte!(vm, chunk) as usize;
-                let frame_slots = vm.frames.last().unwrap().slots;
+                let frame_slots = vm.frames[vm.frame_count - 1].slots;
                 let value = vm.stack[frame_slots + slot];
                 vm.push(value);
             }
             x if x == OpCode::SetLocal as u8 => {
                 let slot = read_byte!(vm, chunk) as usize;
-                let frame_slots = vm.frames.last().unwrap().slots;
+                let frame_slots = vm.frames[vm.frame_count - 1].slots;
                 vm.stack[frame_slots + slot] = vm.peek(0);
             }
             x if x == OpCode::GetLocalLong as u8 => {
                 let slot = read_short!(vm, chunk) as usize;
-                let frame_slots = vm.frames.last().unwrap().slots;
+                let frame_slots = vm.frames[vm.frame_count - 1].slots;
                 let value = vm.stack[frame_slots + slot];
                 vm.push(value);
             }
             x if x == OpCode::SetLocalLong as u8 => {
                 let slot = read_short!(vm, chunk) as usize;
-                let frame_slots = vm.frames.last().unwrap().slots;
+                let frame_slots = vm.frames[vm.frame_count - 1].slots;
                 vm.stack[frame_slots + slot] = vm.peek(0);
             }
             x if x == OpCode::GetGlobal as u8 => {
@@ -445,17 +458,17 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::Jump as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
-                vm.frames.last_mut().unwrap().ip += offset;
+                vm.frames[vm.frame_count - 1].ip += offset;
             }
             x if x == OpCode::JumpIfFalse as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
                 if vm.peek(0).is_falsy() {
-                    vm.frames.last_mut().unwrap().ip += offset;
+                    vm.frames[vm.frame_count - 1].ip += offset;
                 }
             }
             x if x == OpCode::Loop as u8 => {
                 let offset = read_short!(vm, chunk) as usize;
-                vm.frames.last_mut().unwrap().ip -= offset;
+                vm.frames[vm.frame_count - 1].ip -= offset;
             }
             x if x == OpCode::Call as u8 => {
                 let arg_count = read_byte!(vm, chunk) as usize;
@@ -466,13 +479,16 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::Return as u8 => {
                 let result = vm.pop();
-                let frame = vm.frames.pop().unwrap();
-                if vm.frames.is_empty() {
+
+                vm.frame_count -= 1;
+
+                if vm.frame_count == 0 {
                     vm.pop();
                     return InterpretResult::Ok;
                 }
 
-                vm.stack.truncate(frame.slots);
+                let slots = vm.frames[vm.frame_count].slots;
+                vm.stack.truncate(slots);
                 vm.push(result);
             }
             _ => {
