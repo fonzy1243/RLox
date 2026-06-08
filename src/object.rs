@@ -10,6 +10,7 @@ use crate::vm::VM;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ObjType {
+    Closure,
     Function,
     Native,
     String,
@@ -26,6 +27,7 @@ pub struct Obj {
 pub struct ObjFunction {
     pub obj: Obj,
     pub arity: usize,
+    pub upvalue_count: usize,
     pub chunk: Chunk,
     pub name: *mut ObjString,
 }
@@ -42,6 +44,12 @@ pub struct ObjString {
     pub obj: Obj,
     pub length: usize,
     pub hash: u32,
+}
+
+#[repr(C)]
+pub struct ObjClosure {
+    pub obj: Obj,
+    pub function: *mut ObjFunction,
 }
 
 #[repr(C)]
@@ -71,12 +79,23 @@ impl ObjString {
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.obj_type {
+            ObjType::Closure => {
+                let closure = unsafe { &*(self as *const Obj as *const ObjClosure) };
+                let function = unsafe { &*closure.function };
+
+                if function.name.is_null() {
+                    write!(f, "<script>")
+                } else {
+                    let name = ObjString::as_str(function.name);
+                    write!(f, "<fn {}>", name)
+                }
+            }
             ObjType::Function => {
                 let function = unsafe { &*(self as *const Obj as *const ObjFunction) };
                 if function.name.is_null() {
                     write!(f, "<script>")
                 } else {
-                    let name = unsafe { ObjString::as_str(function.name) };
+                    let name = ObjString::as_str(function.name);
                     write!(f, "<fn {}>", name)
                 }
             }
@@ -116,6 +135,21 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     ptr
 }
 
+pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClosure {
+    let closure = Box::new(ObjClosure {
+        obj: Obj {
+            obj_type: ObjType::Closure,
+            next: vm.objects,
+        },
+        function,
+    });
+
+    let ptr = Box::into_raw(closure);
+    vm.objects = ptr as *mut Obj;
+
+    ptr
+}
+
 pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     let function = ObjFunction {
         obj: Obj {
@@ -123,6 +157,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
             next: vm.objects,
         },
         arity: 0,
+        upvalue_count: 0,
         chunk: Chunk::new(),
         name: std::ptr::null_mut(),
     };
@@ -220,6 +255,9 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
 pub fn free_object(object: *mut Obj) {
     unsafe {
         match (*object).obj_type {
+            ObjType::Closure => {
+                let _ = Box::from_raw(object as *mut ObjClosure);
+            }
             ObjType::Function => {
                 let _ = Box::from_raw(object as *mut ObjFunction);
             }

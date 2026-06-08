@@ -2,6 +2,7 @@ use crate::value::{Value, values_equal};
 
 #[derive(Debug)]
 #[repr(u8)]
+#[derive(PartialEq)]
 pub enum OpCode {
     Constant,
     ConstantLong,
@@ -17,6 +18,8 @@ pub enum OpCode {
     GetGlobal,
     DefineGlobal,
     SetGlobal,
+    GetUpvalue,
+    SetUpvalue,
     BuildList,
     BuildListLong,
     GetIndex,
@@ -36,6 +39,7 @@ pub enum OpCode {
     JumpIfFalse,
     Loop,
     Call,
+    Closure,
     Return,
 }
 

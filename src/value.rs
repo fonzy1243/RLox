@@ -1,4 +1,4 @@
-use crate::object::{Obj, ObjFunction, ObjList, ObjNative, ObjString, ObjType};
+use crate::object::{Obj, ObjClosure, ObjFunction, ObjList, ObjNative, ObjString, ObjType};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
@@ -51,6 +51,9 @@ impl Value {
     pub fn is_native(&self) -> bool {
         self.is_obj_type(ObjType::Native)
     }
+    pub fn is_closure(&self) -> bool {
+        self.is_obj_type(ObjType::Closure)
+    }
 
     // AS_ macros
     pub fn as_bool(&self) -> bool {
@@ -93,6 +96,12 @@ impl Value {
         match self {
             Value::Obj(ptr) => *ptr as *mut ObjNative,
             _ => panic!("Value is not a native function"),
+        }
+    }
+    pub fn as_closure(&self) -> *mut ObjClosure {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjClosure,
+            _ => panic!("Value is not a closure."),
         }
     }
 }

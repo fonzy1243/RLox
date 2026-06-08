@@ -110,6 +110,15 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         }
         x if x == OpCode::Loop as u8 => jump_instruction("OP_LOOP", -1, chunk, offset),
         x if x == OpCode::Call as u8 => byte_instruction("OP_CALL", chunk, offset),
+        x if x == OpCode::Closure as u8 => {
+            let constant = chunk.code[offset + 1] as usize;
+            print!("{:-16} {:4} ", "OP_CLOSURE", constant);
+            let value = chunk.constants[constant];
+            print!("{}", value);
+            println!();
+
+            offset + 2
+        }
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {
             println!("Unknown opcode {}", instruction);

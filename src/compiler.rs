@@ -47,6 +47,12 @@ struct Local<'a> {
     depth: i32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct Upvalue {
+    index: u8,
+    is_local: bool,
+}
+
 #[derive(Copy, Clone, PartialEq)]
 pub enum FunctionType {
     Function,
@@ -62,6 +68,7 @@ struct Compiler<'a> {
     local_count: usize,
     scope_depth: i32,
     locals_map: HashMap<&'a str, Vec<usize>>,
+    upvalues: Vec<Upvalue>,
 }
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
@@ -92,6 +99,7 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         local_count: 1,
         scope_depth: 0,
         locals_map: HashMap::new(),
+        upvalues: Vec::with_capacity(100),
     };
     new_compiler.locals[0].depth = 0;
     new_compiler.locals[0].name.start = "";
@@ -156,6 +164,7 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         local_count: 1,
         scope_depth: 0,
         locals_map: HashMap::new(),
+        upvalues: Vec::with_capacity(100),
     };
 
     compiler.locals[0].depth = 0;
@@ -274,7 +283,8 @@ fn function<'a>(
     block(parser, scanner, new_chunk, vm);
 
     let function_ptr = end_compiler(parser, new_chunk);
-    emit_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
+    let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
+    emit_bytes(parser, chunk, OpCode::Closure as u8, constant as u8);
 }
 
 fn fun_declaration<'a>(
@@ -1021,14 +1031,27 @@ fn named_variable<'a>(
     name: Token<'a>,
     can_assign: bool,
 ) {
-    let mut is_local = false;
-    let mut arg = 0;
+    let arg;
+    let get_op;
+    let set_op;
 
     if let Some(local_arg) = resolve_local(parser, &name) {
-        is_local = true;
         arg = local_arg;
+        if arg <= 255 {
+            get_op = OpCode::GetLocal;
+            set_op = OpCode::SetLocal;
+        } else {
+            get_op = OpCode::GetLocalLong;
+            set_op = OpCode::SetLocalLong
+        }
+    } else if let Some(upvalue_arg) = resolve_upvalue(parser, &name) {
+        arg = upvalue_arg;
+        get_op = OpCode::GetUpvalue;
+        set_op = OpCode::SetUpvalue;
     } else {
         arg = identifier_constant(parser, chunk, vm, name) as usize;
+        get_op = OpCode::GetGlobal;
+        set_op = OpCode::SetGlobal;
     }
 
     let is_assignment = can_assign && match_token(parser, scanner, TokenType::Equal);
@@ -1036,31 +1059,13 @@ fn named_variable<'a>(
         expression(parser, scanner, chunk, vm);
     }
 
-    if is_local {
-        if arg <= 255 {
-            let op = if is_assignment {
-                OpCode::SetLocal
-            } else {
-                OpCode::GetLocal
-            };
-            emit_bytes(parser, chunk, op as u8, arg as u8);
-        } else {
-            let op = if is_assignment {
-                OpCode::SetLocalLong
-            } else {
-                OpCode::GetLocalLong
-            };
-            emit_byte(parser, chunk, op as u8);
-            // Emit the 16-bit int as two little-endian bytes
-            emit_byte(parser, chunk, (arg & 0xFF) as u8);
-            emit_byte(parser, chunk, ((arg >> 8) & 0xFF) as u8);
-        }
+    let op = if is_assignment { set_op } else { get_op };
+
+    if op == OpCode::GetLocalLong || op == OpCode::SetLocalLong {
+        emit_byte(parser, chunk, op as u8);
+        emit_byte(parser, chunk, (arg & 0xff) as u8);
+        emit_byte(parser, chunk, ((arg >> 8) & 0xff) as u8);
     } else {
-        let op = if is_assignment {
-            OpCode::SetGlobal
-        } else {
-            OpCode::GetGlobal
-        };
         emit_bytes(parser, chunk, op as u8, arg as u8);
     }
 }
@@ -1154,6 +1159,58 @@ fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize>
             }
             return Some(index);
         }
+    }
+
+    None
+}
+
+fn resolve_enclosing_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
+    let name_str = &name.start[..name.length];
+
+    let (found_index, is_uninitialized) = {
+        let enclosing = parser.compiler.enclosing.as_ref().unwrap();
+        if let Some(stack) = enclosing.locals_map.get(name_str) {
+            if let Some(&index) = stack.last() {
+                (Some(index), enclosing.locals[index].depth == -1)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        }
+    };
+
+    if is_uninitialized {
+        error(parser, "Cannot read local variable in its own initializer.");
+    }
+
+    found_index
+}
+
+fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> usize {
+    for (i, upvalue) in compiler.upvalues.iter().enumerate() {
+        if upvalue.index == index && upvalue.is_local == is_local {
+            return i;
+        }
+    }
+
+    compiler.upvalues.push(Upvalue { index, is_local });
+
+    unsafe {
+        (*compiler.function).upvalue_count = compiler.upvalues.len();
+    }
+
+    compiler.upvalues.len() - 1
+}
+
+fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
+    if parser.compiler.enclosing.is_none() {
+        return None;
+    }
+
+    let local = resolve_local(parser, name);
+    if let Some(local_idx) = local {
+        return Some(add_upvalue(&mut parser.compiler, local_idx as u8, true));
     }
 
     None
