@@ -16,49 +16,55 @@ const FRAMES_MAX: usize = 256;
 const STACK_MAX: usize = FRAMES_MAX * 256;
 
 macro_rules! read_byte {
-    ($vm:expr, $chunk:expr) => {{
-        let frame = &mut $vm.frames[$vm.frame_count - 1];
-        let ip = frame.ip;
-        frame.ip += 1;
-        $chunk.code[ip]
+    ($ip:expr, $chunk:expr) => {{
+        unsafe {
+            let b = *$chunk.code.get_unchecked($ip);
+            $ip += 1;
+            b
+        }
     }};
 }
 
 macro_rules! read_short {
-    ($vm:expr, $chunk:expr) => {{
-        let frame = &mut $vm.frames[$vm.frame_count - 1];
-        let ip = frame.ip;
-
-        frame.ip += 2;
-
-        let bytes: [u8; 2] = $chunk.code[ip..ip + 2].try_into().unwrap();
-        u16::from_le_bytes(bytes)
+    ($ip:expr, $chunk:expr) => {{
+        unsafe {
+            let b1 = *$chunk.code.get_unchecked($ip);
+            let b2 = *$chunk.code.get_unchecked($ip + 1);
+            $ip += 2;
+            u16::from_le_bytes([b1, b2])
+        }
     }};
 }
 
 macro_rules! read_constant {
-    ($vm:expr, $chunk:expr) => {
-        $chunk.constants[read_byte!($vm, $chunk) as usize]
+    ($ip:expr, $chunk:expr) => {
+        unsafe {
+            *$chunk
+                .constants
+                .get_unchecked(read_byte!($ip, $chunk) as usize)
+        }
     };
 }
 
 macro_rules! read_string {
-    ($vm:expr, $chunk:expr) => {{
-        let constant = read_constant!($vm, $chunk);
+    ($ip:expr, $chunk:expr) => {{
+        let constant = read_constant!($ip, $chunk);
         constant.as_obj() as *mut ObjString
     }};
 }
 
 macro_rules! binary_op {
-    ($vm:expr, $wrap:expr, $op:tt) => {{
+    ($vm:expr, $ip:expr, $wrap:expr, $op:tt) => {{
         if !$vm.peek(0).is_number() || !$vm.peek(1).is_number() {
+            $vm.frames[$vm.frame_count - 1].ip = $ip;
             $vm.runtime_error("Operands must be numbers.");
             return InterpretResult::RuntimeError;
         }
         let b = $vm.pop().as_number();
-        let stack_top = $vm.stack_top;
-        let top = &mut $vm.stack[stack_top - 1];
-        *top = $wrap(top.as_number() $op b);
+        unsafe {
+            let top_ptr = $vm.stack_top.sub(1);
+            *top_ptr = $wrap((*top_ptr).as_number() $op b);
+        }
     }};
 }
 
@@ -66,14 +72,14 @@ macro_rules! binary_op {
 pub struct CallFrame {
     pub function: *mut ObjFunction,
     pub ip: usize,
-    pub slots: usize,
+    pub slots: *mut Value,
 }
 
 pub struct VM {
     pub frames: [CallFrame; FRAMES_MAX],
     pub frame_count: usize,
     pub stack: Box<[Value; STACK_MAX]>,
-    pub stack_top: usize,
+    pub stack_top: *mut Value,
     pub objects: *mut Obj,
     pub strings: Table,
     pub globals: Table,
@@ -90,14 +96,17 @@ impl VM {
         let dummy_frame = CallFrame {
             function: std::ptr::null_mut(),
             ip: 0,
-            slots: 0,
+            slots: std::ptr::null_mut(),
         };
+
+        let mut stack: Box<[Value; STACK_MAX]> = vec![Value::Nil; STACK_MAX].try_into().unwrap();
+        let stack_top = stack.as_mut_ptr();
 
         let mut vm = VM {
             frames: [dummy_frame; FRAMES_MAX],
             frame_count: 0,
-            stack: vec![Value::Nil; STACK_MAX].try_into().unwrap(),
-            stack_top: 0,
+            stack: stack,
+            stack_top: stack_top,
             objects: std::ptr::null_mut(),
             strings: Table::new(),
             globals: Table::new(),
@@ -122,18 +131,20 @@ impl VM {
 
     pub fn push(&mut self, value: Value) {
         unsafe {
-            *self.stack.get_unchecked_mut(self.stack_top) = value;
+            *self.stack_top = value;
+            self.stack_top = self.stack_top.add(1);
         }
-        self.stack_top += 1;
     }
 
     pub fn pop(&mut self) -> Value {
-        self.stack_top -= 1;
-        unsafe { *self.stack.get_unchecked(self.stack_top) }
+        unsafe {
+            self.stack_top = self.stack_top.sub(1);
+            *self.stack_top
+        }
     }
 
     pub fn peek(&self, distance: usize) -> Value {
-        self.stack[self.stack_top - 1 - distance]
+        unsafe { *self.stack_top.sub(1 + distance) }
     }
 
     fn call(&mut self, function: *mut ObjFunction, arg_count: usize) -> bool {
@@ -154,7 +165,7 @@ impl VM {
         self.frames[self.frame_count] = CallFrame {
             function,
             ip: 0,
-            slots: self.stack_top - arg_count - 1,
+            slots: unsafe { self.stack_top.sub(arg_count + 1) },
         };
 
         self.frame_count += 1;
@@ -166,11 +177,15 @@ impl VM {
             return self.call(callee.as_function(), arg_count);
         } else if callee.is_native() {
             let native = callee.as_native();
-            let args_start = self.stack_top - arg_count;
-            let result = unsafe { (*native).function }(arg_count, &self.stack[args_start..]);
-            self.stack_top = args_start - 1;
-            self.push(result);
-            return true;
+            unsafe {
+                let args_start = self.stack_top.sub(arg_count);
+                let args_slice = std::slice::from_raw_parts(args_start, arg_count);
+                let result = ((*native).function)(arg_count, args_slice);
+                self.stack_top = args_start.sub(1);
+
+                self.push(result);
+                return true;
+            }
         }
 
         self.runtime_error("Can only call functions and classes.");
@@ -207,7 +222,7 @@ impl VM {
             }
         }
 
-        self.stack_top = 0;
+        self.stack_top = self.frames[self.frame_count].slots;
         self.frame_count = 0;
     }
 
@@ -249,36 +264,40 @@ fn clock_native(_: usize, _: &[Value]) -> Value {
 // ----------------
 
 fn run(vm: &mut VM) -> InterpretResult {
-    loop {
-        let chunk = unsafe { &(*vm.frames[vm.frame_count - 1].function).chunk };
+    let mut ip = vm.frames[vm.frame_count - 1].ip;
+    let mut chunk = unsafe { &(*vm.frames[vm.frame_count - 1].function).chunk };
 
+    loop {
         #[cfg(feature = "debug_trace_execution")]
         {
-            use crate::debug::disassemble_instruction;
-
             print!("          ");
-            for i in 0..vm.stack_top {
-                print!("[ {} ]", vm.stack[i]);
+            unsafe {
+                let stack_len = vm.stack_top.offset_from(vm.stack.as_ptr()) as usize;
+                let stack_slice = std::slice::from_raw_parts(vm.stack.as_ptr(), stack_len);
+
+                for value in stack_slice {
+                    print!("[ {} ]", value);
+                }
             }
             println!();
 
-            let frame = vm.frames[vm.frame_count - 1];
             unsafe {
-                disassemble_instruction(&(*frame.function).chunk, frame.ip);
+                disassemble_instruction(chunk, ip);
             }
         }
 
-        let instruction = read_byte!(vm, chunk);
+        let instruction = unsafe { *chunk.code.get_unchecked(ip) };
+        ip += 1;
 
         match instruction {
             x if x == OpCode::Constant as u8 => {
-                let constant = read_constant!(vm, chunk);
+                let constant = read_constant!(ip, chunk);
                 vm.push(constant);
             }
             x if x == OpCode::ConstantLong as u8 => {
-                let lo = read_byte!(vm, chunk) as usize;
-                let mi = read_byte!(vm, chunk) as usize;
-                let hi = read_byte!(vm, chunk) as usize;
+                let lo = read_byte!(ip, chunk) as usize;
+                let mi = read_byte!(ip, chunk) as usize;
+                let hi = read_byte!(ip, chunk) as usize;
 
                 let index = lo | (mi << 8) | (hi << 16);
 
@@ -293,8 +312,8 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let a = vm.pop();
                 vm.push(Value::Bool(values_equal(a, b)));
             }
-            x if x == OpCode::Greater as u8 => binary_op!(vm, Value::Bool, >),
-            x if x == OpCode::Less as u8 => binary_op!(vm, Value::Bool, <),
+            x if x == OpCode::Greater as u8 => binary_op!(vm, ip, Value::Bool, >),
+            x if x == OpCode::Less as u8 => binary_op!(vm, ip, Value::Bool, <),
             x if x == OpCode::Add as u8 => {
                 if vm.peek(0).is_string() && vm.peek(1).is_string() {
                     vm.concatenate();
@@ -303,37 +322,42 @@ fn run(vm: &mut VM) -> InterpretResult {
                     let a = vm.pop().as_number();
                     vm.push(Value::Number(a + b));
                 } else {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("Operands must be two numbers or two strings.");
                     return InterpretResult::RuntimeError;
                 }
             }
-            x if x == OpCode::Subtract as u8 => binary_op!(vm, Value::Number, -),
-            x if x == OpCode::Multiply as u8 => binary_op!(vm, Value::Number, *),
-            x if x == OpCode::Divide as u8 => binary_op!(vm, Value::Number, /),
+            x if x == OpCode::Subtract as u8 => binary_op!(vm, ip, Value::Number, -),
+            x if x == OpCode::Multiply as u8 => binary_op!(vm, ip, Value::Number, *),
+            x if x == OpCode::Divide as u8 => binary_op!(vm, ip, Value::Number, /),
             x if x == OpCode::IntDivide as u8 => {
                 if !vm.peek(0).is_number() || !vm.peek(1).is_number() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("Operands must be numbers.");
                     return InterpretResult::RuntimeError;
                 }
 
                 let b = vm.pop().as_number();
-                let stack_top = vm.stack_top;
-                let top = &mut vm.stack[stack_top - 1];
-                *top = Value::Number((top.as_number() / b).trunc());
+                unsafe {
+                    let top_ptr = vm.stack_top.sub(1);
+                    *top_ptr = Value::Number(((*top_ptr).as_number() / b).trunc());
+                }
             }
-            x if x == OpCode::Not as u8 => {
-                let stack_top = vm.stack_top;
-                let top = &mut vm.stack[stack_top - 1];
-                *top = Value::Bool(top.is_falsy());
-            }
+            x if x == OpCode::Not as u8 => unsafe {
+                let top_ptr = vm.stack_top.sub(1);
+                *top_ptr = Value::Bool((*top_ptr).is_falsy());
+            },
             x if x == OpCode::Negate as u8 => {
                 if !vm.peek(0).is_number() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("Operand must be a number.");
                     return InterpretResult::RuntimeError;
                 }
-                let stack_top = vm.stack_top;
-                let top = &mut vm.stack[stack_top - 1];
-                *top = Value::Number(-top.as_number())
+
+                unsafe {
+                    let top_ptr = vm.stack_top.sub(1);
+                    *top_ptr = Value::Number(-(*top_ptr).as_number());
+                }
             }
             x if x == OpCode::Pop as u8 => {
                 vm.pop();
@@ -343,40 +367,49 @@ fn run(vm: &mut VM) -> InterpretResult {
                 vm.push(value);
             }
             x if x == OpCode::GetLocal as u8 => {
-                let slot = read_byte!(vm, chunk) as usize;
-                let frame_slots = vm.frames[vm.frame_count - 1].slots;
-                let value = vm.stack[frame_slots + slot];
-                vm.push(value);
+                let slot = read_byte!(ip, chunk) as usize;
+                unsafe {
+                    let frame = vm.frames.get_unchecked(vm.frame_count - 1);
+                    let value = *frame.slots.add(slot);
+                    vm.push(value);
+                }
             }
             x if x == OpCode::SetLocal as u8 => {
-                let slot = read_byte!(vm, chunk) as usize;
-                let frame_slots = vm.frames[vm.frame_count - 1].slots;
-                vm.stack[frame_slots + slot] = vm.peek(0);
+                let slot = read_byte!(ip, chunk) as usize;
+                unsafe {
+                    let frame = vm.frames.get_unchecked(vm.frame_count - 1);
+                    *frame.slots.add(slot) = vm.peek(0);
+                }
             }
             x if x == OpCode::GetLocalLong as u8 => {
-                let slot = read_short!(vm, chunk) as usize;
-                let frame_slots = vm.frames[vm.frame_count - 1].slots;
-                let value = vm.stack[frame_slots + slot];
-                vm.push(value);
+                let slot = read_short!(ip, chunk) as usize;
+                unsafe {
+                    let frame = vm.frames.get_unchecked(vm.frame_count - 1);
+                    let value = *frame.slots.add(slot);
+                    vm.push(value);
+                }
             }
             x if x == OpCode::SetLocalLong as u8 => {
-                let slot = read_short!(vm, chunk) as usize;
-                let frame_slots = vm.frames[vm.frame_count - 1].slots;
-                vm.stack[frame_slots + slot] = vm.peek(0);
+                let slot = read_short!(ip, chunk) as usize;
+                unsafe {
+                    let frame = vm.frames.get_unchecked(vm.frame_count - 1);
+                    *frame.slots.add(slot) = vm.peek(0);
+                }
             }
             x if x == OpCode::GetGlobal as u8 => {
-                let name = read_string!(vm, chunk);
+                let name = read_string!(ip, chunk);
 
                 if let Some(value) = vm.globals.get(name) {
                     vm.push(value);
                 } else {
                     let name_str = ObjString::as_str(name);
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error(&format!("Undefined variable '{}'.", name_str));
                     return InterpretResult::RuntimeError;
                 }
             }
             x if x == OpCode::DefineGlobal as u8 => {
-                let name = read_string!(vm, chunk);
+                let name = read_string!(ip, chunk);
                 let value = vm.peek(0);
 
                 vm.globals.set(name, value);
@@ -384,19 +417,20 @@ fn run(vm: &mut VM) -> InterpretResult {
                 vm.pop();
             }
             x if x == OpCode::SetGlobal as u8 => {
-                let name = read_string!(vm, chunk);
+                let name = read_string!(ip, chunk);
                 let value = vm.peek(0);
 
                 if vm.globals.set(name, value) {
                     vm.globals.delete(name);
 
                     let name_str = ObjString::as_str(name);
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error(&format!("Undefined variable '{}'.", name_str));
                     return InterpretResult::RuntimeError;
                 }
             }
             x if x == OpCode::BuildList as u8 => {
-                let item_count = read_byte!(vm, chunk) as usize;
+                let item_count = read_byte!(ip, chunk) as usize;
                 let mut items = Vec::with_capacity(item_count);
 
                 for _ in 0..item_count {
@@ -408,7 +442,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 vm.push(Value::Obj(list_ptr as *mut Obj));
             }
             x if x == OpCode::BuildListLong as u8 => {
-                let item_count = read_short!(vm, chunk) as usize;
+                let item_count = read_short!(ip, chunk) as usize;
                 let mut items = Vec::with_capacity(item_count);
 
                 for _ in 0..item_count {
@@ -424,10 +458,12 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let list_val = vm.pop();
 
                 if !list_val.is_list() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("Only lists can be subscripted.");
                     return InterpretResult::RuntimeError;
                 }
                 if !index_val.is_number() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("List index must be a number.");
                     return InterpretResult::RuntimeError;
                 }
@@ -436,6 +472,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let index = index_val.as_number() as usize;
 
                 if index >= list.items.len() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("List index out of bounds.");
                     return InterpretResult::RuntimeError;
                 }
@@ -448,10 +485,12 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let list_val = vm.pop();
 
                 if !list_val.is_list() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("Only lists can be subscripted.");
                     return InterpretResult::RuntimeError;
                 }
                 if !index_val.is_number() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("List index must be a number.");
                     return InterpretResult::RuntimeError;
                 }
@@ -460,6 +499,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let index = index_val.as_number() as usize;
 
                 if index >= list.items.len() {
+                    vm.frames[vm.frame_count - 1].ip = ip;
                     vm.runtime_error("List index out of bounds.");
                     return InterpretResult::RuntimeError;
                 }
@@ -472,29 +512,35 @@ fn run(vm: &mut VM) -> InterpretResult {
                 println!("{}", vm.pop());
             }
             x if x == OpCode::Jump as u8 => {
-                let offset = read_short!(vm, chunk) as usize;
-                vm.frames[vm.frame_count - 1].ip += offset;
+                let offset = read_short!(ip, chunk) as usize;
+                ip += offset;
             }
             x if x == OpCode::JumpIfFalse as u8 => {
-                let offset = read_short!(vm, chunk) as usize;
+                let offset = read_short!(ip, chunk) as usize;
                 if vm.peek(0).is_falsy() {
-                    vm.frames[vm.frame_count - 1].ip += offset;
+                    ip += offset;
                 }
             }
             x if x == OpCode::Loop as u8 => {
-                let offset = read_short!(vm, chunk) as usize;
-                vm.frames[vm.frame_count - 1].ip -= offset;
+                let offset = read_short!(ip, chunk) as usize;
+                ip -= offset;
             }
             x if x == OpCode::Call as u8 => {
-                let arg_count = read_byte!(vm, chunk) as usize;
+                let arg_count = read_byte!(ip, chunk) as usize;
+
+                // Sync the current frame ip back to the VM state before calling another function
+                vm.frames[vm.frame_count - 1].ip = ip;
 
                 if !vm.call_value(vm.peek(arg_count), arg_count) {
                     return InterpretResult::RuntimeError;
                 }
+
+                // Reload context for the new frame
+                ip = vm.frames[vm.frame_count - 1].ip;
+                chunk = unsafe { &(*vm.frames[vm.frame_count - 1].function).chunk };
             }
             x if x == OpCode::Return as u8 => {
                 let result = vm.pop();
-
                 vm.frame_count -= 1;
 
                 if vm.frame_count == 0 {
@@ -505,6 +551,10 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let slots = vm.frames[vm.frame_count].slots;
                 vm.stack_top = slots;
                 vm.push(result);
+
+                // Reload context for the parent frame
+                ip = vm.frames[vm.frame_count - 1].ip;
+                chunk = unsafe { &(*vm.frames[vm.frame_count - 1].function).chunk };
             }
             _ => {
                 println!("Unknown opcode {}", instruction);
