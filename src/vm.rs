@@ -121,13 +121,15 @@ impl VM {
     }
 
     pub fn push(&mut self, value: Value) {
-        self.stack[self.stack_top] = value;
+        unsafe {
+            *self.stack.get_unchecked_mut(self.stack_top) = value;
+        }
         self.stack_top += 1;
     }
 
     pub fn pop(&mut self) -> Value {
         self.stack_top -= 1;
-        self.stack[self.stack_top]
+        unsafe { *self.stack.get_unchecked(self.stack_top) }
     }
 
     pub fn peek(&self, distance: usize) -> Value {
@@ -252,12 +254,18 @@ fn run(vm: &mut VM) -> InterpretResult {
 
         #[cfg(feature = "debug_trace_execution")]
         {
+            use crate::debug::disassemble_instruction;
+
             print!("          ");
             for i in 0..vm.stack_top {
                 print!("[ {} ]", vm.stack[i]);
             }
             println!();
-            disassemble_instruction(vm.chunk.as_ref().unwrap(), vm.ip);
+
+            let frame = vm.frames[vm.frame_count - 1];
+            unsafe {
+                disassemble_instruction(&(*frame.function).chunk, frame.ip);
+            }
         }
 
         let instruction = read_byte!(vm, chunk);
