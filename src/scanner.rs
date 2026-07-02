@@ -62,12 +62,15 @@ pub struct Token<'a> {
     pub start: &'a str,
     pub length: usize,
     pub line: usize,
+    pub column: usize,
 }
 
 pub struct Scanner<'a> {
     start: &'a str,
     current: &'a str,
     line: usize,
+    column: usize,
+    start_column: usize,
 }
 
 impl<'a> Scanner<'a> {
@@ -76,6 +79,8 @@ impl<'a> Scanner<'a> {
             start: source,
             current: source,
             line: 1,
+            column: 1,
+            start_column: 1,
         }
     }
 
@@ -90,6 +95,7 @@ impl<'a> Scanner<'a> {
     pub fn scan_token(&mut self) -> Token<'a> {
         self.skip_whitespace();
         self.start = self.current;
+        self.start_column = self.column;
 
         if self.is_at_end() {
             return self.make_token(TokenType::Eof);
@@ -171,6 +177,7 @@ impl<'a> Scanner<'a> {
     fn advance(&mut self) -> char {
         let c = self.current.chars().next().unwrap();
         self.current = &self.current[c.len_utf8()..];
+        self.column += 1;
         c
     }
 
@@ -202,6 +209,7 @@ impl<'a> Scanner<'a> {
             start: self.start,
             length,
             line: self.line,
+            column: self.start_column,
         }
     }
 
@@ -211,6 +219,7 @@ impl<'a> Scanner<'a> {
             start: message,
             length: message.len(),
             line: self.line,
+            column: self.start_column,
         }
     }
 
@@ -223,6 +232,7 @@ impl<'a> Scanner<'a> {
                 '\n' => {
                     self.line += 1;
                     self.advance();
+                    self.column = 1;
                 }
                 '/' => {
                     if self.peek_next() == '/' {

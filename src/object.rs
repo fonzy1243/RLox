@@ -6,6 +6,8 @@ use std::{
 use crate::chunk::Chunk;
 use crate::value::Value;
 use crate::vm::VM;
+#[cfg(feature = "debug_stress_gc")]
+use crate::vm::collect_garbage;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -14,12 +16,14 @@ pub enum ObjType {
     Function,
     Native,
     String,
+    Upvalue,
     List,
 }
 
 #[repr(C)]
 pub struct Obj {
     pub obj_type: ObjType,
+    pub is_marked: bool,
     pub next: *mut Obj,
 }
 
@@ -47,9 +51,19 @@ pub struct ObjString {
 }
 
 #[repr(C)]
+pub struct ObjUpvalue {
+    pub obj: Obj,
+    pub location: *mut Value,
+    pub closed: Value,
+    pub next: *mut ObjUpvalue,
+}
+
+#[repr(C)]
 pub struct ObjClosure {
     pub obj: Obj,
     pub function: *mut ObjFunction,
+    pub upvalues: Box<[*mut ObjUpvalue]>,
+    pub upvalue_count: usize,
 }
 
 #[repr(C)]
@@ -106,6 +120,7 @@ impl fmt::Display for Obj {
                 let s = ObjString::as_str(self as *const Obj as *const ObjString);
                 write!(f, "{}", s)
             }
+            ObjType::Upvalue => write!(f, "upvalue"),
             ObjType::List => {
                 let list = unsafe { &*(self as *const Obj as *const ObjList) };
 
@@ -132,20 +147,42 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
         vm.objects = obj_ptr;
     }
 
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
+
     ptr
 }
 
 pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClosure {
+    let upvalue_count = unsafe { (*function).upvalue_count };
+    let upvalues = vec![std::ptr::null_mut(); upvalue_count].into_boxed_slice();
+
     let closure = Box::new(ObjClosure {
         obj: Obj {
             obj_type: ObjType::Closure,
+            is_marked: false,
             next: vm.objects,
         },
         function,
+        upvalues,
+        upvalue_count,
     });
 
     let ptr = Box::into_raw(closure);
     vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
 
     ptr
 }
@@ -154,6 +191,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     let function = ObjFunction {
         obj: Obj {
             obj_type: ObjType::Function,
+            is_marked: false,
             next: vm.objects,
         },
         arity: 0,
@@ -164,6 +202,15 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
 
     let ptr = Box::into_raw(Box::new(function));
     vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
+
     ptr
 }
 
@@ -172,6 +219,15 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
     unsafe {
         (*ptr).function = function;
     }
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
+
     ptr
 }
 
@@ -192,6 +248,7 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
 
         (*ptr).obj = Obj {
             obj_type: ObjType::String,
+            is_marked: false,
             next: vm.objects,
         };
         (*ptr).length = len;
@@ -201,7 +258,77 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
         std::ptr::copy_nonoverlapping(chars.as_ptr(), chars_ptr, len);
 
+        #[cfg(feature = "debug_stress_gc")]
+        collect_garbage(vm);
+
+        #[cfg(feature = "debug_log_gc")]
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+
         ptr
+    }
+}
+
+pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
+    let upvalue = ObjUpvalue {
+        obj: Obj {
+            obj_type: ObjType::Upvalue,
+            is_marked: false,
+            next: vm.objects,
+        },
+        location: slot,
+        closed: Value::Nil,
+        next: std::ptr::null_mut(),
+    };
+
+    let ptr = Box::into_raw(Box::new(upvalue));
+    vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
+
+    ptr
+}
+
+pub fn capture_upvalue(vm: &mut VM, local: *mut Value) -> *mut ObjUpvalue {
+    let mut prev_upvalue: *mut ObjUpvalue = std::ptr::null_mut();
+    let mut upvalue = vm.open_upvalues;
+
+    unsafe {
+        while !upvalue.is_null() && (*upvalue).location > local {
+            prev_upvalue = upvalue;
+            upvalue = (*upvalue).next;
+        }
+
+        if !upvalue.is_null() && (*upvalue).location == local {
+            return upvalue;
+        }
+
+        let created_upvalue = allocate_upvalue(vm, local);
+        (*created_upvalue).next = upvalue;
+
+        if prev_upvalue.is_null() {
+            vm.open_upvalues = created_upvalue;
+        } else {
+            (*prev_upvalue).next = created_upvalue;
+        }
+
+        created_upvalue
+    }
+}
+
+pub fn close_upvalues(vm: &mut VM, last: *mut Value) {
+    unsafe {
+        while !vm.open_upvalues.is_null() && (*vm.open_upvalues).location >= last {
+            let upvalue = vm.open_upvalues;
+            (*upvalue).closed = *(*upvalue).location;
+            (*upvalue).location = &mut (*upvalue).closed;
+            vm.open_upvalues = (*upvalue).next;
+        }
     }
 }
 
@@ -209,6 +336,7 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     let list = ObjList {
         obj: Obj {
             obj_type: ObjType::List,
+            is_marked: false,
             next: vm.objects,
         },
         items,
@@ -216,6 +344,15 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
 
     let ptr = Box::into_raw(Box::new(list));
     vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+    }
+
     ptr
 }
 
@@ -253,6 +390,9 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
 }
 
 pub fn free_object(object: *mut Obj) {
+    #[cfg(feature = "debug_log_gc")]
+    println!("{:p} free type {:?}", object, (*object).obj_type);
+
     unsafe {
         match (*object).obj_type {
             ObjType::Closure => {
@@ -275,6 +415,9 @@ pub fn free_object(object: *mut Obj) {
                 .unwrap();
 
                 dealloc(object as *mut u8, layout);
+            }
+            ObjType::Upvalue => {
+                let _ = Box::from_raw(object as *mut ObjUpvalue);
             }
             ObjType::List => {
                 // Rebox drops Vec memory

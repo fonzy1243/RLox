@@ -45,6 +45,7 @@ struct ParseRule {
 struct Local<'a> {
     name: Token<'a>,
     depth: i32,
+    is_captured: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -85,10 +86,12 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         start: "",
         length: 0,
         line: 0,
+        column: 0,
     };
     let dummy_local = Local {
         name: dummy,
         depth: -1,
+        is_captured: false,
     };
 
     let mut new_compiler = Compiler {
@@ -102,6 +105,7 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         upvalues: Vec::with_capacity(100),
     };
     new_compiler.locals[0].depth = 0;
+    new_compiler.locals[0].is_captured = false;
     new_compiler.locals[0].name.start = "";
     new_compiler.locals[0].name.length = 0;
 
@@ -148,10 +152,12 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         start: "",
         length: 0,
         line: 0,
+        column: 0,
     };
     let dummy_local = Local {
         name: dummy,
         depth: -1,
+        is_captured: false,
     };
 
     let function = allocate_function(vm);
@@ -187,7 +193,8 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         declaration(&mut parser, &mut scanner, chunk, vm);
     }
 
-    let compiled_fn = end_compiler(&mut parser, chunk);
+    let (compiled_fn, _) = end_compiler(&mut parser, chunk);
+
     if parser.had_error {
         None
     } else {
@@ -200,6 +207,23 @@ fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
 
     loop {
         parser.current = scanner.scan_token();
+
+        #[cfg(feature = "debug_print_tokens")]
+        {
+            if parser.current.line != parser.previous.line {
+                print!("{:4} | ", parser.current.line);
+            } else {
+                print!("   | | ");
+            }
+
+            println!(
+                "{:3} | {:<20?} | '{}'",
+                parser.current.column,
+                parser.current.token_type,
+                &parser.current.start[..parser.current.length]
+            );
+        }
+
         if parser.current.token_type != TokenType::Error {
             break;
         }
@@ -282,9 +306,14 @@ fn function<'a>(
 
     block(parser, scanner, new_chunk, vm);
 
-    let function_ptr = end_compiler(parser, new_chunk);
+    let (function_ptr, upvalues) = end_compiler(parser, new_chunk);
     let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
     emit_bytes(parser, chunk, OpCode::Closure as u8, constant as u8);
+
+    for upvalue in &upvalues {
+        emit_byte(parser, chunk, if upvalue.is_local { 1 } else { 0 });
+        emit_byte(parser, chunk, upvalue.index);
+    }
 }
 
 fn fun_declaration<'a>(
@@ -324,8 +353,11 @@ fn end_scope(parser: &mut Parser, chunk: &mut Chunk) {
             }
         }
 
-        // Clean off the stack at runtime
-        emit_byte(parser, chunk, OpCode::Pop as u8);
+        if parser.compiler.locals[parser.compiler.local_count - 1].is_captured {
+            emit_byte(parser, chunk, OpCode::CloseUpvalue as u8);
+        } else {
+            emit_byte(parser, chunk, OpCode::Pop as u8);
+        }
         parser.compiler.local_count -= 1;
     }
 }
@@ -811,10 +843,11 @@ fn patch_jump(parser: &mut Parser, chunk: &mut Chunk, offset: usize) {
     chunk.code[offset + 1] = ((jump >> 8) & 0xff) as u8;
 }
 
-fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> *mut ObjFunction {
+fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> (*mut ObjFunction, Vec<Upvalue>) {
     emit_return(parser, chunk);
 
     let function = parser.compiler.function;
+    let upvalues = parser.compiler.upvalues.clone();
 
     #[cfg(feature = "debug_print_code")]
     {
@@ -825,7 +858,13 @@ fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> *mut ObjFunction {
                 unsafe { ObjString::as_str((*function).name) }
             };
 
+            unsafe {
+                (*function).upvalue_count = 0;
+            }
             disassemble_chunk(chunk, name);
+            unsafe {
+                (*function).upvalue_count = upvalues.len();
+            }
         }
     }
 
@@ -833,7 +872,7 @@ fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> *mut ObjFunction {
         parser.compiler = *enclosing;
     }
 
-    function
+    (function, upvalues)
 }
 
 fn binary<'a>(
@@ -1203,17 +1242,30 @@ fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> usize {
     compiler.upvalues.len() - 1
 }
 
-fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
-    if parser.compiler.enclosing.is_none() {
-        return None;
-    }
+fn resolve_upvalue_in_compiler<'a>(compiler: &mut Compiler<'a>, name: &Token<'a>) -> Option<usize> {
+    let enclosing = compiler.enclosing.as_mut()?;
 
-    let local = resolve_local(parser, name);
+    let name_str = &name.start[..name.length];
+    let local = if let Some(stack) = enclosing.locals_map.get(name_str) {
+        stack
+            .last()
+            .copied()
+            .filter(|&i| enclosing.locals[i].depth != -1)
+    } else {
+        None
+    };
+
     if let Some(local_idx) = local {
-        return Some(add_upvalue(&mut parser.compiler, local_idx as u8, true));
+        enclosing.locals[local_idx].is_captured = true;
+        return Some(add_upvalue(compiler, local_idx as u8, true));
     }
 
-    None
+    let upvalue = resolve_upvalue_in_compiler(enclosing, name)?;
+    Some(add_upvalue(compiler, upvalue as u8, false))
+}
+
+fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
+    resolve_upvalue_in_compiler(&mut parser.compiler, name)
 }
 
 fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
@@ -1226,6 +1278,7 @@ fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
     let local = &mut parser.compiler.locals[parser.compiler.local_count];
     local.name = name;
     local.depth = -1;
+    local.is_captured = false;
 
     let name_str = &name.start[..name.length];
     parser

@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{
-    NativeFn, Obj, ObjClosure, ObjFunction, ObjString, ObjType, allocate_closure, allocate_list,
-    allocate_native, allocate_string, copy_string, free_object, take_string,
+    NativeFn, Obj, ObjClosure, ObjFunction, ObjString, ObjType, ObjUpvalue, allocate_closure,
+    allocate_list, allocate_native, allocate_string, capture_upvalue, close_upvalues, copy_string,
+    free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -81,6 +82,7 @@ pub struct VM {
     pub objects: *mut Obj,
     pub strings: Table,
     pub globals: Table,
+    pub open_upvalues: *mut ObjUpvalue,
 }
 
 pub enum InterpretResult {
@@ -108,6 +110,7 @@ impl VM {
             objects: std::ptr::null_mut(),
             strings: Table::new(),
             globals: Table::new(),
+            open_upvalues: std::ptr::null_mut(),
         };
 
         vm.define_native("clock", clock_native);
@@ -264,6 +267,16 @@ fn clock_native(_: usize, _: &[Value]) -> Value {
 }
 // ----------------
 
+// Garbage Collection
+pub fn collect_garbage(vm: &mut VM) {
+    #[cfg(feature = "debug_log_gc")]
+    println!("-- gc begin");
+
+    #[cfg(feature = "debug_log_gc")]
+    println!("-- gc end");
+}
+// -----------------
+
 fn run(vm: &mut VM) -> InterpretResult {
     let mut chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
     let mut ip: *const u8 = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
@@ -311,6 +324,22 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Nil as u8 => vm.push(Value::Nil),
             x if x == OpCode::True as u8 => vm.push(Value::Bool(true)),
             x if x == OpCode::False as u8 => vm.push(Value::Bool(false)),
+            x if x == OpCode::GetUpvalue as u8 => {
+                let slot = read_byte!(ip) as usize;
+                let value = unsafe {
+                    let upvalue = (*vm.frames[vm.frame_count - 1].closure).upvalues[slot];
+                    *(*upvalue).location
+                };
+                vm.push(value);
+            }
+            x if x == OpCode::SetUpvalue as u8 => {
+                let slot = read_byte!(ip) as usize;
+                let value = vm.peek(0);
+                unsafe {
+                    let upvalue = (*vm.frames[vm.frame_count - 1].closure).upvalues[slot];
+                    *(*upvalue).location = value;
+                }
+            }
             x if x == OpCode::Equal as u8 => {
                 let b = vm.pop();
                 let a = vm.pop();
@@ -550,13 +579,32 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Closure as u8 => {
                 let function_val = read_constant!(ip, chunk);
                 let function_ptr = function_val.as_function();
-
                 let closure_ptr = allocate_closure(vm, function_ptr);
+
+                let upvalue_count = unsafe { (*closure_ptr).upvalue_count };
+                for i in 0..upvalue_count {
+                    let is_local = read_byte!(ip);
+                    let index = read_byte!(ip) as usize;
+
+                    unsafe {
+                        if is_local == 1 {
+                            (*closure_ptr).upvalues[i] = capture_upvalue(vm, slots.add(index));
+                        } else {
+                            (*closure_ptr).upvalues[i] =
+                                (*vm.frames[vm.frame_count - 1].closure).upvalues[index];
+                        }
+                    }
+                }
 
                 vm.push(Value::Obj(closure_ptr as *mut Obj));
             }
+            x if x == OpCode::CloseUpvalue as u8 => {
+                close_upvalues(vm, unsafe { vm.stack_top.sub(1) });
+                vm.pop();
+            }
             x if x == OpCode::Return as u8 => {
                 let result = vm.pop();
+                close_upvalues(vm, slots);
                 vm.frame_count -= 1;
 
                 if vm.frame_count == 0 {

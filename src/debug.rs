@@ -97,6 +97,8 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
             constant_instruction("OP_DEFINE_GLOBAL", chunk, offset)
         }
         x if x == OpCode::SetGlobal as u8 => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        x if x == OpCode::GetUpvalue as u8 => byte_instruction("OP_GET_UPVALUE", chunk, offset),
+        x if x == OpCode::SetUpvalue as u8 => byte_instruction("OP_SET_UPVALUE", chunk, offset),
         x if x == OpCode::BuildList as u8 => byte_instruction("OP_BUILD_LIST", chunk, offset),
         x if x == OpCode::BuildListLong as u8 => {
             local_long_instruction("OP_BUILD_LIST_LONG", chunk, offset)
@@ -112,13 +114,28 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Call as u8 => byte_instruction("OP_CALL", chunk, offset),
         x if x == OpCode::Closure as u8 => {
             let constant = chunk.code[offset + 1] as usize;
-            print!("{:-16} {:4} ", "OP_CLOSURE", constant);
             let value = chunk.constants[constant];
-            print!("{}", value);
-            println!();
+            println!("{:-16} {:4} {}", "OP_CLOSURE", constant, value);
 
-            offset + 2
+            let function_ptr = value.as_function();
+            let upvalue_count = unsafe { (*function_ptr).upvalue_count };
+
+            let mut current_offset = offset + 2;
+            for _ in 0..upvalue_count {
+                let is_local = chunk.code[current_offset];
+                let index = chunk.code[current_offset + 1];
+                println!(
+                    "{:04}      |                     {} {}",
+                    current_offset,
+                    if is_local == 1 { "local" } else { "upvalue" },
+                    index
+                );
+                current_offset += 2;
+            }
+
+            current_offset
         }
+        x if x == OpCode::CloseUpvalue as u8 => simple_instruction("OP_CLOSE_UPVALUE", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         _ => {
             println!("Unknown opcode {}", instruction);
