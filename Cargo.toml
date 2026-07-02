@@ -8,6 +8,9 @@ edition = "2024"
 [features]
 debug_print_code = []
 debug_trace_execution = []
+debug_print_tokens = []
+debug_stress_gc = []
+debug_log_gc = []
 
 [profile.release]
 opt-level = 3
