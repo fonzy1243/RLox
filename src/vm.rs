@@ -101,14 +101,11 @@ impl VM {
             slots: std::ptr::null_mut(),
         };
 
-        let mut stack: Box<[Value; STACK_MAX]> = vec![Value::Nil; STACK_MAX].try_into().unwrap();
-        let stack_top = stack.as_mut_ptr();
-
         let mut vm = VM {
             frames: [dummy_frame; FRAMES_MAX],
             frame_count: 0,
-            stack: stack,
-            stack_top: stack_top,
+            stack: vec![Value::Nil; STACK_MAX].try_into().unwrap(),
+            stack_top: std::ptr::null_mut(),
             objects: std::ptr::null_mut(),
             strings: Table::new(),
             globals: Table::new(),
@@ -116,6 +113,8 @@ impl VM {
             compiler_roots: Vec::new(),
             gray_stack: Vec::new(),
         };
+
+        vm.stack_top = vm.stack.as_mut_ptr();
 
         vm.define_native("clock", clock_native);
         vm
