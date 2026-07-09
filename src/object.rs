@@ -215,10 +215,17 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
 }
 
 pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
-    let ptr = allocate_object(vm, ObjType::Native) as *mut ObjNative;
-    unsafe {
-        (*ptr).function = function;
-    }
+    let native = ObjNative {
+        obj: Obj {
+            obj_type: ObjType::Native,
+            is_marked: false,
+            next: vm.objects,
+        },
+        function,
+    };
+
+    let ptr = Box::into_raw(Box::new(native));
+    vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
