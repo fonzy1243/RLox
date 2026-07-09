@@ -74,6 +74,7 @@ struct Compiler<'a> {
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
     let func_ptr = allocate_function(vm);
+    vm.compiler_roots.push(func_ptr);
 
     if func_type != FunctionType::Script {
         let name_str = &parser.previous.start[..parser.previous.length];
@@ -193,7 +194,7 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         declaration(&mut parser, &mut scanner, chunk, vm);
     }
 
-    let (compiled_fn, _) = end_compiler(&mut parser, chunk);
+    let (compiled_fn, _) = end_compiler(&mut parser, chunk, vm);
 
     if parser.had_error {
         None
@@ -306,7 +307,7 @@ fn function<'a>(
 
     block(parser, scanner, new_chunk, vm);
 
-    let (function_ptr, upvalues) = end_compiler(parser, new_chunk);
+    let (function_ptr, upvalues) = end_compiler(parser, new_chunk, vm);
     let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
     emit_bytes(parser, chunk, OpCode::Closure as u8, constant as u8);
 
@@ -843,7 +844,11 @@ fn patch_jump(parser: &mut Parser, chunk: &mut Chunk, offset: usize) {
     chunk.code[offset + 1] = ((jump >> 8) & 0xff) as u8;
 }
 
-fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> (*mut ObjFunction, Vec<Upvalue>) {
+fn end_compiler(
+    parser: &mut Parser,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> (*mut ObjFunction, Vec<Upvalue>) {
     emit_return(parser, chunk);
 
     let function = parser.compiler.function;
@@ -871,6 +876,8 @@ fn end_compiler(parser: &mut Parser, chunk: &mut Chunk) -> (*mut ObjFunction, Ve
     if let Some(enclosing) = parser.compiler.enclosing.take() {
         parser.compiler = *enclosing;
     }
+
+    vm.compiler_roots.pop();
 
     (function, upvalues)
 }

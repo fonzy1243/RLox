@@ -83,6 +83,8 @@ pub struct VM {
     pub strings: Table,
     pub globals: Table,
     pub open_upvalues: *mut ObjUpvalue,
+    pub compiler_roots: Vec<*mut ObjFunction>,
+    pub gray_stack: Vec<*mut Obj>,
 }
 
 pub enum InterpretResult {
@@ -111,6 +113,8 @@ impl VM {
             strings: Table::new(),
             globals: Table::new(),
             open_upvalues: std::ptr::null_mut(),
+            compiler_roots: Vec::new(),
+            gray_stack: Vec::new(),
         };
 
         vm.define_native("clock", clock_native);
@@ -274,6 +278,78 @@ pub fn collect_garbage(vm: &mut VM) {
 
     #[cfg(feature = "debug_log_gc")]
     println!("-- gc end");
+}
+
+pub fn mark_object(vm: &mut VM, object: *mut Obj) {
+    if object.is_null() {
+        return;
+    }
+
+    unsafe {
+        if (*object).is_marked {
+            return;
+        }
+
+        #[cfg(feature = "debug_log_gc")]
+        println!("{:p} mark {}", object, unsafe { Value::Obj(object) });
+
+        (*object).is_marked = true;
+    }
+
+    vm.gray_stack.push(object);
+}
+
+pub fn mark_value(vm: &mut VM, value: Value) {
+    if let Value::Obj(ptr) = value {
+        mark_object(vm, ptr);
+    }
+}
+
+fn mark_table(vm: &mut VM, table: &Table) {
+    for i in 0..table.capacity {
+        unsafe {
+            let entry = table.entries.add(i);
+            mark_object(vm, (*entry).key as *mut Obj);
+            mark_value(vm, (*entry).value);
+        }
+    }
+}
+
+fn mark_compiler_roots(vm: &mut VM) {
+    let roots: Vec<*mut ObjFunction> = vm.compiler_roots.clone();
+    for function in roots {
+        mark_object(vm, function as *mut Obj);
+    }
+}
+
+fn mark_roots(vm: &mut VM) {
+    // Mark stack
+    let mut slot = vm.stack.as_ptr() as *const Value;
+    while slot < vm.stack_top as *const Value {
+        unsafe {
+            mark_value(vm, *slot);
+        }
+        slot = unsafe { slot.add(1) }
+    }
+
+    // Mark call frame closures
+    for i in 0..vm.frame_count {
+        mark_object(vm, vm.frames[i].closure as *mut Obj);
+    }
+
+    // Mark open upvalues
+    let mut upvalue = vm.open_upvalues;
+    while !upvalue.is_null() {
+        mark_object(vm, upvalue as *mut Obj);
+        upvalue = unsafe { (*upvalue).next };
+    }
+
+    // Mark globals
+    let globals_ptr = &vm.globals as *const Table;
+    mark_table(vm, unsafe { &*globals_ptr });
+
+    // Mark compiler roots
+    mark_compiler_roots(vm);
 }
 // -----------------
 
