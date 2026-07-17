@@ -1,21 +1,10 @@
-mod chunk;
-mod compiler;
-mod debug;
-mod object;
-mod scanner;
-mod table;
-mod value;
-mod vm;
-
-use crate::chunk::{Chunk, OpCode};
-use crate::debug::disassemble_chunk;
-use crate::vm::{InterpretResult, VM};
-
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 
-fn repl(vm: &mut VM) {
+use rlox::{InterpretResult, Interpreter};
+
+fn repl(interpreter: &mut Interpreter) {
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -27,17 +16,17 @@ fn repl(vm: &mut VM) {
             break;
         }
 
-        vm.interpret(&line);
+        interpreter.interpret(&line);
     }
 }
 
-fn run_file(vm: &mut VM, path: &str) {
+fn run_file(interpreter: &mut Interpreter, path: &str) {
     let source = fs::read_to_string(path).unwrap_or_else(|_| {
         eprintln!("Could not read file \"{}\".", path);
         std::process::exit(74);
     });
 
-    match vm.interpret(&source) {
+    match interpreter.interpret(&source) {
         InterpretResult::CompileError => std::process::exit(65),
         InterpretResult::RuntimeError => std::process::exit(70),
         InterpretResult::Ok => {}
@@ -45,12 +34,12 @@ fn run_file(vm: &mut VM, path: &str) {
 }
 
 fn main() {
-    let mut vm = VM::new();
+    let mut interpreter = Interpreter::new();
     let args: Vec<String> = env::args().collect();
 
     match args.len() {
-        1 => repl(&mut vm),
-        2 => run_file(&mut vm, &args[1]),
+        1 => repl(&mut interpreter),
+        2 => run_file(&mut interpreter, &args[1]),
         _ => {
             eprintln!("Usage: lox [path]");
             std::process::exit(64);

@@ -87,6 +87,7 @@ pub struct VM {
     pub gray_stack: Vec<*mut Obj>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpretResult {
     Ok,
     CompileError,
