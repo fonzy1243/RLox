@@ -1,6 +1,7 @@
 mod chunk;
 mod compiler;
 mod debug;
+mod debug_info;
 mod diagnostic;
 mod object;
 mod runtime_host;
@@ -10,6 +11,10 @@ mod table;
 mod value;
 mod vm;
 
+pub use debug_info::{
+    BindingDebugInfo, BindingId, BindingKind, DebugPoint, DebugPointId, DebugPointKind,
+    FunctionDebugInfo, UpvalueDebugInfo,
+};
 pub use diagnostic::{Diagnostic, DiagnosticPhase, DiagnosticSeverity, RuntimeFrame};
 pub use runtime_host::{RecordingHost, RuntimeHost};
 pub use source::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};

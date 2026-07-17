@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::chunk::Chunk;
+use crate::debug_info::FunctionDebugInfo;
 use crate::value::Value;
 use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
@@ -34,6 +35,7 @@ pub struct ObjFunction {
     pub arity: usize,
     pub upvalue_count: usize,
     pub chunk: Chunk,
+    pub debug_info: FunctionDebugInfo,
     pub name: *mut ObjString,
 }
 
@@ -315,6 +317,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
         arity: 0,
         upvalue_count: 0,
         chunk: Chunk::new(),
+        debug_info: FunctionDebugInfo::default(),
         name: std::ptr::null_mut(),
     };
 

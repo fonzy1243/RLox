@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
 use crate::debug::disassemble_chunk;
+use crate::debug_info::{
+    BindingDebugInfo, BindingId, BindingKind, DebugPoint, DebugPointId, DebugPointKind,
+    FunctionDebugInfo, UpvalueDebugInfo,
+};
 use crate::object::{Obj, ObjFunction, ObjString, allocate_function, copy_string};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
@@ -22,6 +26,8 @@ struct Parser<'a> {
     source_id: SourceId,
     revision: RevisionId,
     diagnostics: Vec<Diagnostic>,
+    next_binding_id: u64,
+    next_debug_point_id: u64,
     compiler: Compiler<'a>,
 }
 
@@ -49,17 +55,31 @@ struct ParseRule {
     precedence: Precedence,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Local<'a> {
     name: Token<'a>,
+    owned_name: String,
     depth: i32,
     is_captured: bool,
+    binding_id: Option<BindingId>,
+    declaration: SourceSpan,
+    metadata_index: Option<usize>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Upvalue {
     index: u8,
     is_local: bool,
+    binding_id: BindingId,
+    name: String,
+    declaration: SourceSpan,
+    metadata_index: usize,
+}
+
+struct PendingPoint {
+    id: DebugPointId,
+    kind: DebugPointKind,
+    span: SourceSpan,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -78,11 +98,102 @@ struct Compiler<'a> {
     scope_depth: i32,
     locals_map: HashMap<&'a str, Vec<usize>>,
     upvalues: Vec<Upvalue>,
+    pending_points: Vec<PendingPoint>,
+}
+
+fn empty_span(source_id: SourceId, revision: RevisionId) -> SourceSpan {
+    let position = crate::TextPosition {
+        byte_offset: 0,
+        line: 1,
+        column: 1,
+    };
+    SourceSpan {
+        source_id,
+        revision,
+        start: position,
+        end: position,
+    }
+}
+
+fn dummy_local<'a>(source_id: SourceId, revision: RevisionId) -> Local<'a> {
+    Local {
+        name: Token {
+            token_type: TokenType::Eof,
+            start: "",
+            length: 0,
+            line: 0,
+            column: 0,
+            start_position: crate::TextPosition {
+                byte_offset: 0,
+                line: 0,
+                column: 0,
+            },
+            end_position: crate::TextPosition {
+                byte_offset: 0,
+                line: 0,
+                column: 0,
+            },
+            error_message: None,
+        },
+        owned_name: String::new(),
+        depth: 0,
+        is_captured: false,
+        binding_id: None,
+        declaration: empty_span(source_id, revision),
+        metadata_index: None,
+    }
+}
+
+fn initialize_function_debug_info(
+    function: *mut ObjFunction,
+    source_id: SourceId,
+    revision: RevisionId,
+    declaration: SourceSpan,
+    entry_id: DebugPointId,
+) {
+    unsafe {
+        (*function).debug_info = FunctionDebugInfo {
+            source_id,
+            revision,
+            declaration,
+            points: vec![DebugPoint {
+                id: entry_id,
+                offset: 0,
+                kind: DebugPointKind::FunctionEntry,
+                span: declaration,
+            }],
+            bindings: Vec::new(),
+            upvalues: Vec::new(),
+        };
+    }
+}
+
+fn next_debug_point_id(parser: &mut Parser<'_>) -> DebugPointId {
+    let id = DebugPointId(parser.next_debug_point_id);
+    parser.next_debug_point_id += 1;
+    id
+}
+
+fn schedule_point(parser: &mut Parser<'_>, kind: DebugPointKind, span: SourceSpan) {
+    let id = next_debug_point_id(parser);
+    parser
+        .compiler
+        .pending_points
+        .push(PendingPoint { id, kind, span });
 }
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
+    let declaration = token_span(parser, parser.previous);
+    let entry_id = next_debug_point_id(parser);
     let func_ptr = allocate_function(vm);
     vm.compiler_roots.push(func_ptr);
+    initialize_function_debug_info(
+        func_ptr,
+        parser.source_id,
+        parser.revision,
+        declaration,
+        entry_id,
+    );
 
     if func_type != FunctionType::Script {
         let name_str = &parser.previous.start[..parser.previous.length];
@@ -90,31 +201,9 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         unsafe { (*func_ptr).name = name_obj };
     }
 
-    let dummy = Token {
-        token_type: TokenType::Eof,
-        start: "",
-        length: 0,
-        line: 0,
-        column: 0,
-        start_position: crate::TextPosition {
-            byte_offset: 0,
-            line: 0,
-            column: 0,
-        },
-        end_position: crate::TextPosition {
-            byte_offset: 0,
-            line: 0,
-            column: 0,
-        },
-        error_message: None,
-    };
-    let dummy_local = Local {
-        name: dummy,
-        depth: -1,
-        is_captured: false,
-    };
+    let dummy_local = dummy_local(parser.source_id, parser.revision);
 
-    let mut new_compiler = Compiler {
+    let new_compiler = Compiler {
         enclosing: None,
         function: func_ptr,
         function_type: func_type,
@@ -123,11 +212,8 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         scope_depth: 0,
         locals_map: HashMap::new(),
         upvalues: Vec::with_capacity(100),
+        pending_points: Vec::new(),
     };
-    new_compiler.locals[0].depth = 0;
-    new_compiler.locals[0].is_captured = false;
-    new_compiler.locals[0].name.start = "";
-    new_compiler.locals[0].name.length = 0;
 
     let old_compiler = std::mem::replace(&mut parser.compiler, new_compiler);
     parser.compiler.enclosing = Some(Box::new(old_compiler));
@@ -229,15 +315,24 @@ pub fn compile(
         },
         error_message: None,
     };
-    let dummy_local = Local {
-        name: dummy,
-        depth: -1,
-        is_captured: false,
-    };
+    let dummy_local = dummy_local(document.id, document.revision);
 
     let function = allocate_function(vm);
+    let script_declaration = SourceSpan {
+        source_id: document.id,
+        revision: document.revision,
+        start: empty_span(document.id, document.revision).start,
+        end: document.eof_span().end,
+    };
+    initialize_function_debug_info(
+        function,
+        document.id,
+        document.revision,
+        script_declaration,
+        DebugPointId(0),
+    );
 
-    let mut compiler = Compiler {
+    let compiler = Compiler {
         enclosing: None,
         function,
         function_type: FunctionType::Script,
@@ -246,11 +341,8 @@ pub fn compile(
         scope_depth: 0,
         locals_map: HashMap::new(),
         upvalues: Vec::with_capacity(100),
+        pending_points: Vec::new(),
     };
-
-    compiler.locals[0].depth = 0;
-    compiler.locals[0].name.start = "";
-    compiler.locals[0].name.length = 0;
 
     let mut parser = Parser {
         current: dummy,
@@ -260,6 +352,8 @@ pub fn compile(
         source_id: document.id,
         revision: document.revision,
         diagnostics: Vec::new(),
+        next_binding_id: 0,
+        next_debug_point_id: 1,
         compiler,
     };
 
@@ -367,8 +461,15 @@ fn function<'a>(
                 }
             }
 
-            let constant = parse_variable(parser, scanner, new_chunk, vm, "Expect parameter name.");
-            define_variable(parser, chunk, constant);
+            let constant = parse_variable(
+                parser,
+                scanner,
+                new_chunk,
+                vm,
+                "Expect parameter name.",
+                BindingKind::Parameter,
+            );
+            define_variable(parser, new_chunk, constant);
 
             if !match_token(parser, scanner, TokenType::Comma) {
                 break;
@@ -393,11 +494,11 @@ fn function<'a>(
 
     let (function_ptr, upvalues) = end_compiler(parser, new_chunk, vm);
     let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
-    emit_bytes(parser, chunk, OpCode::Closure as u8, constant as u8);
+    emit_opcode_with_byte(parser, chunk, OpCode::Closure, constant as u8);
 
     for upvalue in &upvalues {
-        emit_byte(parser, chunk, if upvalue.is_local { 1 } else { 0 });
-        emit_byte(parser, chunk, upvalue.index);
+        emit_byte_operand(parser, chunk, if upvalue.is_local { 1 } else { 0 });
+        emit_byte_operand(parser, chunk, upvalue.index);
     }
 }
 
@@ -407,8 +508,15 @@ fn fun_declaration<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) {
-    let global = parse_variable(parser, scanner, chunk, vm, "Expect function name.");
-    mark_initialized(parser);
+    let global = parse_variable(
+        parser,
+        scanner,
+        chunk,
+        vm,
+        "Expect function name.",
+        BindingKind::Local,
+    );
+    mark_resolver_initialized(parser);
     function(parser, scanner, chunk, vm, FunctionType::Function);
     define_variable(parser, chunk, global);
 }
@@ -428,7 +536,7 @@ fn end_scope(parser: &mut Parser, chunk: &mut Chunk) {
     {
         // Remove variable from map
         let index = parser.compiler.local_count - 1;
-        let local = parser.compiler.locals[index];
+        let local = parser.compiler.locals[index].clone();
         let name_str = &local.name.start[..local.name.length];
 
         if let Some(stack) = parser.compiler.locals_map.get_mut(name_str) {
@@ -438,10 +546,17 @@ fn end_scope(parser: &mut Parser, chunk: &mut Chunk) {
             }
         }
 
-        if parser.compiler.locals[parser.compiler.local_count - 1].is_captured {
-            emit_byte(parser, chunk, OpCode::CloseUpvalue as u8);
+        if let Some(metadata_index) = local.metadata_index {
+            unsafe {
+                (&mut (*parser.compiler.function).debug_info.bindings)[metadata_index].live_end =
+                    chunk.code.len();
+            }
+        }
+
+        if local.is_captured {
+            emit_opcode(parser, chunk, OpCode::CloseUpvalue);
         } else {
-            emit_byte(parser, chunk, OpCode::Pop as u8);
+            emit_opcode(parser, chunk, OpCode::Pop);
         }
         parser.compiler.local_count -= 1;
     }
@@ -453,12 +568,19 @@ fn var_declaration<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) {
-    let global = parse_variable(parser, scanner, chunk, vm, "Expect variable name.");
+    let global = parse_variable(
+        parser,
+        scanner,
+        chunk,
+        vm,
+        "Expect variable name.",
+        BindingKind::Local,
+    );
 
     if match_token(parser, scanner, TokenType::Equal) {
         expression(parser, scanner, chunk, vm);
     } else {
-        emit_byte(parser, chunk, OpCode::Nil as u8);
+        emit_opcode(parser, chunk, OpCode::Nil);
     }
 
     consume(
@@ -484,7 +606,7 @@ fn expression_statement<'a>(
         TokenType::Semicolon,
         "Expect ';' after expression.",
     );
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
 }
 
 fn for_statement<'a>(
@@ -504,14 +626,20 @@ fn for_statement<'a>(
     if match_token(parser, scanner, TokenType::Semicolon) {
         // No initializer
     } else if match_token(parser, scanner, TokenType::Var) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::LoopInitializer, span);
         var_declaration(parser, scanner, chunk, vm);
     } else {
+        let span = token_span(parser, parser.current);
+        schedule_point(parser, DebugPointKind::LoopInitializer, span);
         expression_statement(parser, scanner, chunk, vm);
     }
     let mut loop_start = chunk.code.len();
     let mut exit_jump: Option<usize> = None;
     // Condition
     if !match_token(parser, scanner, TokenType::Semicolon) {
+        let span = token_span(parser, parser.current);
+        schedule_point(parser, DebugPointKind::LoopCondition, span);
         expression(parser, scanner, chunk, vm);
         consume(
             parser,
@@ -521,15 +649,17 @@ fn for_statement<'a>(
         );
 
         // Jump out of the loop if the condition is false.
-        exit_jump = Some(emit_jump(parser, chunk, OpCode::JumpIfFalse as u8));
-        emit_byte(parser, chunk, OpCode::Pop as u8);
+        exit_jump = Some(emit_jump(parser, chunk, OpCode::JumpIfFalse));
+        emit_opcode(parser, chunk, OpCode::Pop);
     }
     // Increment
     if !match_token(parser, scanner, TokenType::RightParen) {
-        let body_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+        let body_jump = emit_jump(parser, chunk, OpCode::Jump);
         let increment_start = chunk.code.len();
+        let span = token_span(parser, parser.current);
+        schedule_point(parser, DebugPointKind::LoopIncrement, span);
         expression(parser, scanner, chunk, vm);
-        emit_byte(parser, chunk, OpCode::Pop as u8);
+        emit_opcode(parser, chunk, OpCode::Pop);
         consume(
             parser,
             scanner,
@@ -547,7 +677,7 @@ fn for_statement<'a>(
 
     if let Some(jump) = exit_jump {
         patch_jump(parser, chunk, jump);
-        emit_byte(parser, chunk, OpCode::Pop as u8);
+        emit_opcode(parser, chunk, OpCode::Pop);
     }
 
     end_scope(parser, chunk);
@@ -573,14 +703,14 @@ fn if_statement<'a>(
         "Expect ')' after condition.",
     );
 
-    let then_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    let then_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
+    emit_opcode(parser, chunk, OpCode::Pop);
     statement(parser, scanner, chunk, vm);
 
-    let else_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+    let else_jump = emit_jump(parser, chunk, OpCode::Jump);
 
     patch_jump(parser, chunk, then_jump);
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
 
     if match_token(parser, scanner, TokenType::Else) {
         statement(parser, scanner, chunk, vm);
@@ -625,7 +755,7 @@ fn switch_statement<'a>(
                 compiler_error(parser, "Cannot have 'case' after 'default'.");
             }
 
-            emit_byte(parser, chunk, OpCode::Dup as u8);
+            emit_opcode(parser, chunk, OpCode::Dup);
             expression(parser, scanner, chunk, vm);
             consume(
                 parser,
@@ -634,10 +764,10 @@ fn switch_statement<'a>(
                 "Expect ':' after 'case' value.",
             );
 
-            emit_byte(parser, chunk, OpCode::Equal as u8);
-            let next_case_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+            emit_opcode(parser, chunk, OpCode::Equal);
+            let next_case_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
 
-            emit_byte(parser, chunk, OpCode::Pop as u8);
+            emit_opcode(parser, chunk, OpCode::Pop);
 
             while !check(parser, TokenType::Case)
                 && !check(parser, TokenType::Default)
@@ -647,12 +777,12 @@ fn switch_statement<'a>(
                 declaration(parser, scanner, chunk, vm);
             }
 
-            let exit_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+            let exit_jump = emit_jump(parser, chunk, OpCode::Jump);
             exit_jumps.push(exit_jump);
 
             patch_jump(parser, chunk, next_case_jump);
 
-            emit_byte(parser, chunk, OpCode::Pop as u8);
+            emit_opcode(parser, chunk, OpCode::Pop);
         } else if match_token(parser, scanner, TokenType::Default) {
             if has_default {
                 compiler_error(parser, "Cannot have more than one 'default' case.");
@@ -689,7 +819,7 @@ fn switch_statement<'a>(
         patch_jump(parser, chunk, jump);
     }
 
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
 
     end_scope(parser, chunk);
 }
@@ -707,7 +837,7 @@ fn print_statement<'a>(
         TokenType::Semicolon,
         "Expect ';' after value.",
     );
-    emit_byte(parser, chunk, OpCode::Print as u8);
+    emit_opcode(parser, chunk, OpCode::Print);
 }
 
 fn return_statement<'a>(
@@ -730,7 +860,7 @@ fn return_statement<'a>(
             TokenType::Semicolon,
             "Expect ';' after return value.",
         );
-        emit_byte(parser, chunk, OpCode::Return as u8);
+        emit_opcode(parser, chunk, OpCode::Return);
     }
 }
 
@@ -755,13 +885,13 @@ fn while_statement<'a>(
         "Expect ')' after condition.",
     );
 
-    let exit_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    let exit_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
+    emit_opcode(parser, chunk, OpCode::Pop);
     statement(parser, scanner, chunk, vm);
     emit_loop(parser, chunk, loop_start);
 
     patch_jump(parser, chunk, exit_jump);
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
 }
 
 fn synchronize<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -795,8 +925,12 @@ fn declaration<'a>(
     vm: &mut VM,
 ) {
     if match_token(parser, scanner, TokenType::Fun) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         fun_declaration(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::Var) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         var_declaration(parser, scanner, chunk, vm);
     } else {
         statement(parser, scanner, chunk, vm);
@@ -814,22 +948,34 @@ fn statement<'a>(
     vm: &mut VM,
 ) {
     if match_token(parser, scanner, TokenType::Print) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         print_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::Return) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         return_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::For) {
         for_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::If) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         if_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::Switch) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         switch_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::While) {
+        let span = token_span(parser, parser.previous);
+        schedule_point(parser, DebugPointKind::Statement, span);
         while_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::LeftBrace) {
         begin_scope(parser);
         block(parser, scanner, chunk, vm);
         end_scope(parser, chunk);
     } else {
+        let span = token_span(parser, parser.current);
+        schedule_point(parser, DebugPointKind::Statement, span);
         expression_statement(parser, scanner, chunk, vm);
     }
 }
@@ -877,48 +1023,83 @@ fn merged_span(parser: &Parser, start: Token<'_>, end: Token<'_>) -> SourceSpan 
     }
 }
 
-fn emit_byte(parser: &Parser, chunk: &mut Chunk, byte: u8) {
-    emit_byte_at(chunk, byte, token_span(parser, parser.previous));
+fn emit_opcode(parser: &mut Parser, chunk: &mut Chunk, opcode: OpCode) {
+    emit_opcode_at(parser, chunk, opcode, token_span(parser, parser.previous));
 }
 
-fn emit_byte_at(chunk: &mut Chunk, byte: u8, span: SourceSpan) {
+fn emit_opcode_at(parser: &mut Parser, chunk: &mut Chunk, opcode: OpCode, span: SourceSpan) {
+    let offset = chunk.code.len();
+    let pending = std::mem::take(&mut parser.compiler.pending_points);
+    unsafe {
+        (*parser.compiler.function)
+            .debug_info
+            .points
+            .extend(pending.into_iter().map(|point| DebugPoint {
+                id: point.id,
+                offset,
+                kind: point.kind,
+                span: point.span,
+            }));
+    }
+    chunk.write(opcode, span);
+}
+
+fn emit_byte_operand(parser: &Parser, chunk: &mut Chunk, byte: u8) {
+    emit_byte_operand_at(chunk, byte, token_span(parser, parser.previous));
+}
+
+fn emit_byte_operand_at(chunk: &mut Chunk, byte: u8, span: SourceSpan) {
     chunk.write(byte, span);
 }
 
-fn emit_bytes(parser: &Parser, chunk: &mut Chunk, byte1: u8, byte2: u8) {
-    emit_byte(parser, chunk, byte1);
-    emit_byte(parser, chunk, byte2);
+fn emit_u16_operand(parser: &Parser, chunk: &mut Chunk, value: u16) {
+    let span = token_span(parser, parser.previous);
+    emit_u16_operand_at(chunk, value, span);
 }
 
-fn emit_bytes_at(chunk: &mut Chunk, byte1: u8, byte2: u8, span: SourceSpan) {
-    emit_byte_at(chunk, byte1, span);
-    emit_byte_at(chunk, byte2, span);
+fn emit_u16_operand_at(chunk: &mut Chunk, value: u16, span: SourceSpan) {
+    emit_byte_operand_at(chunk, (value & 0xff) as u8, span);
+    emit_byte_operand_at(chunk, (value >> 8) as u8, span);
+}
+
+fn emit_opcode_with_byte(parser: &mut Parser, chunk: &mut Chunk, opcode: OpCode, operand: u8) {
+    emit_opcode(parser, chunk, opcode);
+    emit_byte_operand(parser, chunk, operand);
+}
+
+fn emit_opcode_with_byte_at(
+    parser: &mut Parser,
+    chunk: &mut Chunk,
+    opcode: OpCode,
+    operand: u8,
+    span: SourceSpan,
+) {
+    emit_opcode_at(parser, chunk, opcode, span);
+    emit_byte_operand_at(chunk, operand, span);
 }
 
 fn emit_loop(parser: &mut Parser, chunk: &mut Chunk, loop_start: usize) {
-    emit_byte(parser, chunk, OpCode::Loop as u8);
+    emit_opcode(parser, chunk, OpCode::Loop);
 
     let offset = chunk.code.len() - loop_start + 2;
     if offset > u16::MAX as usize {
         compiler_error(parser, "Loop body too large");
     }
 
-    emit_byte(parser, chunk, (offset & 0xff) as u8);
-    emit_byte(parser, chunk, ((offset >> 8) & 0xff) as u8);
+    emit_u16_operand(parser, chunk, offset as u16);
 }
 
-fn emit_jump(parser: &mut Parser, chunk: &mut Chunk, instruction: u8) -> usize {
-    emit_byte(parser, chunk, instruction);
+fn emit_jump(parser: &mut Parser, chunk: &mut Chunk, instruction: OpCode) -> usize {
+    emit_opcode(parser, chunk, instruction);
     // Placeholder offset
-    emit_byte(parser, chunk, 0xff);
-    emit_byte(parser, chunk, 0xff);
+    emit_u16_operand(parser, chunk, u16::MAX);
 
     chunk.code.len() - 2
 }
 
-fn emit_return(parser: &Parser, chunk: &mut Chunk) {
-    emit_byte(parser, chunk, OpCode::Nil as u8);
-    emit_byte(parser, chunk, OpCode::Return as u8);
+fn emit_return(parser: &mut Parser, chunk: &mut Chunk) {
+    emit_opcode(parser, chunk, OpCode::Nil);
+    emit_opcode(parser, chunk, OpCode::Return);
 }
 
 fn make_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) -> usize {
@@ -929,12 +1110,12 @@ fn emit_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) {
     let constant = make_constant(parser, chunk, value);
 
     if constant <= 255 {
-        emit_bytes(parser, chunk, OpCode::Constant as u8, constant as u8);
+        emit_opcode_with_byte(parser, chunk, OpCode::Constant, constant as u8);
     } else {
-        emit_byte(parser, chunk, OpCode::ConstantLong as u8);
-        emit_byte(parser, chunk, (constant & 0xFF) as u8);
-        emit_byte(parser, chunk, ((constant >> 8) & 0xFF) as u8);
-        emit_byte(parser, chunk, ((constant >> 16) & 0xFF) as u8);
+        emit_opcode(parser, chunk, OpCode::ConstantLong);
+        emit_byte_operand(parser, chunk, (constant & 0xFF) as u8);
+        emit_byte_operand(parser, chunk, ((constant >> 8) & 0xFF) as u8);
+        emit_byte_operand(parser, chunk, ((constant >> 16) & 0xFF) as u8);
     }
 }
 
@@ -955,6 +1136,19 @@ fn end_compiler(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) -> (*mut ObjFunction, Vec<Upvalue>) {
+    let live_end = chunk.code.len();
+    for local in parser.compiler.locals[1..parser.compiler.local_count].iter() {
+        if let Some(metadata_index) = local.metadata_index {
+            unsafe {
+                let binding =
+                    &mut (&mut (*parser.compiler.function).debug_info.bindings)[metadata_index];
+                if binding.live_start != usize::MAX {
+                    binding.live_end = live_end;
+                }
+            }
+        }
+    }
+    parser.compiler.pending_points.clear();
     emit_return(parser, chunk);
 
     let function = parser.compiler.function;
@@ -1005,21 +1199,26 @@ fn binary<'a>(
     parse_precedence(parser, scanner, chunk, next_precedence, vm);
 
     match operator_type {
-        TokenType::BangEqual => emit_bytes_at(chunk, OpCode::Equal as u8, OpCode::Not as u8, span),
-        TokenType::EqualEqual => emit_byte_at(chunk, OpCode::Equal as u8, span),
-        TokenType::Greater => emit_byte_at(chunk, OpCode::Greater as u8, span),
+        TokenType::BangEqual => {
+            emit_opcode_at(parser, chunk, OpCode::Equal, span);
+            emit_opcode_at(parser, chunk, OpCode::Not, span);
+        }
+        TokenType::EqualEqual => emit_opcode_at(parser, chunk, OpCode::Equal, span),
+        TokenType::Greater => emit_opcode_at(parser, chunk, OpCode::Greater, span),
         TokenType::GreaterEqual => {
-            emit_bytes_at(chunk, OpCode::Less as u8, OpCode::Not as u8, span)
+            emit_opcode_at(parser, chunk, OpCode::Less, span);
+            emit_opcode_at(parser, chunk, OpCode::Not, span);
         }
-        TokenType::Less => emit_byte_at(chunk, OpCode::Less as u8, span),
+        TokenType::Less => emit_opcode_at(parser, chunk, OpCode::Less, span),
         TokenType::LessEqual => {
-            emit_bytes_at(chunk, OpCode::Greater as u8, OpCode::Not as u8, span)
+            emit_opcode_at(parser, chunk, OpCode::Greater, span);
+            emit_opcode_at(parser, chunk, OpCode::Not, span);
         }
-        TokenType::Plus => emit_byte_at(chunk, OpCode::Add as u8, span),
-        TokenType::Minus => emit_byte_at(chunk, OpCode::Subtract as u8, span),
-        TokenType::Star => emit_byte_at(chunk, OpCode::Multiply as u8, span),
-        TokenType::Slash => emit_byte_at(chunk, OpCode::Divide as u8, span),
-        TokenType::Backslash => emit_byte_at(chunk, OpCode::IntDivide as u8, span),
+        TokenType::Plus => emit_opcode_at(parser, chunk, OpCode::Add, span),
+        TokenType::Minus => emit_opcode_at(parser, chunk, OpCode::Subtract, span),
+        TokenType::Star => emit_opcode_at(parser, chunk, OpCode::Multiply, span),
+        TokenType::Slash => emit_opcode_at(parser, chunk, OpCode::Divide, span),
+        TokenType::Backslash => emit_opcode_at(parser, chunk, OpCode::IntDivide, span),
         _ => unreachable!(),
     }
 }
@@ -1034,7 +1233,7 @@ fn call<'a>(
     let opening = parser.previous;
     let arg_count = argument_list(parser, scanner, chunk, vm);
     let span = merged_span(parser, opening, parser.previous);
-    emit_bytes_at(chunk, OpCode::Call as u8, arg_count, span);
+    emit_opcode_with_byte_at(parser, chunk, OpCode::Call, arg_count, span);
 }
 
 fn literal<'a>(
@@ -1045,9 +1244,9 @@ fn literal<'a>(
     _: bool,
 ) {
     match parser.previous.token_type {
-        TokenType::False => emit_byte(parser, chunk, OpCode::False as u8),
-        TokenType::Nil => emit_byte(parser, chunk, OpCode::Nil as u8),
-        TokenType::True => emit_byte(parser, chunk, OpCode::True as u8),
+        TokenType::False => emit_opcode(parser, chunk, OpCode::False),
+        TokenType::Nil => emit_opcode(parser, chunk, OpCode::Nil),
+        TokenType::True => emit_opcode(parser, chunk, OpCode::True),
         _ => unreachable!(),
     }
 }
@@ -1088,11 +1287,11 @@ fn or<'a>(
     vm: &mut VM,
     _: bool,
 ) {
-    let else_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
-    let end_jump = emit_jump(parser, chunk, OpCode::Jump as u8);
+    let else_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
+    let end_jump = emit_jump(parser, chunk, OpCode::Jump);
 
     patch_jump(parser, chunk, else_jump);
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
 
     parse_precedence(parser, scanner, chunk, Precedence::Or, vm);
     patch_jump(parser, chunk, end_jump);
@@ -1141,11 +1340,10 @@ fn list<'a>(
     );
 
     if item_count <= 255 {
-        emit_bytes(parser, chunk, OpCode::BuildList as u8, item_count as u8);
+        emit_opcode_with_byte(parser, chunk, OpCode::BuildList, item_count as u8);
     } else {
-        emit_byte(parser, chunk, OpCode::BuildListLong as u8);
-        emit_byte(parser, chunk, (item_count & 0xFF) as u8);
-        emit_byte(parser, chunk, ((item_count >> 8) & 0xFF) as u8);
+        emit_opcode(parser, chunk, OpCode::BuildListLong);
+        emit_u16_operand(parser, chunk, item_count as u16);
     }
 }
 
@@ -1170,9 +1368,9 @@ fn index<'a>(
 
     if can_assign && match_token(parser, scanner, TokenType::Equal) {
         expression(parser, scanner, chunk, vm);
-        emit_byte_at(chunk, OpCode::SetIndex as u8, span);
+        emit_opcode_at(parser, chunk, OpCode::SetIndex, span);
     } else {
-        emit_byte_at(chunk, OpCode::GetIndex as u8, span);
+        emit_opcode_at(parser, chunk, OpCode::GetIndex, span);
     }
 }
 
@@ -1227,11 +1425,10 @@ fn named_variable<'a>(
     let op = if is_assignment { set_op } else { get_op };
 
     if op == OpCode::GetLocalLong || op == OpCode::SetLocalLong {
-        emit_byte_at(chunk, op as u8, span);
-        emit_byte_at(chunk, (arg & 0xff) as u8, span);
-        emit_byte_at(chunk, ((arg >> 8) & 0xff) as u8, span);
+        emit_opcode_at(parser, chunk, op, span);
+        emit_u16_operand_at(chunk, arg as u16, span);
     } else {
-        emit_bytes_at(chunk, op as u8, arg as u8, span);
+        emit_opcode_with_byte_at(parser, chunk, op, arg as u8, span);
     }
 }
 
@@ -1249,8 +1446,8 @@ fn unary<'a>(
     parse_precedence(parser, scanner, chunk, Precedence::Unary, vm);
 
     match operator_type {
-        TokenType::Bang => emit_byte_at(chunk, OpCode::Not as u8, span),
-        TokenType::Minus => emit_byte_at(chunk, OpCode::Negate as u8, span),
+        TokenType::Bang => emit_opcode_at(parser, chunk, OpCode::Not, span),
+        TokenType::Minus => emit_opcode_at(parser, chunk, OpCode::Negate, span),
         _ => unreachable!(),
     }
 }
@@ -1320,7 +1517,7 @@ fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize>
 
     if let Some(stack) = parser.compiler.locals_map.get(name_str) {
         if let Some(&index) = stack.last() {
-            let local = parser.compiler.locals[index];
+            let local = parser.compiler.locals[index].clone();
             if local.depth == -1 {
                 compiler_error(parser, "Can't read local variable in its own initializer.");
             }
@@ -1354,18 +1551,43 @@ fn resolve_enclosing_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Opt
     found_index
 }
 
-fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> Result<usize, ()> {
+fn add_upvalue(
+    compiler: &mut Compiler,
+    index: usize,
+    is_local: bool,
+    binding_id: BindingId,
+    name: String,
+    declaration: SourceSpan,
+) -> Result<usize, ()> {
+    let index = u8::try_from(index).map_err(|_| ())?;
     for (i, upvalue) in compiler.upvalues.iter().enumerate() {
         if upvalue.index == index && upvalue.is_local == is_local {
             return Ok(i);
         }
     }
 
-    if compiler.upvalues.len() == LOCALS_MAX {
-        return Err(());
-    }
+    let table_index = u8::try_from(compiler.upvalues.len()).map_err(|_| ())?;
+    let metadata_index = unsafe { (*compiler.function).debug_info.upvalues.len() };
 
-    compiler.upvalues.push(Upvalue { index, is_local });
+    unsafe {
+        (*compiler.function)
+            .debug_info
+            .upvalues
+            .push(UpvalueDebugInfo {
+                binding_id,
+                name: name.clone(),
+                index: table_index,
+                declaration,
+            });
+    }
+    compiler.upvalues.push(Upvalue {
+        index,
+        is_local,
+        binding_id,
+        name,
+        declaration,
+        metadata_index,
+    });
 
     unsafe {
         (*compiler.function).upvalue_count = compiler.upvalues.len();
@@ -1393,14 +1615,32 @@ fn resolve_upvalue_in_compiler<'a>(
     };
 
     if let Some(local_idx) = local {
+        let local = enclosing.locals[local_idx].clone();
         enclosing.locals[local_idx].is_captured = true;
-        return add_upvalue(compiler, local_idx as u8, true).map(Some);
+        return add_upvalue(
+            compiler,
+            local_idx,
+            true,
+            local.binding_id.expect("captured locals have binding IDs"),
+            local.owned_name,
+            local.declaration,
+        )
+        .map(Some);
     }
 
     let Some(upvalue) = resolve_upvalue_in_compiler(enclosing, name)? else {
         return Ok(None);
     };
-    add_upvalue(compiler, upvalue as u8, false).map(Some)
+    let provenance = enclosing.upvalues[upvalue].clone();
+    add_upvalue(
+        compiler,
+        upvalue,
+        false,
+        provenance.binding_id,
+        provenance.name,
+        provenance.declaration,
+    )
+    .map(Some)
 }
 
 fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
@@ -1420,10 +1660,34 @@ fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
     }
 
     let index = parser.compiler.local_count;
+    let binding_id = BindingId(parser.next_binding_id);
+    parser.next_binding_id += 1;
+    let owned_name = name.start[..name.length].to_string();
+    let declaration = token_span(parser, name);
+    let metadata_index = unsafe { (*parser.compiler.function).debug_info.bindings.len() };
+    unsafe {
+        (*parser.compiler.function)
+            .debug_info
+            .bindings
+            .push(BindingDebugInfo {
+                id: binding_id,
+                name: owned_name.clone(),
+                kind: BindingKind::Local,
+                slot: index as u16,
+                scope_depth: parser.compiler.scope_depth,
+                declaration,
+                live_start: usize::MAX,
+                live_end: usize::MAX,
+            });
+    }
     let local = &mut parser.compiler.locals[parser.compiler.local_count];
     local.name = name;
+    local.owned_name = owned_name;
     local.depth = -1;
     local.is_captured = false;
+    local.binding_id = Some(binding_id);
+    local.declaration = declaration;
+    local.metadata_index = Some(metadata_index);
 
     let name_str = &name.start[..name.length];
     parser
@@ -1436,7 +1700,7 @@ fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
     parser.compiler.local_count += 1;
 }
 
-fn declare_variable<'a>(parser: &mut Parser<'a>) {
+fn declare_variable<'a>(parser: &mut Parser<'a>, binding_kind: BindingKind) {
     if parser.compiler.scope_depth == 0 {
         return;
     }
@@ -1446,7 +1710,7 @@ fn declare_variable<'a>(parser: &mut Parser<'a>) {
 
     if let Some(stack) = parser.compiler.locals_map.get(name_str) {
         if let Some(&index) = stack.last() {
-            let local = parser.compiler.locals[index];
+            let local = parser.compiler.locals[index].clone();
             if local.depth == -1 || local.depth == parser.compiler.scope_depth {
                 compiler_error(parser, "Already a variable with this name in this scope.");
             }
@@ -1454,6 +1718,14 @@ fn declare_variable<'a>(parser: &mut Parser<'a>) {
     }
 
     add_local(parser, name);
+    if let Some(metadata_index) =
+        parser.compiler.locals[parser.compiler.local_count - 1].metadata_index
+    {
+        unsafe {
+            (&mut (*parser.compiler.function).debug_info.bindings)[metadata_index].kind =
+                binding_kind;
+        }
+    }
 }
 
 fn parse_variable<'a>(
@@ -1462,10 +1734,11 @@ fn parse_variable<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     error_message: &str,
+    binding_kind: BindingKind,
 ) -> u8 {
     consume(parser, scanner, TokenType::Identifier, error_message);
 
-    declare_variable(parser);
+    declare_variable(parser, binding_kind);
 
     if parser.compiler.scope_depth > 0 {
         return 0;
@@ -1475,7 +1748,7 @@ fn parse_variable<'a>(
     identifier_constant(parser, chunk, vm, name)
 }
 
-fn mark_initialized(parser: &mut Parser) {
+fn mark_resolver_initialized(parser: &mut Parser) {
     if parser.compiler.scope_depth == 0 {
         return;
     }
@@ -1484,13 +1757,24 @@ fn mark_initialized(parser: &mut Parser) {
     parser.compiler.locals[local_count - 1].depth = parser.compiler.scope_depth;
 }
 
+fn initialize_local_lifetime(parser: &mut Parser, live_start: usize) {
+    mark_resolver_initialized(parser);
+    let local_count = parser.compiler.local_count;
+    if let Some(metadata_index) = parser.compiler.locals[local_count - 1].metadata_index {
+        unsafe {
+            (&mut (*parser.compiler.function).debug_info.bindings)[metadata_index].live_start =
+                live_start;
+        }
+    }
+}
+
 fn define_variable(parser: &mut Parser, chunk: &mut Chunk, global: u8) {
     if parser.compiler.scope_depth > 0 {
-        mark_initialized(parser);
+        initialize_local_lifetime(parser, chunk.code.len());
         return;
     }
 
-    emit_bytes(parser, chunk, OpCode::DefineGlobal as u8, global);
+    emit_opcode_with_byte(parser, chunk, OpCode::DefineGlobal, global);
 }
 
 fn argument_list<'a>(
@@ -1530,9 +1814,9 @@ fn and<'a>(
     vm: &mut VM,
     _: bool,
 ) {
-    let end_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
+    let end_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
 
-    emit_byte(parser, chunk, OpCode::Pop as u8);
+    emit_opcode(parser, chunk, OpCode::Pop);
     parse_precedence(parser, scanner, chunk, Precedence::And, vm);
 
     patch_jump(parser, chunk, end_jump);
@@ -1676,5 +1960,452 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: None,
             precedence: Precedence::None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::compile;
+    use crate::chunk::OpCode;
+    use crate::debug_info::{BindingKind, DebugPointKind};
+    use crate::object::{ObjFunction, ObjString};
+    use crate::value::Value;
+    use crate::vm::VM;
+    use crate::{RecordingHost, RevisionId, SourceDocument, SourceId};
+
+    fn compile_result(source: &str) -> (VM, Option<*mut ObjFunction>, RecordingHost) {
+        let document = SourceDocument::new(SourceId(41), RevisionId(7), "test.lox", source);
+        let mut vm = VM::new();
+        let mut host = RecordingHost::default();
+        let function = compile(&document, &mut vm, &mut host);
+        (vm, function, host)
+    }
+
+    fn compile_success(source: &str) -> (VM, *mut ObjFunction) {
+        let (vm, function, host) = compile_result(source);
+        assert!(
+            host.diagnostics().is_empty(),
+            "unexpected diagnostics: {:?}",
+            host.diagnostics()
+        );
+        (vm, function.expect("source should compile"))
+    }
+
+    fn function_name(function: *mut ObjFunction) -> &'static str {
+        unsafe {
+            if (*function).name.is_null() {
+                "<script>"
+            } else {
+                ObjString::as_str((*function).name)
+            }
+        }
+    }
+
+    fn function_ref(function: *mut ObjFunction) -> &'static ObjFunction {
+        unsafe { &*function }
+    }
+
+    fn direct_function(function: *mut ObjFunction, name: &str) -> *mut ObjFunction {
+        unsafe {
+            (*function)
+                .chunk
+                .constants
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Obj(object)
+                        if (**object).obj_type == crate::object::ObjType::Function =>
+                    {
+                        Some(*object as *mut ObjFunction)
+                    }
+                    _ => None,
+                })
+                .find(|candidate| function_name(*candidate) == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+        }
+    }
+
+    fn opcode_starts(function: *mut ObjFunction) -> HashSet<usize> {
+        let chunk = unsafe { &(*function).chunk };
+        chunk
+            .opcode_starts()
+            .unwrap_or_else(|error| panic!("invalid compiler bytecode: {error}"))
+    }
+
+    fn assert_points_are_opcode_starts(function: *mut ObjFunction) {
+        let starts = opcode_starts(function);
+        unsafe {
+            for point in &(*function).debug_info.points {
+                assert!(
+                    starts.contains(&point.offset),
+                    "point {:?} is not at an opcode start",
+                    point
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debug_points_preserve_distinct_same_line_statement_spans() {
+        let source = "var a=1; a=a+1; print a;";
+        let (_vm, function) = compile_success(source);
+        let points = unsafe { &(*function).debug_info.points };
+        let statements: Vec<_> = points
+            .iter()
+            .filter(|point| point.kind == DebugPointKind::Statement)
+            .collect();
+
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|point| &source[point.span.start.byte_offset..point.span.end.byte_offset])
+                .collect::<Vec<_>>(),
+            ["var", "a", "print"]
+        );
+        assert!(statements.iter().all(|point| point.span.start.line == 1));
+        assert_eq!(
+            points
+                .iter()
+                .filter(|point| point.kind == DebugPointKind::FunctionEntry)
+                .count(),
+            1
+        );
+        assert_eq!(points[0].offset, 0);
+        assert_eq!(points[1].offset, 0);
+        assert_ne!(points[0].id, points[1].id);
+        assert!(points.iter().all(|point| {
+            point.span.source_id == SourceId(41) && point.span.revision == RevisionId(7)
+        }));
+        assert_points_are_opcode_starts(function);
+    }
+
+    #[test]
+    fn empty_function_has_only_an_entry_point() {
+        let (_vm, script) = compile_success("fun empty() {}\n");
+        let empty = direct_function(script, "empty");
+
+        assert_eq!(function_ref(empty).debug_info.points.len(), 1);
+        assert_eq!(
+            function_ref(empty).debug_info.points[0].kind,
+            DebugPointKind::FunctionEntry
+        );
+        assert_eq!(function_ref(empty).debug_info.points[0].offset, 0);
+    }
+
+    #[test]
+    fn multiline_expression_has_one_statement_point() {
+        let (_vm, function) = compile_success("print (1 +\n  2);\n");
+        let points = unsafe { &(*function).debug_info.points };
+        let statements: Vec<_> = points
+            .iter()
+            .filter(|point| point.kind == DebugPointKind::Statement)
+            .collect();
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].span.start.line, 1);
+        assert_points_are_opcode_starts(function);
+    }
+
+    #[test]
+    fn for_clauses_and_body_have_distinct_semantic_points() {
+        let (_vm, function) = compile_success("for (var i=0; i<2; i=i+1) print i;\n");
+        let points = unsafe { &(*function).debug_info.points };
+        let kinds: Vec<_> = points.iter().map(|point| point.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                DebugPointKind::FunctionEntry,
+                DebugPointKind::LoopInitializer,
+                DebugPointKind::LoopCondition,
+                DebugPointKind::LoopIncrement,
+                DebugPointKind::Statement,
+            ]
+        );
+        for point in points.iter().skip(1) {
+            let opcode = function_ref(function).chunk.code[point.offset];
+            assert!(!matches!(
+                opcode,
+                x if x == OpCode::Jump as u8
+                    || x == OpCode::JumpIfFalse as u8
+                    || x == OpCode::Loop as u8
+                    || x == OpCode::Pop as u8
+                    || x == OpCode::CloseUpvalue as u8
+            ));
+        }
+        assert_points_are_opcode_starts(function);
+    }
+
+    #[test]
+    fn omitted_for_clauses_do_not_create_points() {
+        let (_vm, function) = compile_success("for (;;) print 1;\n");
+        let kinds: Vec<_> = unsafe { &(*function).debug_info.points }
+            .iter()
+            .map(|point| point.kind)
+            .collect();
+
+        assert_eq!(
+            kinds,
+            [DebugPointKind::FunctionEntry, DebugPointKind::Statement]
+        );
+    }
+
+    #[test]
+    fn debug_points_decode_across_long_and_variable_width_instructions() {
+        let mut source = String::from("fun outer(p) { fun inner() { print p; } return inner; }\n");
+        for value in 0..260 {
+            source.push_str(&format!("print {};\n", value + 1000));
+        }
+        let (_vm, script) = compile_success(&source);
+        let outer = direct_function(script, "outer");
+        let inner = direct_function(outer, "inner");
+
+        assert!(unsafe { (*script).chunk.code.contains(&(OpCode::ConstantLong as u8)) });
+        assert_points_are_opcode_starts(script);
+        assert_points_are_opcode_starts(outer);
+        assert_points_are_opcode_starts(inner);
+    }
+
+    #[test]
+    fn shadowed_and_reused_slots_have_distinct_binding_ids_and_exact_lifetimes() {
+        let (_vm, script) =
+            compile_success("fun f(p) { { var a=1; print a; } { var a=2; print a; } }\n");
+        let function = direct_function(script, "f");
+        let info = unsafe { &(*function).debug_info };
+        let parameter = info
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "p")
+            .unwrap();
+        let locals: Vec<_> = info
+            .bindings
+            .iter()
+            .filter(|binding| binding.name == "a")
+            .collect();
+
+        assert_eq!(parameter.kind, BindingKind::Parameter);
+        assert_eq!(parameter.live_start, 0);
+        assert_eq!(locals.len(), 2);
+        assert_eq!(locals[0].slot, locals[1].slot);
+        assert_ne!(locals[0].id, locals[1].id);
+        assert!(
+            locals
+                .iter()
+                .all(|binding| binding.kind == BindingKind::Local)
+        );
+        assert!(locals.iter().all(|binding| {
+            function_ref(function).chunk.code[binding.live_end] == OpCode::Pop as u8
+        }));
+        assert_eq!(
+            function_ref(function).chunk.code[parameter.live_end],
+            OpCode::Nil as u8
+        );
+    }
+
+    #[test]
+    fn recursive_local_starts_after_complete_closure_and_keeps_capture_provenance() {
+        let source = "fun outer() { var seed=1; fun recurse(n) { print seed; if (n>0) recurse(n-1); } recurse(1); }\n";
+        let (_vm, script) = compile_success(source);
+        let outer = direct_function(script, "outer");
+        let recurse = direct_function(outer, "recurse");
+        let binding = unsafe { &(*outer).debug_info.bindings }
+            .iter()
+            .find(|binding| binding.name == "recurse")
+            .unwrap();
+        let closure_offset = opcode_starts(outer)
+            .into_iter()
+            .find(|offset| function_ref(outer).chunk.code[*offset] == OpCode::Closure as u8)
+            .unwrap();
+
+        assert_eq!(unsafe { (*recurse).upvalue_count }, 2);
+        assert_eq!(binding.live_start, closure_offset + 6);
+        let local_function_point = unsafe { &(*outer).debug_info.points }
+            .iter()
+            .find(|point| point.kind == DebugPointKind::Statement && point.offset == closure_offset)
+            .expect("local function point should survive nested compilation");
+        assert_eq!(
+            &source[local_function_point.span.start.byte_offset
+                ..local_function_point.span.end.byte_offset],
+            "fun"
+        );
+        let upvalue = unsafe { &(*recurse).debug_info.upvalues }
+            .iter()
+            .find(|upvalue| upvalue.name == "recurse")
+            .unwrap();
+        assert_eq!(upvalue.binding_id, binding.id);
+        assert_eq!(upvalue.name, "recurse");
+        assert_eq!(upvalue.declaration, binding.declaration);
+    }
+
+    #[test]
+    fn transitive_open_and_closed_captures_keep_original_binding_metadata() {
+        let (_vm, script) = compile_success(
+            "fun outer(p) { var a=1; fun middle() { fun inner() { print p; print a; } return inner; } return middle; }\n",
+        );
+        let outer = direct_function(script, "outer");
+        let middle = direct_function(outer, "middle");
+        let inner = direct_function(middle, "inner");
+        let outer_bindings = unsafe { &(*outer).debug_info.bindings };
+        let inner_upvalues = unsafe { &(*inner).debug_info.upvalues };
+
+        for name in ["p", "a"] {
+            let binding = outer_bindings
+                .iter()
+                .find(|binding| binding.name == name)
+                .unwrap();
+            let middle_capture = unsafe { &(*middle).debug_info.upvalues }
+                .iter()
+                .find(|upvalue| upvalue.name == name)
+                .unwrap();
+            let inner_capture = inner_upvalues
+                .iter()
+                .find(|upvalue| upvalue.name == name)
+                .unwrap();
+            assert_eq!(middle_capture.binding_id, binding.id);
+            assert_eq!(inner_capture.binding_id, binding.id);
+            assert_eq!(inner_capture.declaration, binding.declaration);
+        }
+    }
+
+    fn capture_boundary_source(grandparent_bindings: usize) -> String {
+        let mut source = String::from("fun grand() {");
+        for index in 0..grandparent_bindings {
+            source.push_str(&format!("var g{index}={index};"));
+        }
+        source.push_str("fun parent() {");
+        for index in 0..254 {
+            source.push_str(&format!("var p{index}={index};"));
+        }
+        source.push_str("fun child() {");
+        for index in 0..grandparent_bindings {
+            source.push_str(&format!("print g{index};"));
+        }
+        for index in 0..254 {
+            source.push_str(&format!("print p{index};"));
+        }
+        source.push_str("print child;");
+        source.push_str("} return child; } return parent; }");
+        source
+    }
+
+    #[test]
+    fn capture_table_accepts_256_entries_and_slot_255_without_wrapping() {
+        let source = capture_boundary_source(1);
+        let (_vm, script) = compile_success(&source);
+        let grand = direct_function(script, "grand");
+        let parent = direct_function(grand, "parent");
+        let child = direct_function(parent, "child");
+
+        assert_eq!(unsafe { (*child).upvalue_count }, 256);
+        assert_eq!(unsafe { (*child).debug_info.upvalues.len() }, 256);
+        assert_eq!(function_ref(child).debug_info.upvalues[255].index, 255);
+        let closure_offset = opcode_starts(parent)
+            .into_iter()
+            .find(|offset| function_ref(parent).chunk.code[*offset] == OpCode::Closure as u8)
+            .unwrap();
+        assert_eq!(
+            function_ref(parent).chunk.code[closure_offset + 2 + 255 * 2],
+            1
+        );
+        assert_eq!(
+            function_ref(parent).chunk.code[closure_offset + 3 + 255 * 2],
+            255
+        );
+    }
+
+    #[test]
+    fn duplicate_capture_at_the_limit_reuses_the_existing_entry() {
+        let mut source = capture_boundary_source(1);
+        source = source.replacen("} return child;", "print p253; } return child;", 1);
+        let (_vm, script) = compile_success(&source);
+        let grand = direct_function(script, "grand");
+        let parent = direct_function(grand, "parent");
+        let child = direct_function(parent, "child");
+
+        assert_eq!(unsafe { (*child).upvalue_count }, 256);
+        assert_eq!(unsafe { (*child).debug_info.upvalues.len() }, 256);
+    }
+
+    #[test]
+    fn captured_local_ends_immediately_before_close_upvalue() {
+        let (_vm, script) =
+            compile_success("fun outer() { { var captured=1; fun inner(){ print captured; } } }\n");
+        let outer = direct_function(script, "outer");
+        let binding = unsafe { &(*outer).debug_info.bindings }
+            .iter()
+            .find(|binding| binding.name == "captured")
+            .unwrap();
+
+        assert_eq!(
+            function_ref(outer).chunk.code[binding.live_end],
+            OpCode::CloseUpvalue as u8
+        );
+    }
+
+    #[test]
+    fn capture_table_rejects_the_257th_entry_before_u8_conversion() {
+        let source = capture_boundary_source(2);
+        let (_vm, function, host) = compile_result(&source);
+
+        assert!(function.is_none());
+        assert!(
+            host.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Too many closure variables in function.")
+        );
+    }
+
+    #[test]
+    fn captured_slot_rejects_first_index_beyond_u8() {
+        let mut source = String::from("fun outer() {");
+        for index in 0..256 {
+            source.push_str(&format!("var v{index}={index};"));
+        }
+        source.push_str("fun inner() { print v255; }}");
+        let (_vm, function, host) = compile_result(&source);
+
+        assert!(function.is_none());
+        assert!(
+            host.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Too many local variables in function.")
+        );
+    }
+
+    #[test]
+    fn metadata_does_not_change_bytecode_or_runtime_output() {
+        let source = "var a=1; a=a+1; print a;";
+        let (_vm, function) = compile_success(source);
+        assert_eq!(
+            unsafe { &(*function).chunk.code },
+            &[
+                OpCode::Constant as u8,
+                1,
+                OpCode::DefineGlobal as u8,
+                0,
+                OpCode::GetGlobal as u8,
+                0,
+                OpCode::Constant as u8,
+                1,
+                OpCode::Add as u8,
+                OpCode::SetGlobal as u8,
+                0,
+                OpCode::Pop as u8,
+                OpCode::GetGlobal as u8,
+                0,
+                OpCode::Print as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ]
+        );
+
+        let document = SourceDocument::new(SourceId(41), RevisionId(7), "test.lox", source);
+        let mut vm = VM::new();
+        let mut host = RecordingHost::default();
+        assert_eq!(vm.run(&document, &mut host), crate::InterpretResult::Ok);
+        assert_eq!(host.output(), ["2"]);
+        assert!(host.diagnostics().is_empty());
     }
 }
