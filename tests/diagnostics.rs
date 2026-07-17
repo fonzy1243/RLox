@@ -172,3 +172,48 @@ fn consecutive_scanner_errors_are_not_suppressed_by_parser_recovery() {
     assert_eq!(scanner_diagnostics[0].span.start.column, 1);
     assert_eq!(scanner_diagnostics[1].span.start.column, 2);
 }
+
+#[test]
+fn diagnostic_phase_compiler_for_top_level_return() {
+    let (status, host) = run("return 1;");
+
+    assert_eq!(status, InterpretResult::CompileError);
+    assert_eq!(host.diagnostics()[0].phase, DiagnosticPhase::Compiler);
+    assert_eq!(host.diagnostics()[0].code, "compiler.error");
+}
+
+#[test]
+fn diagnostic_phase_compiler_for_duplicate_local() {
+    let (status, host) = run("{ var value; var value; }");
+
+    assert_eq!(status, InterpretResult::CompileError);
+    assert_eq!(host.diagnostics()[0].phase, DiagnosticPhase::Compiler);
+    assert_eq!(host.diagnostics()[0].code, "compiler.error");
+}
+
+#[test]
+fn diagnostic_phase_compiler_for_own_initializer() {
+    let (status, host) = run("{ var value = value; }");
+
+    assert_eq!(status, InterpretResult::CompileError);
+    assert_eq!(host.diagnostics()[0].phase, DiagnosticPhase::Compiler);
+    assert_eq!(host.diagnostics()[0].code, "compiler.error");
+}
+
+#[test]
+fn diagnostic_phase_parser_for_missing_delimiter() {
+    let (status, host) = run("print (1 + 2;");
+
+    assert_eq!(status, InterpretResult::CompileError);
+    assert_eq!(host.diagnostics()[0].phase, DiagnosticPhase::Parser);
+    assert_eq!(host.diagnostics()[0].code, "parser.error");
+}
+
+#[test]
+fn diagnostic_phase_scanner_for_malformed_scalar() {
+    let (status, host) = run("β");
+
+    assert_eq!(status, InterpretResult::CompileError);
+    assert_eq!(host.diagnostics()[0].phase, DiagnosticPhase::Scanner);
+    assert_eq!(host.diagnostics()[0].code, "scanner.error");
+}

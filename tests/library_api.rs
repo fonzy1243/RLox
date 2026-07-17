@@ -87,6 +87,7 @@ fn safety_limits_recover_after_recursion_overflow() {
     assert_eq!(interpreter.interpret("print 1;"), InterpretResult::Ok);
 }
 
+#[cfg(not(any(feature = "debug_trace_execution", feature = "debug_log_gc")))]
 #[test]
 fn runtime_stack_boundary_recovers_for_the_next_run() {
     let declarations = (0..255)

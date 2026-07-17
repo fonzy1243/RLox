@@ -139,24 +139,31 @@ fn current_chunk<'a>(chunk: &'a mut Chunk) -> &'a mut Chunk {
 
 fn error_at(parser: &mut Parser, token: &Token, message: &str) {
     let scanner_error = token.token_type == TokenType::Error;
-    if parser.panic_mode && !scanner_error {
+    let (phase, code) = if scanner_error {
+        (DiagnosticPhase::Scanner, "scanner.error")
+    } else {
+        (DiagnosticPhase::Parser, "parser.error")
+    };
+    report_at(parser, token, message, phase, code, scanner_error);
+}
+
+fn report_at(
+    parser: &mut Parser,
+    token: &Token,
+    message: &str,
+    phase: DiagnosticPhase,
+    code: &str,
+    bypass_panic_mode: bool,
+) {
+    if parser.panic_mode && !bypass_panic_mode {
         return;
     }
     parser.panic_mode = true;
 
     parser.diagnostics.push(Diagnostic {
-        phase: if scanner_error {
-            DiagnosticPhase::Scanner
-        } else {
-            DiagnosticPhase::Parser
-        },
+        phase,
         severity: DiagnosticSeverity::Error,
-        code: if scanner_error {
-            "scanner.error"
-        } else {
-            "parser.error"
-        }
-        .to_string(),
+        code: code.to_string(),
         message: message.to_string(),
         span: token.span(parser.source_id, parser.revision),
         frames: Vec::new(),
@@ -172,6 +179,30 @@ fn error(parser: &mut Parser, message: &str) {
 fn error_at_current(parser: &mut Parser, message: &str) {
     let token = parser.current;
     error_at(parser, &token, message);
+}
+
+fn compiler_error(parser: &mut Parser, message: &str) {
+    let token = parser.previous;
+    report_at(
+        parser,
+        &token,
+        message,
+        DiagnosticPhase::Compiler,
+        "compiler.error",
+        false,
+    );
+}
+
+fn compiler_error_at_current(parser: &mut Parser, message: &str) {
+    let token = parser.current;
+    report_at(
+        parser,
+        &token,
+        message,
+        DiagnosticPhase::Compiler,
+        "compiler.error",
+        false,
+    );
 }
 
 pub fn compile(
@@ -332,7 +363,7 @@ fn function<'a>(
             unsafe {
                 (*parser.compiler.function).arity += 1;
                 if (*parser.compiler.function).arity > 255 {
-                    error_at_current(parser, "Cannot have more than 255 parameters.");
+                    compiler_error_at_current(parser, "Cannot have more than 255 parameters.");
                 }
             }
 
@@ -591,7 +622,7 @@ fn switch_statement<'a>(
     while !check(parser, TokenType::RightBrace) && !check(parser, TokenType::Eof) {
         if match_token(parser, scanner, TokenType::Case) {
             if has_default {
-                error(parser, "Cannot have 'case' after 'default'.");
+                compiler_error(parser, "Cannot have 'case' after 'default'.");
             }
 
             emit_byte(parser, chunk, OpCode::Dup as u8);
@@ -624,7 +655,7 @@ fn switch_statement<'a>(
             emit_byte(parser, chunk, OpCode::Pop as u8);
         } else if match_token(parser, scanner, TokenType::Default) {
             if has_default {
-                error(parser, "Cannot have more than one 'default' case.");
+                compiler_error(parser, "Cannot have more than one 'default' case.");
             }
             has_default = true;
             consume(
@@ -686,7 +717,7 @@ fn return_statement<'a>(
     vm: &mut VM,
 ) {
     if parser.compiler.function_type == FunctionType::Script {
-        error(parser, "Cannot return from top-level code.");
+        compiler_error(parser, "Cannot return from top-level code.");
     }
 
     if match_token(parser, scanner, TokenType::Semicolon) {
@@ -869,7 +900,7 @@ fn emit_loop(parser: &mut Parser, chunk: &mut Chunk, loop_start: usize) {
 
     let offset = chunk.code.len() - loop_start + 2;
     if offset > u16::MAX as usize {
-        error(parser, "Loop body too large");
+        compiler_error(parser, "Loop body too large");
     }
 
     emit_byte(parser, chunk, (offset & 0xff) as u8);
@@ -912,7 +943,7 @@ fn patch_jump(parser: &mut Parser, chunk: &mut Chunk, offset: usize) {
     let jump = chunk.code.len() - offset - 2;
 
     if jump > u16::MAX as usize {
-        error(parser, "Too much code to jump over.");
+        compiler_error(parser, "Too much code to jump over.");
     }
 
     chunk.code[offset] = (jump & 0xff) as u8;
@@ -1094,7 +1125,7 @@ fn list<'a>(
             item_count += 1;
 
             if item_count > 255 {
-                error(parser, "Error processing list literal.");
+                compiler_error(parser, "Error processing list literal.");
             }
             if !match_token(parser, scanner, TokenType::Comma) {
                 break;
@@ -1270,7 +1301,7 @@ fn identifier_constant<'a>(
     let constant = make_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
 
     if constant > u8::MAX as usize {
-        error(parser, "Too many globals in one chunk.");
+        compiler_error(parser, "Too many globals in one chunk.");
         return 0;
     }
 
@@ -1291,7 +1322,7 @@ fn resolve_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize>
         if let Some(&index) = stack.last() {
             let local = parser.compiler.locals[index];
             if local.depth == -1 {
-                error(parser, "Can't read local variable in its own initializer.");
+                compiler_error(parser, "Can't read local variable in its own initializer.");
             }
             return Some(index);
         }
@@ -1317,7 +1348,7 @@ fn resolve_enclosing_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Opt
     };
 
     if is_uninitialized {
-        error(parser, "Cannot read local variable in its own initializer.");
+        compiler_error(parser, "Cannot read local variable in its own initializer.");
     }
 
     found_index
@@ -1376,7 +1407,7 @@ fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usiz
     match resolve_upvalue_in_compiler(&mut parser.compiler, name) {
         Ok(upvalue) => upvalue,
         Err(()) => {
-            error(parser, "Too many closure variables in function.");
+            compiler_error(parser, "Too many closure variables in function.");
             None
         }
     }
@@ -1384,7 +1415,7 @@ fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usiz
 
 fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
     if parser.compiler.local_count == LOCALS_MAX {
-        error(parser, "Too many local variables in function.");
+        compiler_error(parser, "Too many local variables in function.");
         return;
     }
 
@@ -1417,7 +1448,7 @@ fn declare_variable<'a>(parser: &mut Parser<'a>) {
         if let Some(&index) = stack.last() {
             let local = parser.compiler.locals[index];
             if local.depth == -1 || local.depth == parser.compiler.scope_depth {
-                error(parser, "Already a variable with this name in this scope.");
+                compiler_error(parser, "Already a variable with this name in this scope.");
             }
         }
     }
@@ -1473,7 +1504,7 @@ fn argument_list<'a>(
         loop {
             expression(parser, scanner, chunk, vm);
             if arg_count == 255 {
-                error(parser, "Cannot have more than 255 arguments.");
+                compiler_error(parser, "Cannot have more than 255 arguments.");
             }
             arg_count += 1;
 
