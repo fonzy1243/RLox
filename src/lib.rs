@@ -6,6 +6,7 @@ mod diagnostic;
 mod object;
 mod runtime_host;
 mod scanner;
+mod session;
 mod source;
 mod table;
 mod value;
@@ -17,6 +18,10 @@ pub use debug_info::{
 };
 pub use diagnostic::{Diagnostic, DiagnosticPhase, DiagnosticSeverity, RuntimeFrame};
 pub use runtime_host::{RecordingHost, RuntimeHost};
+pub use session::{
+    ActivationId, ExecutionControl, ExecutionState, InterpreterSession, PauseLocation, PauseReason,
+    ResumeMode, RunOutcome, SessionError, SessionOperation,
+};
 pub use source::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};
 pub use vm::InterpretResult;
 
