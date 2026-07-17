@@ -3,6 +3,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     DebugPoint, DebugPointKind, Diagnostic, DiagnosticPhase, DiagnosticSeverity, RevisionId,
     RuntimeHost, SnapshotLimitError, SnapshotLimits, SnapshotReason, SourceDocument, SourceId,
@@ -27,17 +29,20 @@ pub enum ExecutionState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PauseReason {
     DebugPoint,
     Step,
     Explicit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ActivationId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PauseLocation {
     pub source_id: SourceId,
     pub revision: RevisionId,

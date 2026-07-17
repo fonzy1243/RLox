@@ -24,9 +24,9 @@ pub use session::{
     ResumeMode, RunOutcome, SessionError, SessionOperation,
 };
 pub use snapshot::{
-    BindingSnapshot, DebugValue, FrameSnapshot, MIN_ESTIMATED_JSON_BYTES, SnapshotBuildError,
-    SnapshotLimitError, SnapshotLimitField, SnapshotLimits, SnapshotReason, SnapshotSizeError,
-    ValueKind, VmSnapshot,
+    BindingSnapshot, DebugValue, FrameSnapshot, MAX_SNAPSHOT_JSON_BYTES, MIN_ESTIMATED_JSON_BYTES,
+    SnapshotBuildError, SnapshotLimitError, SnapshotLimitField, SnapshotLimits, SnapshotReason,
+    SnapshotSizeError, ValueKind, VmSnapshot,
 };
 pub use source::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};
 pub use vm::InterpretResult;

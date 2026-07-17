@@ -1,9 +1,12 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SourceId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RevisionId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +16,51 @@ pub struct TextPosition {
     pub column: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize)]
+struct TextPositionSerialize {
+    byte_offset: u64,
+    line: u64,
+    column: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextPositionDeserialize {
+    byte_offset: u64,
+    line: u64,
+    column: u64,
+}
+
+impl Serialize for TextPosition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = TextPositionSerialize {
+            byte_offset: u64::try_from(self.byte_offset).map_err(S::Error::custom)?,
+            line: u64::try_from(self.line).map_err(S::Error::custom)?,
+            column: u64::try_from(self.column).map_err(S::Error::custom)?,
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TextPosition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TextPositionDeserialize::deserialize(deserializer)?;
+        Ok(Self {
+            byte_offset: usize::try_from(wire.byte_offset).map_err(D::Error::custom)?,
+            line: usize::try_from(wire.line).map_err(D::Error::custom)?,
+            column: usize::try_from(wire.column).map_err(D::Error::custom)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpan {
     pub source_id: SourceId,
     pub revision: RevisionId,

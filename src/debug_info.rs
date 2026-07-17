@@ -1,6 +1,8 @@
 use crate::{RevisionId, SourceId, SourceSpan, TextPosition};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DebugPointId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +22,8 @@ pub struct DebugPoint {
     pub span: SourceSpan,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BindingId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

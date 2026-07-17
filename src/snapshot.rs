@@ -1,6 +1,8 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+
 use crate::chunk::OpCode;
 use crate::object::{
     Obj, ObjClosure, ObjFunction, ObjList, ObjNative, ObjString, ObjType, ObjUpvalue,
@@ -19,17 +21,19 @@ const MAX_FRAMES: usize = 256;
 const MAX_BINDINGS_PER_FRAME: usize = 512;
 const MAX_TOTAL_BINDINGS: usize = 16_384;
 const MAX_GLOBALS: usize = 8_192;
-const MAX_ESTIMATED_JSON_BYTES: usize = 5 * 1_048_576;
+pub const MAX_SNAPSHOT_JSON_BYTES: usize = 5 * 1_048_576;
 const MAX_UNSIGNED_DECIMAL_BYTES: usize = 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum SnapshotReason {
     Paused(PauseReason),
     Faulted,
     Cancelled,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmSnapshot {
     pub reason: SnapshotReason,
     pub current_span: SourceSpan,
@@ -39,7 +43,8 @@ pub struct VmSnapshot {
     pub globals_truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrameSnapshot {
     pub activation_id: ActivationId,
     pub function: String,
@@ -54,7 +59,8 @@ pub struct FrameSnapshot {
     pub upvalues_truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingSnapshot {
     pub binding_id: Option<BindingId>,
     pub name: String,
@@ -64,7 +70,8 @@ pub struct BindingSnapshot {
     pub value: DebugValue,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ValueKind {
     Nil,
     Bool,
@@ -78,7 +85,8 @@ pub enum ValueKind {
     Truncated,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum DebugValue {
     Nil,
     Bool(bool),
@@ -96,6 +104,144 @@ pub enum DebugValue {
         object_id: u64,
     },
     Truncated,
+}
+
+#[derive(Default)]
+enum PayloadField<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+
+fn deserialize_present_payload<'de, D, T>(deserializer: D) -> Result<PayloadField<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(PayloadField::Present)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotReasonKind {
+    Paused,
+    Faulted,
+    Cancelled,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotReasonDeserialize {
+    kind: SnapshotReasonKind,
+    #[serde(default, deserialize_with = "deserialize_present_payload")]
+    payload: PayloadField<PauseReason>,
+}
+
+impl<'de> Deserialize<'de> for SnapshotReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SnapshotReasonDeserialize::deserialize(deserializer)?;
+        match (wire.kind, wire.payload) {
+            (SnapshotReasonKind::Paused, PayloadField::Present(reason)) => Ok(Self::Paused(reason)),
+            (SnapshotReasonKind::Faulted, PayloadField::Missing) => Ok(Self::Faulted),
+            (SnapshotReasonKind::Cancelled, PayloadField::Missing) => Ok(Self::Cancelled),
+            _ => Err(D::Error::custom(
+                "payload does not match snapshot reason kind",
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DebugValueKind {
+    Nil,
+    Bool,
+    Number,
+    String,
+    Function,
+    Closure,
+    Native,
+    List,
+    Cycle,
+    Truncated,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DebugValuePayload {
+    Bool(bool),
+    String(String),
+    List(DebugListPayload),
+    Cycle(DebugCyclePayload),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugListPayload {
+    object_id: u64,
+    items: Vec<DebugValue>,
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugCyclePayload {
+    object_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugValueDeserialize {
+    kind: DebugValueKind,
+    #[serde(default, deserialize_with = "deserialize_present_payload")]
+    payload: PayloadField<DebugValuePayload>,
+}
+
+impl<'de> Deserialize<'de> for DebugValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DebugValueDeserialize::deserialize(deserializer)?;
+        match (wire.kind, wire.payload) {
+            (DebugValueKind::Nil, PayloadField::Missing) => Ok(Self::Nil),
+            (DebugValueKind::Bool, PayloadField::Present(DebugValuePayload::Bool(value))) => {
+                Ok(Self::Bool(value))
+            }
+            (DebugValueKind::Number, PayloadField::Present(DebugValuePayload::String(value))) => {
+                Ok(Self::Number(value))
+            }
+            (DebugValueKind::String, PayloadField::Present(DebugValuePayload::String(value))) => {
+                Ok(Self::String(value))
+            }
+            (DebugValueKind::Function, PayloadField::Present(DebugValuePayload::String(value))) => {
+                Ok(Self::Function(value))
+            }
+            (DebugValueKind::Closure, PayloadField::Present(DebugValuePayload::String(value))) => {
+                Ok(Self::Closure(value))
+            }
+            (DebugValueKind::Native, PayloadField::Present(DebugValuePayload::String(value))) => {
+                Ok(Self::Native(value))
+            }
+            (DebugValueKind::List, PayloadField::Present(DebugValuePayload::List(value))) => {
+                Ok(Self::List {
+                    object_id: value.object_id,
+                    items: value.items,
+                    truncated: value.truncated,
+                })
+            }
+            (DebugValueKind::Cycle, PayloadField::Present(DebugValuePayload::Cycle(value))) => {
+                Ok(Self::Cycle {
+                    object_id: value.object_id,
+                })
+            }
+            (DebugValueKind::Truncated, PayloadField::Missing) => Ok(Self::Truncated),
+            _ => Err(D::Error::custom("payload does not match debug value kind")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +270,7 @@ impl Default for SnapshotLimits {
             max_bindings_per_frame: 512,
             max_total_bindings: 8_192,
             max_globals: 2_048,
-            max_estimated_json_bytes: MAX_ESTIMATED_JSON_BYTES,
+            max_estimated_json_bytes: MAX_SNAPSHOT_JSON_BYTES,
         }
     }
 }
@@ -174,7 +320,7 @@ impl SnapshotLimits {
         validate_max(
             SnapshotLimitField::EstimatedJsonBytes,
             self.max_estimated_json_bytes,
-            MAX_ESTIMATED_JSON_BYTES,
+            MAX_SNAPSHOT_JSON_BYTES,
         )
     }
 }
@@ -1664,7 +1810,7 @@ mod tests {
             (SnapshotLimitField::Globals, MAX_GLOBALS),
             (
                 SnapshotLimitField::EstimatedJsonBytes,
-                MAX_ESTIMATED_JSON_BYTES,
+                MAX_SNAPSHOT_JSON_BYTES,
             ),
         ];
 
