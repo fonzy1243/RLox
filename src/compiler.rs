@@ -9,6 +9,8 @@ use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::vm::VM;
 
+const LOCALS_MAX: usize = u8::MAX as usize + 1;
+
 struct Parser<'a> {
     current: Token<'a>,
     previous: Token<'a>,
@@ -99,7 +101,7 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         enclosing: None,
         function: func_ptr,
         function_type: func_type,
-        locals: vec![dummy_local; u16::MAX as usize],
+        locals: vec![dummy_local; LOCALS_MAX],
         local_count: 1,
         scope_depth: 0,
         locals_map: HashMap::new(),
@@ -167,7 +169,7 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         enclosing: None,
         function,
         function_type: FunctionType::Script,
-        locals: vec![dummy_local; u16::MAX as usize],
+        locals: vec![dummy_local; LOCALS_MAX],
         local_count: 1,
         scope_depth: 0,
         locals_map: HashMap::new(),
@@ -1233,11 +1235,15 @@ fn resolve_enclosing_local<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Opt
     found_index
 }
 
-fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> usize {
+fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> Result<usize, ()> {
     for (i, upvalue) in compiler.upvalues.iter().enumerate() {
         if upvalue.index == index && upvalue.is_local == is_local {
-            return i;
+            return Ok(i);
         }
+    }
+
+    if compiler.upvalues.len() == LOCALS_MAX {
+        return Err(());
     }
 
     compiler.upvalues.push(Upvalue { index, is_local });
@@ -1246,11 +1252,16 @@ fn add_upvalue(compiler: &mut Compiler, index: u8, is_local: bool) -> usize {
         (*compiler.function).upvalue_count = compiler.upvalues.len();
     }
 
-    compiler.upvalues.len() - 1
+    Ok(compiler.upvalues.len() - 1)
 }
 
-fn resolve_upvalue_in_compiler<'a>(compiler: &mut Compiler<'a>, name: &Token<'a>) -> Option<usize> {
-    let enclosing = compiler.enclosing.as_mut()?;
+fn resolve_upvalue_in_compiler<'a>(
+    compiler: &mut Compiler<'a>,
+    name: &Token<'a>,
+) -> Result<Option<usize>, ()> {
+    let Some(enclosing) = compiler.enclosing.as_mut() else {
+        return Ok(None);
+    };
 
     let name_str = &name.start[..name.length];
     let local = if let Some(stack) = enclosing.locals_map.get(name_str) {
@@ -1264,19 +1275,27 @@ fn resolve_upvalue_in_compiler<'a>(compiler: &mut Compiler<'a>, name: &Token<'a>
 
     if let Some(local_idx) = local {
         enclosing.locals[local_idx].is_captured = true;
-        return Some(add_upvalue(compiler, local_idx as u8, true));
+        return add_upvalue(compiler, local_idx as u8, true).map(Some);
     }
 
-    let upvalue = resolve_upvalue_in_compiler(enclosing, name)?;
-    Some(add_upvalue(compiler, upvalue as u8, false))
+    let Some(upvalue) = resolve_upvalue_in_compiler(enclosing, name)? else {
+        return Ok(None);
+    };
+    add_upvalue(compiler, upvalue as u8, false).map(Some)
 }
 
 fn resolve_upvalue<'a>(parser: &mut Parser<'a>, name: &Token<'a>) -> Option<usize> {
-    resolve_upvalue_in_compiler(&mut parser.compiler, name)
+    match resolve_upvalue_in_compiler(&mut parser.compiler, name) {
+        Ok(upvalue) => upvalue,
+        Err(()) => {
+            error(parser, "Too many closure variables in function.");
+            None
+        }
+    }
 }
 
 fn add_local<'a>(parser: &mut Parser<'a>, name: Token<'a>) {
-    if parser.compiler.local_count == u16::MAX as usize {
+    if parser.compiler.local_count == LOCALS_MAX {
         error(parser, "Too many local variables in function.");
         return;
     }

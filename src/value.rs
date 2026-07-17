@@ -10,12 +10,7 @@ pub enum Value {
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::Bool(b) => write!(f, "{}", b),
-            Value::Nil => write!(f, "nil"),
-            Value::Number(n) => write!(f, "{}", n),
-            Value::Obj(ptr) => write!(f, "{}", unsafe { &**ptr }),
-        }
+        crate::object::format_value(*self, f)
     }
 }
 

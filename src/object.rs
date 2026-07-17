@@ -1,5 +1,6 @@
 use std::{
     alloc::{Layout, alloc, dealloc},
+    collections::HashSet,
     fmt,
 };
 
@@ -38,6 +39,7 @@ pub struct ObjFunction {
 
 pub type NativeFn = fn(arg_count: usize, args: &[Value]) -> Value;
 
+#[repr(C)]
 pub struct ObjNative {
     pub obj: Obj,
     pub function: NativeFn,
@@ -92,47 +94,89 @@ impl ObjString {
 
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.obj_type {
-            ObjType::Closure => {
-                let closure = unsafe { &*(self as *const Obj as *const ObjClosure) };
-                let function = unsafe { &*closure.function };
+        let mut visited = HashSet::new();
+        format_object(self as *const Obj, f, &mut visited, 0)
+    }
+}
 
-                if function.name.is_null() {
-                    write!(f, "<script>")
-                } else {
-                    let name = ObjString::as_str(function.name);
-                    write!(f, "<fn {}>", name)
-                }
-            }
-            ObjType::Function => {
-                let function = unsafe { &*(self as *const Obj as *const ObjFunction) };
-                if function.name.is_null() {
-                    write!(f, "<script>")
-                } else {
-                    let name = ObjString::as_str(function.name);
-                    write!(f, "<fn {}>", name)
-                }
-            }
-            ObjType::Native => {
-                write!(f, "<native fn>")
-            }
-            ObjType::String => {
-                let s = ObjString::as_str(self as *const Obj as *const ObjString);
-                write!(f, "{}", s)
-            }
-            ObjType::Upvalue => write!(f, "upvalue"),
-            ObjType::List => {
-                let list = unsafe { &*(self as *const Obj as *const ObjList) };
+const FORMAT_DEPTH_LIMIT: usize = 64;
+const FORMAT_ELEMENT_LIMIT: usize = 100;
 
-                write!(f, "[]")?;
-                for (i, item) in list.items.iter().enumerate() {
-                    if i > 0 {
+pub(crate) fn format_value(value: Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut visited = HashSet::new();
+    format_value_nested(value, f, &mut visited, 0)
+}
+
+fn format_value_nested(
+    value: Value,
+    f: &mut fmt::Formatter<'_>,
+    visited: &mut HashSet<*const Obj>,
+    depth: usize,
+) -> fmt::Result {
+    match value {
+        Value::Bool(value) => write!(f, "{}", value),
+        Value::Nil => write!(f, "nil"),
+        Value::Number(value) => write!(f, "{}", value),
+        Value::Obj(ptr) => format_object(ptr, f, visited, depth),
+    }
+}
+
+fn format_object(
+    ptr: *const Obj,
+    f: &mut fmt::Formatter<'_>,
+    visited: &mut HashSet<*const Obj>,
+    depth: usize,
+) -> fmt::Result {
+    match unsafe { (*ptr).obj_type } {
+        ObjType::Closure => {
+            let closure = unsafe { &*(ptr as *const ObjClosure) };
+            let function = unsafe { &*closure.function };
+
+            if function.name.is_null() {
+                write!(f, "<script>")
+            } else {
+                write!(f, "<fn {}>", ObjString::as_str(function.name))
+            }
+        }
+        ObjType::Function => {
+            let function = unsafe { &*(ptr as *const ObjFunction) };
+            if function.name.is_null() {
+                write!(f, "<script>")
+            } else {
+                write!(f, "<fn {}>", ObjString::as_str(function.name))
+            }
+        }
+        ObjType::Native => write!(f, "<native fn>"),
+        ObjType::String => write!(f, "{}", ObjString::as_str(ptr as *const ObjString)),
+        ObjType::Upvalue => write!(f, "upvalue"),
+        ObjType::List => {
+            if depth >= FORMAT_DEPTH_LIMIT {
+                return write!(f, "<depth-limit>");
+            }
+            if !visited.insert(ptr) {
+                return write!(f, "<cycle>");
+            }
+
+            let list = unsafe { &*(ptr as *const ObjList) };
+            let result = (|| {
+                write!(f, "[")?;
+                for (index, item) in list.items.iter().take(FORMAT_ELEMENT_LIMIT).enumerate() {
+                    if index > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", item)?;
+                    format_value_nested(*item, f, visited, depth + 1)?;
+                }
+                if list.items.len() > FORMAT_ELEMENT_LIMIT {
+                    if FORMAT_ELEMENT_LIMIT > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "...")?;
                 }
                 write!(f, "]")
-            }
+            })();
+
+            visited.remove(&ptr);
+            result
         }
     }
 }
@@ -151,9 +195,11 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -180,9 +226,11 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -207,9 +255,11 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -231,9 +281,11 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -269,7 +321,11 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         collect_garbage(vm);
 
         #[cfg(feature = "debug_log_gc")]
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!(
+            "{:p} allocate for {:?}",
+            ptr,
+            Obj::obj_type(ptr as *mut Obj)
+        );
 
         ptr
     }
@@ -294,9 +350,11 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -356,9 +414,11 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    println!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -398,7 +458,7 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
 
 pub fn free_object(object: *mut Obj) {
     #[cfg(feature = "debug_log_gc")]
-    println!("{:p} free type {:?}", object, (*object).obj_type);
+    println!("{:p} free type {:?}", object, Obj::obj_type(object));
 
     unsafe {
         match (*object).obj_type {

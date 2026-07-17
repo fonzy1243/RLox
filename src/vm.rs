@@ -230,8 +230,17 @@ impl VM {
             }
         }
 
-        self.stack_top = self.frames[self.frame_count].slots;
+        self.reset_execution_state();
+    }
+
+    fn reset_execution_state(&mut self) {
+        let stack_start = self.stack.as_mut_ptr();
+        unsafe {
+            close_upvalues(self, stack_start);
+        }
+        self.open_upvalues = std::ptr::null_mut();
         self.frame_count = 0;
+        self.stack_top = stack_start;
     }
 
     fn define_native(&mut self, name: &str, function: NativeFn) {
@@ -352,6 +361,21 @@ fn mark_roots(vm: &mut VM) {
     mark_compiler_roots(vm);
 }
 // -----------------
+
+fn checked_list_index(value: Value, len: usize) -> Result<usize, &'static str> {
+    if !value.is_number() {
+        return Err("List index must be a number.");
+    }
+    let number = value.as_number();
+    if !number.is_finite() || number.fract() != 0.0 || number < 0.0 {
+        return Err("List index must be a non-negative integer.");
+    }
+    let index = number as usize;
+    if index >= len {
+        return Err("List index out of bounds.");
+    }
+    Ok(index)
+}
 
 fn run(vm: &mut VM) -> InterpretResult {
     let mut chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
@@ -567,20 +591,15 @@ fn run(vm: &mut VM) -> InterpretResult {
                     vm.runtime_error("Only lists can be subscripted.");
                     return InterpretResult::RuntimeError;
                 }
-                if !index_val.is_number() {
-                    vm.frames[vm.frame_count - 1].ip = current_offset + 1;
-                    vm.runtime_error("List index must be a number.");
-                    return InterpretResult::RuntimeError;
-                }
-
                 let list = unsafe { &*list_val.as_list() };
-                let index = index_val.as_number() as usize;
-
-                if index >= list.items.len() {
-                    vm.frames[vm.frame_count - 1].ip = current_offset + 1;
-                    vm.runtime_error("List index out of bounds.");
-                    return InterpretResult::RuntimeError;
-                }
+                let index = match checked_list_index(index_val, list.items.len()) {
+                    Ok(index) => index,
+                    Err(message) => {
+                        vm.frames[vm.frame_count - 1].ip = current_offset + 1;
+                        vm.runtime_error(message);
+                        return InterpretResult::RuntimeError;
+                    }
+                };
 
                 vm.push(list.items[index]);
             }
@@ -594,20 +613,15 @@ fn run(vm: &mut VM) -> InterpretResult {
                     vm.runtime_error("Only lists can be subscripted.");
                     return InterpretResult::RuntimeError;
                 }
-                if !index_val.is_number() {
-                    vm.frames[vm.frame_count - 1].ip = current_offset + 1;
-                    vm.runtime_error("List index must be a number.");
-                    return InterpretResult::RuntimeError;
-                }
-
                 let list = unsafe { &mut *list_val.as_list() };
-                let index = index_val.as_number() as usize;
-
-                if index >= list.items.len() {
-                    vm.frames[vm.frame_count - 1].ip = current_offset + 1;
-                    vm.runtime_error("List index out of bounds.");
-                    return InterpretResult::RuntimeError;
-                }
+                let index = match checked_list_index(index_val, list.items.len()) {
+                    Ok(index) => index,
+                    Err(message) => {
+                        vm.frames[vm.frame_count - 1].ip = current_offset + 1;
+                        vm.runtime_error(message);
+                        return InterpretResult::RuntimeError;
+                    }
+                };
 
                 list.items[index] = value;
 

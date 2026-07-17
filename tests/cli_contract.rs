@@ -92,3 +92,44 @@ fn repl_keeps_globals_between_lines() {
     assert!(String::from_utf8(output.stdout).unwrap().contains("7\n"));
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn repl_recovers_after_runtime_error() {
+    let mut child = rlox()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"print missing;\nprint 1;\n").unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let repl_output = stdout.replace("> ", "");
+
+    assert!(output.status.success());
+    assert!(repl_output.trim_end().ends_with('1'));
+}
+
+#[test]
+fn cyclic_list_prints_a_cycle_marker() {
+    let output = run_file("var a=[nil]; a[0]=a; print a;");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("<cycle>"));
+}
+
+#[test]
+fn stack_heavy_recursion_exits_with_runtime_error() {
+    let declarations = (0..255)
+        .map(|index| format!("var local{index};"))
+        .collect::<String>();
+    let source = format!("fun recurse() {{{declarations} return 1 + recurse();}} recurse();");
+    let output = run_file(&source);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(70));
+    assert!(stderr.contains("Stack overflow."));
+}
