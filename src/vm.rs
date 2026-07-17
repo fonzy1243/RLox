@@ -7,7 +7,7 @@ use crate::object::{
     FORMAT_BYTE_LIMIT, FORMAT_DEPTH_LIMIT, FORMAT_ELEMENT_LIMIT, FORMAT_NODE_LIMIT,
     FORMAT_TOTAL_ELEMENT_LIMIT, NativeFn, Obj, ObjClosure, ObjFunction, ObjList, ObjString,
     ObjType, ObjUpvalue, TRUNCATION_MARKER, allocate_closure, allocate_list, allocate_native,
-    capture_upvalue, close_upvalues, copy_string, free_object, take_string,
+    allocate_upvalue, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -346,8 +346,7 @@ impl VM {
 
     pub(crate) fn cleanup_execution(&mut self) {
         let stack_start = self.stack.as_mut_ptr();
-        close_upvalues(self, stack_start);
-        self.open_upvalues = std::ptr::null_mut();
+        self.close_upvalues_for_cleanup();
         self.frame_count = 0;
         self.stack_top = stack_start;
     }
@@ -935,7 +934,7 @@ impl VM {
                     let upvalue = if is_local {
                         let stack_index = self.local_index(frame_index, capture, current_offset)?;
                         let location = unsafe { self.stack.as_mut_ptr().add(stack_index) };
-                        capture_upvalue(self, location)
+                        self.capture_upvalue_checked(location, current_offset)?
                     } else {
                         unsafe { (*self.frames[frame_index].closure).upvalues[capture] }
                     };
@@ -947,14 +946,14 @@ impl VM {
             x if x == OpCode::CloseUpvalue as u8 => {
                 self.require_stack(1, current_offset)?;
                 let location = unsafe { self.stack_top.sub(1) };
-                close_upvalues(self, location);
+                self.close_upvalues_checked(location, current_offset)?;
                 self.pop();
             }
             x if x == OpCode::Return as u8 => {
                 self.require_stack(1, current_offset)?;
                 let result = self.peek_checked(0, current_offset)?;
                 let slots = self.frames[frame_index].slots;
-                close_upvalues(self, slots);
+                self.close_upvalues_checked(slots, current_offset)?;
                 self.frame_count -= 1;
 
                 if self.frame_count == 0 {
@@ -978,6 +977,134 @@ impl VM {
 
     fn stack_len(&self) -> usize {
         unsafe { self.stack_top.offset_from(self.stack.as_ptr()) as usize }
+    }
+
+    fn stack_boundary_index(&self, location: *mut Value, offset: usize) -> Result<usize, VmFault> {
+        let address = location as usize;
+        let stack_start = self.stack.as_ptr() as usize;
+        let stack_top = self.stack_top as usize;
+        let value_size = std::mem::size_of::<Value>();
+        let distance = address
+            .checked_sub(stack_start)
+            .ok_or_else(|| VmFault::new("Invalid upvalue location.", offset))?;
+        if address > stack_top || distance % value_size != 0 {
+            return Err(VmFault::new("Invalid upvalue location.", offset));
+        }
+        Ok(distance / value_size)
+    }
+
+    fn stack_slot_index(&self, location: *mut Value, offset: usize) -> Result<usize, VmFault> {
+        let index = self.stack_boundary_index(location, offset)?;
+        if location as usize == self.stack_top as usize {
+            return Err(VmFault::new("Invalid upvalue location.", offset));
+        }
+        Ok(index)
+    }
+
+    fn validate_open_upvalues(
+        &self,
+        offset: usize,
+    ) -> Result<Vec<(*mut ObjUpvalue, usize)>, VmFault> {
+        let mut current = self.open_upvalues;
+        let mut visited = HashSet::new();
+        let mut previous_slot = None;
+        let mut upvalues = Vec::new();
+
+        while !current.is_null() {
+            self.require_object_kind(current as *mut Obj, ObjType::Upvalue, offset)?;
+            if !visited.insert(current) {
+                return Err(VmFault::new("Invalid open upvalue chain.", offset));
+            }
+
+            let location = unsafe { (*current).location };
+            let slot = self.stack_slot_index(location, offset)?;
+            if previous_slot.is_some_and(|previous| slot >= previous) {
+                return Err(VmFault::new("Invalid open upvalue chain.", offset));
+            }
+
+            upvalues.push((current, slot));
+            previous_slot = Some(slot);
+            current = unsafe { (*current).next };
+        }
+
+        Ok(upvalues)
+    }
+
+    fn capture_upvalue_checked(
+        &mut self,
+        local: *mut Value,
+        offset: usize,
+    ) -> Result<*mut ObjUpvalue, VmFault> {
+        let local_slot = self.stack_slot_index(local, offset)?;
+        let upvalues = self.validate_open_upvalues(offset)?;
+
+        if let Some((upvalue, _)) = upvalues.iter().find(|(_, slot)| *slot == local_slot) {
+            return Ok(*upvalue);
+        }
+
+        let insertion = upvalues
+            .iter()
+            .position(|(_, slot)| *slot < local_slot)
+            .unwrap_or(upvalues.len());
+        let next = upvalues
+            .get(insertion)
+            .map_or(std::ptr::null_mut(), |(upvalue, _)| *upvalue);
+        let created = allocate_upvalue(self, local);
+        unsafe { (*created).next = next };
+
+        if insertion == 0 {
+            self.open_upvalues = created;
+        } else {
+            let previous = upvalues[insertion - 1].0;
+            unsafe { (*previous).next = created };
+        }
+
+        Ok(created)
+    }
+
+    fn close_upvalues_checked(&mut self, last: *mut Value, offset: usize) -> Result<(), VmFault> {
+        let last_slot = self.stack_boundary_index(last, offset)?;
+        let upvalues = self.validate_open_upvalues(offset)?;
+        let close_count = upvalues
+            .iter()
+            .take_while(|(_, slot)| *slot >= last_slot)
+            .count();
+        let remaining = upvalues
+            .get(close_count)
+            .map_or(std::ptr::null_mut(), |(upvalue, _)| *upvalue);
+
+        for (upvalue, _) in upvalues.into_iter().take(close_count) {
+            unsafe {
+                (*upvalue).closed = *(*upvalue).location;
+                (*upvalue).location = std::ptr::addr_of_mut!((*upvalue).closed);
+                (*upvalue).next = std::ptr::null_mut();
+            }
+        }
+        self.open_upvalues = remaining;
+        Ok(())
+    }
+
+    fn close_upvalues_for_cleanup(&mut self) {
+        self.open_upvalues = std::ptr::null_mut();
+        let upvalues: Vec<_> = self
+            .object_registry
+            .iter()
+            .filter_map(|(object, allocation)| {
+                (allocation.kind == ObjType::Upvalue).then_some(*object as *mut ObjUpvalue)
+            })
+            .collect();
+
+        for upvalue in upvalues {
+            let closed = unsafe { std::ptr::addr_of_mut!((*upvalue).closed) };
+            let location = unsafe { (*upvalue).location };
+            if location != closed {
+                if self.stack_slot_index(location, 0).is_ok() {
+                    unsafe { (*upvalue).closed = *location };
+                }
+                unsafe { (*upvalue).location = closed };
+            }
+            unsafe { (*upvalue).next = std::ptr::null_mut() };
+        }
     }
 
     fn object_kind(&self, object: *mut Obj, offset: usize) -> Result<ObjType, VmFault> {
@@ -1046,26 +1173,6 @@ impl VM {
         Ok(function)
     }
 
-    fn open_upvalue_contains(
-        &self,
-        target: *mut ObjUpvalue,
-        offset: usize,
-    ) -> Result<bool, VmFault> {
-        let mut current = self.open_upvalues;
-        let mut visited = HashSet::new();
-        while !current.is_null() {
-            self.require_object_kind(current as *mut Obj, ObjType::Upvalue, offset)?;
-            if !visited.insert(current) {
-                return Err(VmFault::new("Invalid open upvalue chain.", offset));
-            }
-            if current == target {
-                return Ok(true);
-            }
-            current = unsafe { (*current).next };
-        }
-        Ok(false)
-    }
-
     fn upvalue_location(
         &self,
         upvalue: *mut ObjUpvalue,
@@ -1081,18 +1188,11 @@ impl VM {
             return Ok(location);
         }
 
-        let address = location as usize;
-        let stack_start = self.stack.as_ptr() as usize;
-        let stack_top = self.stack_top as usize;
-        let value_size = std::mem::size_of::<Value>();
-        let exact_slot = address
-            .checked_sub(stack_start)
-            .is_some_and(|distance| distance % value_size == 0);
-        let in_live_stack = address >= stack_start
-            && address
-                .checked_add(value_size)
-                .is_some_and(|end| end <= stack_top);
-        if !exact_slot || !in_live_stack || !self.open_upvalue_contains(upvalue, offset)? {
+        let open_upvalues = self.validate_open_upvalues(offset)?;
+        if !open_upvalues
+            .iter()
+            .any(|(candidate, _)| *candidate == upvalue)
+        {
             return Err(VmFault::new("Invalid upvalue location.", offset));
         }
         Ok(location)
@@ -1770,6 +1870,70 @@ mod tests {
         let fault = vm.upvalue_location(upvalue, 0).unwrap_err();
 
         assert_eq!(fault.message, "Invalid upvalue location.");
+    }
+
+    #[test]
+    fn checked_close_rejects_a_half_slot_and_terminal_cleanup_detaches_it() {
+        let mut vm = VM::new();
+        assert!(vm.push(Value::Nil));
+        assert!(vm.push(Value::Nil));
+        let stack_start = vm.stack.as_mut_ptr();
+        let location =
+            unsafe { (stack_start as *mut u8).add(std::mem::align_of::<Value>()) as *mut Value };
+        let upvalue = allocate_upvalue(&mut vm, location);
+        vm.open_upvalues = upvalue;
+
+        let fault = vm.close_upvalues_checked(stack_start, 0).unwrap_err();
+        assert_eq!(fault.message, "Invalid upvalue location.");
+
+        vm.cleanup_execution();
+        let closed = unsafe { std::ptr::addr_of_mut!((*upvalue).closed) };
+        assert!(vm.open_upvalues.is_null());
+        assert_eq!(unsafe { (*upvalue).location }, closed);
+    }
+
+    #[test]
+    fn checked_close_rejects_an_open_upvalue_cycle_and_cleanup_terminates() {
+        let mut vm = VM::new();
+        assert!(vm.push(Value::Nil));
+        assert!(vm.push(Value::Nil));
+        let stack_start = vm.stack.as_mut_ptr();
+        let high = allocate_upvalue(&mut vm, unsafe { stack_start.add(1) });
+        let low = allocate_upvalue(&mut vm, stack_start);
+        unsafe {
+            (*high).next = low;
+            (*low).next = high;
+        }
+        vm.open_upvalues = high;
+
+        let fault = vm.close_upvalues_checked(stack_start, 0).unwrap_err();
+        assert_eq!(fault.message, "Invalid open upvalue chain.");
+
+        vm.cleanup_execution();
+        assert!(vm.open_upvalues.is_null());
+        assert_eq!(unsafe { (*high).location }, unsafe {
+            std::ptr::addr_of_mut!((*high).closed)
+        });
+        assert_eq!(unsafe { (*low).location }, unsafe {
+            std::ptr::addr_of_mut!((*low).closed)
+        });
+    }
+
+    #[test]
+    fn cleanup_detaches_registered_upvalues_hidden_by_an_alien_chain_head() {
+        let mut vm = VM::new();
+        assert!(vm.push(Value::Number(7.0)));
+        let stack_start = vm.stack.as_mut_ptr();
+        let upvalue = allocate_upvalue(&mut vm, stack_start);
+        vm.open_upvalues = usize::MAX as *mut ObjUpvalue;
+
+        vm.cleanup_execution();
+
+        assert!(vm.open_upvalues.is_null());
+        assert_eq!(unsafe { (*upvalue).closed }, Value::Number(7.0));
+        assert_eq!(unsafe { (*upvalue).location }, unsafe {
+            std::ptr::addr_of_mut!((*upvalue).closed)
+        });
     }
 
     #[test]

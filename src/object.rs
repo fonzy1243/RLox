@@ -438,44 +438,6 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
     ptr
 }
 
-pub fn capture_upvalue(vm: &mut VM, local: *mut Value) -> *mut ObjUpvalue {
-    let mut prev_upvalue: *mut ObjUpvalue = std::ptr::null_mut();
-    let mut upvalue = vm.open_upvalues;
-
-    unsafe {
-        while !upvalue.is_null() && (*upvalue).location > local {
-            prev_upvalue = upvalue;
-            upvalue = (*upvalue).next;
-        }
-
-        if !upvalue.is_null() && (*upvalue).location == local {
-            return upvalue;
-        }
-
-        let created_upvalue = allocate_upvalue(vm, local);
-        (*created_upvalue).next = upvalue;
-
-        if prev_upvalue.is_null() {
-            vm.open_upvalues = created_upvalue;
-        } else {
-            (*prev_upvalue).next = created_upvalue;
-        }
-
-        created_upvalue
-    }
-}
-
-pub fn close_upvalues(vm: &mut VM, last: *mut Value) {
-    unsafe {
-        while !vm.open_upvalues.is_null() && (*vm.open_upvalues).location >= last {
-            let upvalue = vm.open_upvalues;
-            (*upvalue).closed = *(*upvalue).location;
-            (*upvalue).location = &mut (*upvalue).closed;
-            vm.open_upvalues = (*upvalue).next;
-        }
-    }
-}
-
 pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     let list = ObjList {
         obj: Obj {
