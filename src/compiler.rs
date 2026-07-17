@@ -522,7 +522,16 @@ fn function<'a>(
 
     let (function_ptr, upvalues) = end_compiler(parser, new_chunk, vm);
     let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
-    emit_opcode_with_byte(parser, chunk, OpCode::Closure, constant as u8);
+    if constant <= u8::MAX as usize {
+        emit_opcode_with_byte(parser, chunk, OpCode::Closure, constant as u8);
+    } else if constant <= 0x00ff_ffff {
+        emit_opcode(parser, chunk, OpCode::ClosureLong);
+        emit_byte_operand(parser, chunk, (constant & 0xff) as u8);
+        emit_byte_operand(parser, chunk, ((constant >> 8) & 0xff) as u8);
+        emit_byte_operand(parser, chunk, ((constant >> 16) & 0xff) as u8);
+    } else {
+        compiler_error(parser, "Too many constants in one chunk.");
+    }
 
     for upvalue in &upvalues {
         emit_byte_operand(parser, chunk, if upvalue.is_local { 1 } else { 0 });
@@ -2821,6 +2830,35 @@ mod tests {
             HashSet::from([0, 3, 4])
         );
         assert_eq!(encoded_long_list.spans.len(), encoded_long_list.code.len());
+    }
+
+    #[test]
+    fn golden_long_closure_uses_a_three_byte_constant_operand() {
+        let mut source = String::from("fun outer() { var captured; fun first() {}");
+        for value in 0..=254 {
+            source.push_str(&format!("{value};"));
+        }
+        source.push_str("fun later() { print captured; } later(); } outer();");
+
+        let (_vm, script) = compile_success(&source);
+        let outer = direct_function(script, "outer");
+        let offset = opcode_starts(outer)
+            .into_iter()
+            .find(|offset| function_ref(outer).chunk.code[*offset] == OpCode::ClosureLong as u8)
+            .expect("the second nested function should use a long closure operand");
+
+        assert_eq!(
+            &function_ref(outer).chunk.code[offset..offset + 6],
+            &[OpCode::ClosureLong as u8, 0, 1, 0, 1, 1]
+        );
+        assert_points_are_opcode_starts(outer);
+        let Value::Obj(later) = function_ref(outer).chunk.constants[256] else {
+            panic!("long closure constant should contain a function");
+        };
+        assert_eq!(
+            unsafe { ObjString::as_str((*(later as *mut ObjFunction)).name) },
+            "later"
+        );
     }
 
     #[test]

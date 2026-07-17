@@ -1,4 +1,4 @@
-use rlox::{InterpretResult, Interpreter};
+use rlox::{InterpretResult, Interpreter, RecordingHost, RevisionId, SourceDocument, SourceId};
 
 #[test]
 fn library_interprets_a_source_string() {
@@ -133,4 +133,22 @@ fn safety_limits_reject_excess_upvalues() {
         interpreter.interpret(&source),
         InterpretResult::CompileError
     );
+}
+
+#[test]
+fn nested_functions_after_long_constant_tables_call_the_right_closure() {
+    let mut source = String::from("fun outer() { var captured; fun first() { print \"first\"; }");
+    for value in 0..=254 {
+        source.push_str(&format!("{value};"));
+    }
+    source.push_str("fun later() { print captured; } captured = \"later\"; later(); } outer();");
+
+    let document = SourceDocument::new(SourceId(81), RevisionId(1), "closure-long.lox", source);
+    let mut host = RecordingHost::default();
+
+    assert_eq!(
+        Interpreter::new().run(document, &mut host),
+        InterpretResult::Ok
+    );
+    assert_eq!(host.output(), ["later"]);
 }

@@ -1,10 +1,13 @@
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunk::OpCode;
 use crate::compiler::compile;
 use crate::object::{
-    NativeFn, Obj, ObjClosure, ObjFunction, ObjString, ObjUpvalue, allocate_closure, allocate_list,
-    allocate_native, capture_upvalue, close_upvalues, copy_string, free_object, take_string,
+    FORMAT_BYTE_LIMIT, FORMAT_DEPTH_LIMIT, FORMAT_ELEMENT_LIMIT, FORMAT_NODE_LIMIT,
+    FORMAT_TOTAL_ELEMENT_LIMIT, NativeFn, Obj, ObjClosure, ObjFunction, ObjList, ObjString,
+    ObjType, ObjUpvalue, TRUNCATION_MARKER, allocate_closure, allocate_list, allocate_native,
+    capture_upvalue, close_upvalues, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -41,6 +44,76 @@ pub struct VM {
     pub compiler_roots: Vec<*mut ObjFunction>,
     pub gray_stack: Vec<*mut Obj>,
     next_activation_id: u64,
+    object_registry: HashMap<*mut Obj, ObjectAllocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectAllocation {
+    pub kind: ObjType,
+    pub string_len: Option<usize>,
+}
+
+struct CheckedFormatState {
+    output: String,
+    visited: HashSet<*mut Obj>,
+    nodes_remaining: usize,
+    elements_remaining: usize,
+    truncated: bool,
+}
+
+impl CheckedFormatState {
+    fn new() -> Self {
+        Self {
+            output: String::new(),
+            visited: HashSet::new(),
+            nodes_remaining: FORMAT_NODE_LIMIT,
+            elements_remaining: FORMAT_TOTAL_ELEMENT_LIMIT,
+            truncated: false,
+        }
+    }
+
+    fn consume_node(&mut self) -> bool {
+        if self.nodes_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.nodes_remaining -= 1;
+        true
+    }
+
+    fn consume_element(&mut self) -> bool {
+        if self.elements_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.elements_remaining -= 1;
+        true
+    }
+
+    fn write_str(&mut self, value: &str) {
+        if self.truncated {
+            return;
+        }
+        let content_limit = FORMAT_BYTE_LIMIT - TRUNCATION_MARKER.len();
+        let remaining = content_limit.saturating_sub(self.output.len());
+        if value.len() <= remaining {
+            self.output.push_str(value);
+            return;
+        }
+        let mut end = remaining.min(value.len());
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.output.push_str(&value[..end]);
+        self.truncate();
+    }
+
+    fn truncate(&mut self) {
+        if !self.truncated {
+            self.output.push_str(TRUNCATION_MARKER);
+            self.truncated = true;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +172,7 @@ impl VM {
             compiler_roots: Vec::new(),
             gray_stack: Vec::new(),
             next_activation_id: 1,
+            object_registry: HashMap::new(),
         };
 
         vm.stack_top = vm.stack.as_mut_ptr();
@@ -183,7 +257,11 @@ impl VM {
         arg_count: usize,
         call_site: Option<(usize, SourceSpan)>,
     ) -> Result<(), VmFault> {
-        let arity = unsafe { (*(*closure).function).arity };
+        let fault_offset = self.current_offset().unwrap_or(0);
+        self.require_object_kind(closure as *mut Obj, ObjType::Closure, fault_offset)?;
+        let function = unsafe { (*closure).function };
+        self.require_object_kind(function as *mut Obj, ObjType::Function, fault_offset)?;
+        let arity = unsafe { (*function).arity };
         if arg_count != arity {
             return Err(VmFault::new(
                 format!("Expected {} arguments but got {}.", arity, arg_count),
@@ -303,6 +381,22 @@ impl VM {
             .map(|point| (frame.activation_id, point))
     }
 
+    pub(crate) fn register_object(
+        &mut self,
+        object: *mut Obj,
+        kind: ObjType,
+        string_len: Option<usize>,
+    ) {
+        let previous = self
+            .object_registry
+            .insert(object, ObjectAllocation { kind, string_len });
+        debug_assert!(previous.is_none(), "object address registered twice");
+    }
+
+    pub(crate) fn object_allocation(&self, object: *mut Obj) -> Option<ObjectAllocation> {
+        self.object_registry.get(&object).copied()
+    }
+
     fn define_native(&mut self, name: &str, function: NativeFn) -> bool {
         let name_obj = copy_string(self, name);
         let native_obj = allocate_native(self, function);
@@ -329,7 +423,11 @@ impl Drop for VM {
         while !object.is_null() {
             unsafe {
                 let next = (*object).next;
-                free_object(object);
+                let allocation = self
+                    .object_registry
+                    .remove(&object)
+                    .expect("every allocated object remains registered until it is freed");
+                free_object(object, allocation.kind, allocation.string_len);
                 object = next;
             }
         }
@@ -453,8 +551,8 @@ impl VM {
 
         let frame_index = self.frame_count - 1;
         let current_offset = self.frames[frame_index].ip;
-        let function = unsafe { (*self.frames[frame_index].closure).function };
-        let width = instruction_width_at(function, current_offset)
+        let function = self.frame_function(frame_index, current_offset)?;
+        let width = instruction_width_at(self, function, current_offset)
             .map_err(|message| VmFault::new(message, current_offset))?;
         let next_offset = current_offset
             .checked_add(width)
@@ -472,9 +570,30 @@ impl VM {
             eprint!("          ");
             let stack_len = self.stack_len();
             for value in &self.stack[..stack_len] {
-                eprint!("[ {} ]", value);
+                let rendered = self.format_value_checked(*value, current_offset)?;
+                eprint!("[ {rendered} ]");
             }
             eprintln!();
+            let constant_index = if matches!(
+                instruction,
+                x if x == OpCode::Constant as u8
+                    || x == OpCode::GetGlobal as u8
+                    || x == OpCode::DefineGlobal as u8
+                    || x == OpCode::SetGlobal as u8
+                    || x == OpCode::Closure as u8
+            ) {
+                Some(self.code_byte(function, current_offset + 1, current_offset)? as usize)
+            } else if instruction == OpCode::ConstantLong as u8
+                || instruction == OpCode::ClosureLong as u8
+            {
+                Some(self.code_u24(function, current_offset + 1, current_offset)?)
+            } else {
+                None
+            };
+            if let Some(index) = constant_index {
+                let value = self.constant(function, index, current_offset)?;
+                self.format_value_checked(value, current_offset)?;
+            }
             disassemble_instruction(unsafe { &(*function).chunk }, current_offset);
         }
 
@@ -530,12 +649,13 @@ impl VM {
                 let index = self.code_byte(function, current_offset + 1, current_offset)? as usize;
                 let name = self.string_constant(function, index, current_offset)?;
                 if instruction == OpCode::GetGlobal as u8 {
-                    let value = self.globals.get(name).ok_or_else(|| {
-                        VmFault::new(
-                            format!("Undefined variable '{}'.", ObjString::as_str(name)),
+                    let Some(value) = self.globals.get(name) else {
+                        let name = self.string_text(name, current_offset)?;
+                        return Err(VmFault::new(
+                            format!("Undefined variable '{name}'."),
                             current_offset,
-                        )
-                    })?;
+                        ));
+                    };
                     self.push_checked(value, current_offset)?;
                 } else if instruction == OpCode::DefineGlobal as u8 {
                     let value = self.peek_checked(0, current_offset)?;
@@ -545,8 +665,9 @@ impl VM {
                     let value = self.peek_checked(0, current_offset)?;
                     if self.globals.set(name, value) {
                         self.globals.delete(name);
+                        let name = self.string_text(name, current_offset)?;
                         return Err(VmFault::new(
-                            format!("Undefined variable '{}'.", ObjString::as_str(name)),
+                            format!("Undefined variable '{name}'."),
                             current_offset,
                         ));
                     }
@@ -558,13 +679,14 @@ impl VM {
                 let upvalue = unsafe { (&(*closure).upvalues).get(slot).copied() }
                     .filter(|upvalue| !upvalue.is_null())
                     .ok_or_else(|| VmFault::new("Invalid upvalue.", current_offset))?;
+                let location = self.upvalue_location(upvalue, current_offset)?;
                 if instruction == OpCode::GetUpvalue as u8 {
-                    let value = unsafe { *(*upvalue).location };
+                    let value = unsafe { *location };
                     self.push_checked(value, current_offset)?;
                 } else {
                     let value = self.peek_checked(0, current_offset)?;
                     unsafe {
-                        *(*upvalue).location = value;
+                        *location = value;
                     }
                 }
             }
@@ -586,13 +708,14 @@ impl VM {
                 self.require_stack(2, current_offset)?;
                 let index_value = self.peek_checked(0, current_offset)?;
                 let list_value = self.peek_checked(1, current_offset)?;
-                if !list_value.is_list() {
+                let Some((list, ObjType::List)) = self.value_object(list_value, current_offset)?
+                else {
                     return Err(VmFault::new(
                         "Only lists can be subscripted.",
                         current_offset,
                     ));
-                }
-                let list = unsafe { &*list_value.as_list() };
+                };
+                let list = unsafe { &*(list as *mut ObjList) };
                 let index = checked_list_index(index_value, list.items.len())
                     .map_err(|message| VmFault::new(message, current_offset))?;
                 let value = list.items[index];
@@ -605,13 +728,14 @@ impl VM {
                 let value = self.peek_checked(0, current_offset)?;
                 let index_value = self.peek_checked(1, current_offset)?;
                 let list_value = self.peek_checked(2, current_offset)?;
-                if !list_value.is_list() {
+                let Some((list, ObjType::List)) = self.value_object(list_value, current_offset)?
+                else {
                     return Err(VmFault::new(
                         "Only lists can be subscripted.",
                         current_offset,
                     ));
-                }
-                let list = unsafe { &mut *list_value.as_list() };
+                };
+                let list = unsafe { &mut *(list as *mut ObjList) };
                 let index = checked_list_index(index_value, list.items.len())
                     .map_err(|message| VmFault::new(message, current_offset))?;
                 list.items[index] = value;
@@ -636,8 +760,18 @@ impl VM {
                 let (a, b) = self.binary_values(current_offset)?;
                 if a.is_number() && b.is_number() {
                     self.replace_binary(Value::Number(a.as_number() + b.as_number()));
-                } else if a.is_string() && b.is_string() {
-                    let chars = format!("{}{}", a.as_cstring(), b.as_cstring());
+                } else if let (
+                    Some((a_string, ObjType::String)),
+                    Some((b_string, ObjType::String)),
+                ) = (
+                    self.value_object(a, current_offset)?,
+                    self.value_object(b, current_offset)?,
+                ) {
+                    let chars = format!(
+                        "{}{}",
+                        self.string_text(a_string as *mut ObjString, current_offset)?,
+                        self.string_text(b_string as *mut ObjString, current_offset)?
+                    );
                     let result = take_string(self, chars);
                     self.pop();
                     self.pop();
@@ -680,7 +814,8 @@ impl VM {
                 self.stack[index] = Value::Number(-value.as_number());
             }
             x if x == OpCode::Print as u8 => {
-                let output = self.peek_checked(0, current_offset)?.to_string();
+                let value = self.peek_checked(0, current_offset)?;
+                let output = self.format_value_checked(value, current_offset)?;
                 self.pop();
                 host.output(output);
             }
@@ -705,7 +840,7 @@ impl VM {
                 } else {
                     target
                 };
-                if !is_opcode_start(function, selected) {
+                if !is_opcode_start(self, function, selected) {
                     return Err(VmFault::new("Invalid jump target.", current_offset));
                 }
                 self.frames[frame_index].ip = selected;
@@ -715,9 +850,10 @@ impl VM {
                     self.code_byte(function, current_offset + 1, current_offset)? as usize;
                 self.require_stack(arg_count + 1, current_offset)?;
                 let callee = self.peek_checked(arg_count, current_offset)?;
-                if callee.is_closure() {
+                let callee_object = self.value_object(callee, current_offset)?;
+                if let Some((closure, ObjType::Closure)) = callee_object {
                     self.install_frame(
-                        callee.as_closure(),
+                        closure as *mut ObjClosure,
                         arg_count,
                         Some((current_offset, span)),
                     )
@@ -725,8 +861,8 @@ impl VM {
                         fault.offset = current_offset;
                         fault
                     })?;
-                } else if callee.is_native() {
-                    let native = callee.as_native();
+                } else if let Some((native, ObjType::Native)) = callee_object {
+                    let native = native as *mut crate::object::ObjNative;
                     let len = self.stack_len();
                     let args = self.stack[len - arg_count..len].to_vec();
                     let result = unsafe { ((*native).function)(arg_count, &args) };
@@ -740,18 +876,28 @@ impl VM {
                     ));
                 }
             }
-            x if x == OpCode::Closure as u8 => {
-                let constant_index =
-                    self.code_byte(function, current_offset + 1, current_offset)? as usize;
+            x if x == OpCode::Closure as u8 || x == OpCode::ClosureLong as u8 => {
+                let constant_index = if instruction == OpCode::Closure as u8 {
+                    self.code_byte(function, current_offset + 1, current_offset)? as usize
+                } else {
+                    self.code_u24(function, current_offset + 1, current_offset)?
+                };
                 let function_value = self.constant(function, constant_index, current_offset)?;
-                if !function_value.is_function() {
+                let Some((child_function, ObjType::Function)) =
+                    self.value_object(function_value, current_offset)?
+                else {
                     return Err(VmFault::new("Invalid closure function.", current_offset));
-                }
-                let child_function = function_value.as_function();
+                };
+                let child_function = child_function as *mut ObjFunction;
                 let count = unsafe { (*child_function).upvalue_count };
                 let mut descriptors = Vec::with_capacity(count);
                 for index in 0..count {
-                    let descriptor_offset = current_offset + 2 + index * 2;
+                    let operand_width = if instruction == OpCode::Closure as u8 {
+                        1
+                    } else {
+                        3
+                    };
+                    let descriptor_offset = current_offset + 1 + operand_width + index * 2;
                     let is_local = self.code_byte(function, descriptor_offset, current_offset)?;
                     let capture =
                         self.code_byte(function, descriptor_offset + 1, current_offset)? as usize;
@@ -769,7 +915,12 @@ impl VM {
                             (&(*parent).upvalues)
                                 .get(capture)
                                 .copied()
-                                .is_some_and(|upvalue| !upvalue.is_null())
+                                .is_some_and(|upvalue| {
+                                    !upvalue.is_null()
+                                        && self.object_allocation(upvalue as *mut Obj).is_some_and(
+                                            |allocation| allocation.kind == ObjType::Upvalue,
+                                        )
+                                })
                         };
                         if !valid {
                             return Err(VmFault::new("Invalid closure upvalue.", current_offset));
@@ -827,6 +978,218 @@ impl VM {
 
     fn stack_len(&self) -> usize {
         unsafe { self.stack_top.offset_from(self.stack.as_ptr()) as usize }
+    }
+
+    fn object_kind(&self, object: *mut Obj, offset: usize) -> Result<ObjType, VmFault> {
+        let allocation = self
+            .object_allocation(object)
+            .ok_or_else(|| VmFault::new("Invalid object reference.", offset))?;
+        let stored_tag = unsafe { std::ptr::addr_of!((*object).obj_type).cast::<u8>().read() };
+        if stored_tag != allocation.kind as u8 {
+            return Err(VmFault::new("Invalid object header.", offset));
+        }
+        Ok(allocation.kind)
+    }
+
+    fn value_object(
+        &self,
+        value: Value,
+        offset: usize,
+    ) -> Result<Option<(*mut Obj, ObjType)>, VmFault> {
+        match value {
+            Value::Obj(object) => Ok(Some((object, self.object_kind(object, offset)?))),
+            _ => Ok(None),
+        }
+    }
+
+    fn require_object_kind(
+        &self,
+        object: *mut Obj,
+        expected: ObjType,
+        offset: usize,
+    ) -> Result<(), VmFault> {
+        if self.object_kind(object, offset)? == expected {
+            Ok(())
+        } else {
+            Err(VmFault::new("Invalid object type.", offset))
+        }
+    }
+
+    fn string_text(&self, string: *mut ObjString, offset: usize) -> Result<&str, VmFault> {
+        let object = string as *mut Obj;
+        self.require_object_kind(object, ObjType::String, offset)?;
+        let allocation = self
+            .object_allocation(object)
+            .ok_or_else(|| VmFault::new("Invalid string object.", offset))?;
+        let length = allocation
+            .string_len
+            .ok_or_else(|| VmFault::new("Invalid string allocation.", offset))?;
+        if unsafe { (*string).length } != length {
+            return Err(VmFault::new("Invalid string allocation.", offset));
+        }
+        let bytes = unsafe {
+            let chars = (string as *const u8).add(std::mem::size_of::<ObjString>());
+            std::slice::from_raw_parts(chars, length)
+        };
+        std::str::from_utf8(bytes).map_err(|_| VmFault::new("Invalid string encoding.", offset))
+    }
+
+    fn frame_function(
+        &self,
+        frame_index: usize,
+        offset: usize,
+    ) -> Result<*mut ObjFunction, VmFault> {
+        let closure = self.frames[frame_index].closure;
+        self.require_object_kind(closure as *mut Obj, ObjType::Closure, offset)?;
+        let function = unsafe { (*closure).function };
+        self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?;
+        Ok(function)
+    }
+
+    fn open_upvalue_contains(
+        &self,
+        target: *mut ObjUpvalue,
+        offset: usize,
+    ) -> Result<bool, VmFault> {
+        let mut current = self.open_upvalues;
+        let mut visited = HashSet::new();
+        while !current.is_null() {
+            self.require_object_kind(current as *mut Obj, ObjType::Upvalue, offset)?;
+            if !visited.insert(current) {
+                return Err(VmFault::new("Invalid open upvalue chain.", offset));
+            }
+            if current == target {
+                return Ok(true);
+            }
+            current = unsafe { (*current).next };
+        }
+        Ok(false)
+    }
+
+    fn upvalue_location(
+        &self,
+        upvalue: *mut ObjUpvalue,
+        offset: usize,
+    ) -> Result<*mut Value, VmFault> {
+        self.require_object_kind(upvalue as *mut Obj, ObjType::Upvalue, offset)?;
+        let location = unsafe { (*upvalue).location };
+        if location.is_null() {
+            return Err(VmFault::new("Invalid upvalue location.", offset));
+        }
+        let closed = unsafe { std::ptr::addr_of_mut!((*upvalue).closed) };
+        if location == closed {
+            return Ok(location);
+        }
+
+        let address = location as usize;
+        let stack_start = self.stack.as_ptr() as usize;
+        let stack_top = self.stack_top as usize;
+        let value_size = std::mem::size_of::<Value>();
+        let exact_slot = address
+            .checked_sub(stack_start)
+            .is_some_and(|distance| distance % value_size == 0);
+        let in_live_stack = address >= stack_start
+            && address
+                .checked_add(value_size)
+                .is_some_and(|end| end <= stack_top);
+        if !exact_slot || !in_live_stack || !self.open_upvalue_contains(upvalue, offset)? {
+            return Err(VmFault::new("Invalid upvalue location.", offset));
+        }
+        Ok(location)
+    }
+
+    fn validate_value(&self, value: Value, offset: usize) -> Result<(), VmFault> {
+        if let Value::Obj(object) = value {
+            self.object_kind(object, offset)?;
+        }
+        Ok(())
+    }
+
+    fn format_value_checked(&self, value: Value, offset: usize) -> Result<String, VmFault> {
+        let mut state = CheckedFormatState::new();
+        self.format_value_nested_checked(value, &mut state, 0, offset)?;
+        Ok(state.output)
+    }
+
+    fn format_value_nested_checked(
+        &self,
+        value: Value,
+        state: &mut CheckedFormatState,
+        depth: usize,
+        offset: usize,
+    ) -> Result<(), VmFault> {
+        if !state.consume_node() {
+            return Ok(());
+        }
+        match value {
+            Value::Bool(value) => state.write_str(if value { "true" } else { "false" }),
+            Value::Nil => state.write_str("nil"),
+            Value::Number(value) => state.write_str(&value.to_string()),
+            Value::Obj(object) => {
+                let kind = self.object_kind(object, offset)?;
+                match kind {
+                    ObjType::Closure => {
+                        let closure = unsafe { &*(object as *mut ObjClosure) };
+                        self.format_function_checked(closure.function, state, offset)?;
+                    }
+                    ObjType::Function => {
+                        self.format_function_checked(object as *mut ObjFunction, state, offset)?;
+                    }
+                    ObjType::Native => state.write_str("<native fn>"),
+                    ObjType::String => {
+                        state.write_str(self.string_text(object as *mut ObjString, offset)?);
+                    }
+                    ObjType::Upvalue => state.write_str("upvalue"),
+                    ObjType::List => {
+                        if depth >= FORMAT_DEPTH_LIMIT {
+                            state.write_str("<depth-limit>");
+                            return Ok(());
+                        }
+                        if !state.visited.insert(object) {
+                            state.write_str("<cycle>");
+                            return Ok(());
+                        }
+                        let list = unsafe { &*(object as *mut ObjList) };
+                        state.write_str("[");
+                        for (index, item) in
+                            list.items.iter().take(FORMAT_ELEMENT_LIMIT).enumerate()
+                        {
+                            if state.truncated || !state.consume_element() {
+                                break;
+                            }
+                            if index > 0 {
+                                state.write_str(", ");
+                            }
+                            self.format_value_nested_checked(*item, state, depth + 1, offset)?;
+                        }
+                        if !state.truncated && list.items.len() > FORMAT_ELEMENT_LIMIT {
+                            state.truncate();
+                        }
+                        state.write_str("]");
+                        state.visited.remove(&object);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn format_function_checked(
+        &self,
+        function: *mut ObjFunction,
+        state: &mut CheckedFormatState,
+        offset: usize,
+    ) -> Result<(), VmFault> {
+        self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?;
+        let name = unsafe { (*function).name };
+        if name.is_null() {
+            state.write_str("<script>");
+        } else {
+            state.write_str("<fn ");
+            state.write_str(self.string_text(name, offset)?);
+            state.write_str(">");
+        }
+        Ok(())
     }
 
     fn require_stack(&self, count: usize, offset: usize) -> Result<(), VmFault> {
@@ -904,12 +1267,14 @@ impl VM {
         index: usize,
         offset: usize,
     ) -> Result<Value, VmFault> {
-        unsafe {
+        let value = unsafe {
             (&(*function).chunk.constants)
                 .get(index)
                 .copied()
                 .ok_or_else(|| VmFault::new("Invalid constant index.", offset))
-        }
+        }?;
+        self.validate_value(value, offset)?;
+        Ok(value)
     }
 
     fn string_constant(
@@ -919,10 +1284,10 @@ impl VM {
         offset: usize,
     ) -> Result<*mut ObjString, VmFault> {
         let value = self.constant(function, index, offset)?;
-        if !value.is_string() {
+        let Some((string, ObjType::String)) = self.value_object(value, offset)? else {
             return Err(VmFault::new("Invalid string constant.", offset));
-        }
-        Ok(value.as_obj() as *mut ObjString)
+        };
+        Ok(string as *mut ObjString)
     }
 
     fn local_index(
@@ -978,7 +1343,13 @@ impl VM {
     }
 }
 
-fn instruction_width_at(function: *mut ObjFunction, offset: usize) -> Result<usize, String> {
+fn instruction_width_at(
+    vm: &VM,
+    function: *mut ObjFunction,
+    offset: usize,
+) -> Result<usize, String> {
+    vm.require_object_kind(function as *mut Obj, ObjType::Function, offset)
+        .map_err(|fault| fault.message)?;
     let chunk = unsafe { &(*function).chunk };
     let opcode = *chunk
         .code
@@ -1013,21 +1384,50 @@ fn instruction_width_at(function: *mut ObjFunction, offset: usize) -> Result<usi
         3
     } else if opcode == OpCode::ConstantLong as u8 {
         4
-    } else if opcode == OpCode::Closure as u8 {
-        let constant_index = *chunk
-            .code
-            .get(offset + 1)
-            .ok_or_else(|| format!("Truncated Closure instruction at {offset}."))?
-            as usize;
+    } else if opcode == OpCode::Closure as u8 || opcode == OpCode::ClosureLong as u8 {
+        let operand_width = if opcode == OpCode::Closure as u8 {
+            1
+        } else {
+            3
+        };
+        let constant_index = if operand_width == 1 {
+            *chunk
+                .code
+                .get(offset + 1)
+                .ok_or_else(|| format!("Truncated Closure instruction at {offset}."))?
+                as usize
+        } else {
+            let lo = *chunk
+                .code
+                .get(offset + 1)
+                .ok_or_else(|| format!("Truncated Closure instruction at {offset}."))?
+                as usize;
+            let mid = *chunk
+                .code
+                .get(offset + 2)
+                .ok_or_else(|| format!("Truncated Closure instruction at {offset}."))?
+                as usize;
+            let hi = *chunk
+                .code
+                .get(offset + 3)
+                .ok_or_else(|| format!("Truncated Closure instruction at {offset}."))?
+                as usize;
+            lo | (mid << 8) | (hi << 16)
+        };
         let value = *chunk
             .constants
             .get(constant_index)
             .ok_or_else(|| format!("Invalid Closure constant at {offset}."))?;
-        if !value.is_function() {
+        vm.validate_value(value, offset)
+            .map_err(|fault| fault.message)?;
+        let Some((function_object, ObjType::Function)) = vm
+            .value_object(value, offset)
+            .map_err(|fault| fault.message)?
+        else {
             return Err(format!("Invalid Closure function at {offset}."));
-        }
-        let count = unsafe { (*value.as_function()).upvalue_count };
-        2usize
+        };
+        let count = unsafe { (*(function_object as *mut ObjFunction)).upvalue_count };
+        (1usize + operand_width)
             .checked_add(
                 count
                     .checked_mul(2)
@@ -1086,22 +1486,26 @@ fn instruction_width_at(function: *mut ObjFunction, offset: usize) -> Result<usi
     } else {
         None
     };
-    if let Some(index) = constant_index
-        && chunk.constants.get(index).is_none()
-    {
-        return Err(format!("Invalid constant index {index} at {offset}."));
+    if let Some(index) = constant_index {
+        let value = chunk
+            .constants
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("Invalid constant index {index} at {offset}."))?;
+        vm.validate_value(value, offset)
+            .map_err(|fault| fault.message)?;
     }
     Ok(width)
 }
 
-fn is_opcode_start(function: *mut ObjFunction, target: usize) -> bool {
+fn is_opcode_start(vm: &VM, function: *mut ObjFunction, target: usize) -> bool {
     let code_len = unsafe { (*function).chunk.code.len() };
     if target >= code_len {
         return false;
     }
     let mut offset = 0;
     while offset < target {
-        let Ok(width) = instruction_width_at(function, offset) else {
+        let Ok(width) = instruction_width_at(vm, function, offset) else {
             return false;
         };
         let Some(next) = offset.checked_add(width) else {
@@ -1115,6 +1519,7 @@ fn is_opcode_start(function: *mut ObjFunction, target: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{allocate_closure, allocate_function, allocate_upvalue};
     use crate::{RecordingHost, RevisionId, SourceId};
 
     fn prepared_vm(source: &str) -> (VM, RecordingHost) {
@@ -1130,6 +1535,16 @@ mod tests {
         unsafe { (*vm.frames[0].closure).function }
     }
 
+    fn replace_active_code(vm: &mut VM, code: Vec<u8>) {
+        let function = active_function(vm);
+        let span = unsafe { (*function).debug_info.declaration };
+        unsafe {
+            (*function).chunk.spans = vec![span; code.len()];
+            (*function).chunk.code = code;
+        }
+        vm.frames[vm.frame_count - 1].ip = 0;
+    }
+
     #[test]
     fn malformed_constant_faults_before_trace_disassembly() {
         let (mut vm, mut host) = prepared_vm("print 1;");
@@ -1140,6 +1555,259 @@ mod tests {
 
         assert!(fault.message.contains("Invalid constant index"));
         assert_eq!(fault.offset, 0);
+    }
+
+    #[test]
+    fn null_object_constant_faults_before_stack_or_trace_use() {
+        let (mut vm, mut host) = prepared_vm("print 1;");
+        let function = active_function(&vm);
+        unsafe { (&mut (*function).chunk.constants)[0] = Value::Obj(std::ptr::null_mut()) };
+
+        let fault = vm.dispatch_one(&mut host).unwrap_err();
+
+        assert_eq!(fault.message, "Invalid object reference.");
+        assert_eq!(fault.offset, 0);
+    }
+
+    #[test]
+    fn alien_object_constant_faults_before_stack_or_trace_use() {
+        let (mut vm, mut host) = prepared_vm("print 1;");
+        let function = active_function(&vm);
+        unsafe { (&mut (*function).chunk.constants)[0] = Value::Obj(1usize as *mut Obj) };
+
+        let fault = vm.dispatch_one(&mut host).unwrap_err();
+
+        assert_eq!(fault.message, "Invalid object reference.");
+        assert_eq!(fault.offset, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "debug_trace_execution")]
+    fn registered_string_length_is_checked_before_trace_formatting() {
+        let (mut vm, mut host) = prepared_vm("print \"safe\";");
+        let function = active_function(&vm);
+        let string = unsafe { (&(*function).chunk.constants)[0].as_obj() as *mut ObjString };
+        let original_length = unsafe { (*string).length };
+        unsafe { (*string).length = original_length + 1 };
+
+        let fault = vm.dispatch_one(&mut host).unwrap_err();
+
+        unsafe { (*string).length = original_length };
+        assert_eq!(fault.message, "Invalid string allocation.");
+        assert_eq!(fault.offset, 0);
+    }
+
+    #[test]
+    fn malformed_instruction_widths_and_unknown_opcodes_fault() {
+        let cases = [
+            (vec![u8::MAX], "Unknown opcode"),
+            (vec![OpCode::GetLocal as u8], "Truncated instruction"),
+            (vec![OpCode::Jump as u8, 0], "Truncated instruction"),
+            (
+                vec![OpCode::ConstantLong as u8, 0, 0],
+                "Truncated instruction",
+            ),
+            (
+                vec![OpCode::ClosureLong as u8, 0, 0],
+                "Truncated Closure instruction",
+            ),
+        ];
+
+        for (code, expected) in cases {
+            let (mut vm, mut host) = prepared_vm("print 1;");
+            replace_active_code(&mut vm, code);
+            let fault = vm.dispatch_one(&mut host).unwrap_err();
+            assert!(fault.message.contains(expected), "{fault:?}");
+            assert_eq!(fault.offset, 0);
+        }
+    }
+
+    #[test]
+    fn malformed_indexed_and_stack_operands_fault_without_crossing_frame_floor() {
+        let cases = [
+            (vec![OpCode::GetLocal as u8, u8::MAX], "Invalid local slot."),
+            (vec![OpCode::GetUpvalue as u8, 0], "Invalid upvalue."),
+            (vec![OpCode::BuildList as u8, 2], "Stack underflow."),
+            (vec![OpCode::Call as u8, 1], "Stack underflow."),
+            (vec![OpCode::Return as u8], "Stack underflow."),
+        ];
+
+        for (code, expected) in cases {
+            let (mut vm, mut host) = prepared_vm("print 1;");
+            replace_active_code(&mut vm, code);
+            let fault = vm.dispatch_one(&mut host).unwrap_err();
+            assert_eq!(fault.message, expected);
+            assert_eq!(fault.offset, 0);
+        }
+    }
+
+    #[test]
+    fn malformed_jump_targets_fault_for_operand_interior_and_underflow() {
+        let cases = [
+            vec![
+                OpCode::Jump as u8,
+                1,
+                0,
+                OpCode::Constant as u8,
+                0,
+                OpCode::Return as u8,
+            ],
+            vec![OpCode::Loop as u8, 4, 0],
+        ];
+
+        for code in cases {
+            let (mut vm, mut host) = prepared_vm("print 1;");
+            replace_active_code(&mut vm, code);
+            let fault = vm.dispatch_one(&mut host).unwrap_err();
+            assert_eq!(fault.message, "Invalid jump target.");
+            assert_eq!(fault.offset, 0);
+        }
+    }
+
+    #[test]
+    fn malformed_global_and_closure_constant_types_fault() {
+        let (mut global_vm, mut global_host) = prepared_vm("print missing;");
+        let global_function = active_function(&global_vm);
+        unsafe { (&mut (*global_function).chunk.constants)[0] = Value::Number(1.0) };
+        let global_fault = global_vm.dispatch_one(&mut global_host).unwrap_err();
+        assert_eq!(global_fault.message, "Invalid string constant.");
+
+        let (mut closure_vm, mut closure_host) = prepared_vm("fun f() {}");
+        let closure_function = active_function(&closure_vm);
+        unsafe { (&mut (*closure_function).chunk.constants)[1] = Value::Number(1.0) };
+        let closure_fault = closure_vm.dispatch_one(&mut closure_host).unwrap_err();
+        assert!(closure_fault.message.contains("Invalid Closure function"));
+    }
+
+    #[test]
+    fn malformed_closure_descriptors_fault_before_allocation_or_capture() {
+        let (mut vm, mut host) =
+            prepared_vm("fun outer() { var value=1; fun inner() { print value; } } outer();");
+        let script = active_function(&vm);
+        let outer = unsafe {
+            (*script)
+                .chunk
+                .constants
+                .iter()
+                .find_map(|value| match value {
+                    Value::Obj(object)
+                        if vm.object_allocation(*object).is_some_and(|allocation| {
+                            allocation.kind == ObjType::Function
+                                && !(*(*object as *mut ObjFunction)).name.is_null()
+                                && ObjString::as_str((*(*object as *mut ObjFunction)).name)
+                                    == "outer"
+                        }) =>
+                    {
+                        Some(*object as *mut ObjFunction)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let closure_offset = unsafe { (*outer).chunk.opcode_starts().unwrap() }
+            .into_iter()
+            .find(|offset| unsafe { (&(*outer).chunk.code)[*offset] == OpCode::Closure as u8 })
+            .unwrap();
+        vm.cleanup_execution();
+        let outer_closure = allocate_closure(&mut vm, outer);
+        assert!(vm.push(Value::Obj(outer_closure as *mut Obj)));
+        vm.install_frame(outer_closure, 0, None).unwrap();
+        while vm.current_offset().unwrap() < closure_offset {
+            assert_eq!(
+                vm.dispatch_one(&mut host).unwrap(),
+                DispatchResult::Continue
+            );
+        }
+
+        unsafe { (&mut (*outer).chunk.code)[closure_offset + 2] = 2 };
+        let fault = vm.dispatch_one(&mut host).unwrap_err();
+        assert_eq!(fault.message, "Invalid closure capture descriptor.");
+
+        unsafe {
+            (*outer).chunk.code.truncate(closure_offset + 3);
+            (*outer).chunk.spans.truncate(closure_offset + 3);
+        }
+        vm.frames[0].ip = closure_offset;
+        let truncated = vm.dispatch_one(&mut host).unwrap_err();
+        assert!(truncated.message.contains("Truncated instruction"));
+    }
+
+    #[test]
+    fn alien_open_upvalue_location_faults_before_dereference() {
+        let mut vm = VM::new();
+        let mut host = RecordingHost::default();
+        let function = allocate_function(&mut vm);
+        let span = unsafe { (*function).debug_info.declaration };
+        unsafe {
+            (*function).arity = 0;
+            (*function).upvalue_count = 1;
+            (*function).chunk.code = vec![OpCode::GetUpvalue as u8, 0];
+            (*function).chunk.spans = vec![span; 2];
+        }
+        let closure = allocate_closure(&mut vm, function);
+        let upvalue = allocate_upvalue(&mut vm, usize::MAX as *mut Value);
+        unsafe { (*closure).upvalues[0] = upvalue };
+        assert!(vm.push(Value::Obj(closure as *mut Obj)));
+        vm.install_frame(closure, 0, None).unwrap();
+
+        let fault = vm.dispatch_one(&mut host).unwrap_err();
+
+        assert_eq!(fault.message, "Invalid upvalue location.");
+    }
+
+    #[test]
+    fn aligned_pointer_inside_a_stack_slot_is_not_an_upvalue_location() {
+        let mut vm = VM::new();
+        assert!(std::mem::size_of::<Value>() > std::mem::align_of::<Value>());
+        assert!(vm.push(Value::Nil));
+        assert!(vm.push(Value::Nil));
+        let location = unsafe {
+            (vm.stack.as_mut_ptr() as *mut u8).add(std::mem::align_of::<Value>()) as *mut Value
+        };
+        let upvalue = allocate_upvalue(&mut vm, location);
+        vm.open_upvalues = upvalue;
+
+        let fault = vm.upvalue_location(upvalue, 0).unwrap_err();
+
+        assert_eq!(fault.message, "Invalid upvalue location.");
+    }
+
+    #[test]
+    fn allocation_registry_rejects_and_safely_drops_a_mismatched_object_header() {
+        let mut vm = VM::new();
+        let string = copy_string(&mut vm, "safe");
+        unsafe { (*string).obj.obj_type = ObjType::List };
+
+        let fault = vm.object_kind(string as *mut Obj, 0).unwrap_err();
+
+        assert_eq!(fault.message, "Invalid object header.");
+    }
+
+    #[test]
+    fn checked_value_formatting_stops_at_its_depth_budget() {
+        let mut vm = VM::new();
+        let mut value = Value::Obj(1usize as *mut Obj);
+        for _ in 0..=64 {
+            value = Value::Obj(allocate_list(&mut vm, vec![value]) as *mut Obj);
+        }
+
+        let rendered = vm.format_value_checked(value, 0).unwrap();
+
+        assert!(rendered.contains("<depth-limit>"));
+        assert!(!rendered.contains("<truncated>"));
+    }
+
+    #[test]
+    fn activation_exhaustion_faults_before_installing_a_frame() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        let closure = vm.frames[0].closure;
+        let frame_count = vm.frame_count;
+        vm.next_activation_id = u64::MAX;
+
+        let fault = vm.install_frame(closure, 0, None).unwrap_err();
+
+        assert_eq!(fault.message, "Activation counter exhausted.");
+        assert_eq!(vm.frame_count, frame_count);
     }
 
     #[test]

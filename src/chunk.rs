@@ -43,6 +43,7 @@ pub enum OpCode {
     Loop,
     Call,
     Closure,
+    ClosureLong,
     CloseUpvalue,
     Return,
 }
@@ -139,11 +140,23 @@ impl Chunk {
                 3
             } else if opcode == OpCode::ConstantLong as u8 {
                 4
-            } else if opcode == OpCode::Closure as u8 {
-                if offset + 2 > self.code.len() {
+            } else if opcode == OpCode::Closure as u8 || opcode == OpCode::ClosureLong as u8 {
+                let operand_width = if opcode == OpCode::Closure as u8 {
+                    1
+                } else {
+                    3
+                };
+                let base_width = 1 + operand_width;
+                if offset + base_width > self.code.len() {
                     return Err(format!("truncated Closure instruction at {offset}"));
                 }
-                let constant = self.code[offset + 1] as usize;
+                let constant = if operand_width == 1 {
+                    self.code[offset + 1] as usize
+                } else {
+                    (self.code[offset + 1] as usize)
+                        | ((self.code[offset + 2] as usize) << 8)
+                        | ((self.code[offset + 3] as usize) << 16)
+                };
                 let Some(value) = self.constants.get(constant) else {
                     return Err(format!("invalid Closure constant at {offset}"));
                 };
@@ -154,7 +167,7 @@ impl Chunk {
                 let descriptors = unsafe { (*function).upvalue_count }
                     .checked_mul(2)
                     .ok_or_else(|| format!("Closure width overflow at {offset}"))?;
-                2usize
+                base_width
                     .checked_add(descriptors)
                     .ok_or_else(|| format!("Closure width overflow at {offset}"))?
             } else if matches!(

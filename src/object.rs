@@ -11,7 +11,7 @@ use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
 use crate::vm::collect_garbage;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjType {
     Closure,
@@ -104,12 +104,12 @@ impl fmt::Display for Obj {
     }
 }
 
-const FORMAT_DEPTH_LIMIT: usize = 64;
-const FORMAT_ELEMENT_LIMIT: usize = 100;
-const FORMAT_NODE_LIMIT: usize = 1_024;
-const FORMAT_TOTAL_ELEMENT_LIMIT: usize = 1_024;
-const FORMAT_BYTE_LIMIT: usize = 8 * 1_024;
-const TRUNCATION_MARKER: &str = "<truncated>";
+pub(crate) const FORMAT_DEPTH_LIMIT: usize = 64;
+pub(crate) const FORMAT_ELEMENT_LIMIT: usize = 100;
+pub(crate) const FORMAT_NODE_LIMIT: usize = 1_024;
+pub(crate) const FORMAT_TOTAL_ELEMENT_LIMIT: usize = 1_024;
+pub(crate) const FORMAT_BYTE_LIMIT: usize = 8 * 1_024;
+pub(crate) const TRUNCATION_MARKER: &str = "<truncated>";
 
 struct FormatState {
     output: String,
@@ -260,6 +260,7 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
         let obj_ptr = ptr as *mut Obj;
 
         (*obj_ptr).next = vm.objects;
+        vm.register_object(obj_ptr, (*obj_ptr).obj_type, None);
         vm.objects = obj_ptr;
     }
 
@@ -292,6 +293,7 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
     });
 
     let ptr = Box::into_raw(closure);
+    vm.register_object(ptr as *mut Obj, ObjType::Closure, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
@@ -322,6 +324,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     };
 
     let ptr = Box::into_raw(Box::new(function));
+    vm.register_object(ptr as *mut Obj, ObjType::Function, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
@@ -348,6 +351,7 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
     };
 
     let ptr = Box::into_raw(Box::new(native));
+    vm.register_object(ptr as *mut Obj, ObjType::Native, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
@@ -385,6 +389,7 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         };
         (*ptr).length = len;
         (*ptr).hash = hash;
+        vm.register_object(ptr as *mut Obj, ObjType::String, Some(len));
         vm.objects = ptr as *mut Obj;
 
         let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
@@ -417,6 +422,7 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
     };
 
     let ptr = Box::into_raw(Box::new(upvalue));
+    vm.register_object(ptr as *mut Obj, ObjType::Upvalue, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
@@ -481,6 +487,7 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     };
 
     let ptr = Box::into_raw(Box::new(list));
+    vm.register_object(ptr as *mut Obj, ObjType::List, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
@@ -529,12 +536,12 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
     result
 }
 
-pub fn free_object(object: *mut Obj) {
+pub fn free_object(object: *mut Obj, kind: ObjType, string_len: Option<usize>) {
     #[cfg(feature = "debug_log_gc")]
-    eprintln!("{:p} free type {:?}", object, Obj::obj_type(object));
+    eprintln!("{:p} free type {:?}", object, kind);
 
     unsafe {
-        match (*object).obj_type {
+        match kind {
             ObjType::Closure => {
                 let _ = Box::from_raw(object as *mut ObjClosure);
             }
@@ -545,9 +552,7 @@ pub fn free_object(object: *mut Obj) {
                 let _ = Box::from_raw(object as *mut ObjNative);
             }
             ObjType::String => {
-                let string_ptr = object as *mut ObjString;
-                let len = (*string_ptr).length;
-
+                let len = string_len.expect("string allocations retain their registered size");
                 let layout = Layout::from_size_align(
                     std::mem::size_of::<ObjString>() + len,
                     std::mem::align_of::<ObjString>(),

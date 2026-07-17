@@ -395,6 +395,24 @@ fn explicit_pause_has_priority_over_a_completed_step() {
 }
 
 #[test]
+fn pre_start_pause_consumes_the_one_shot_initial_debug_stop() {
+    let mut session = session("print 1; print 2;");
+    session.control().request_pause();
+
+    assert!(matches!(
+        session.start_debugging(),
+        RunOutcome::Paused(PauseReason::Explicit)
+    ));
+    assert!(session.host().output().is_empty());
+
+    assert!(matches!(
+        session.resume(ResumeMode::Continue),
+        RunOutcome::Completed
+    ));
+    assert_eq!(session.host().output(), ["1", "2"]);
+}
+
+#[test]
 fn cancellation_is_sticky_and_wins_over_pause() {
     let mut session = session("print 1;");
     assert!(matches!(session.start_debugging(), RunOutcome::Paused(_)));

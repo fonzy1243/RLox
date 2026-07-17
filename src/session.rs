@@ -254,10 +254,10 @@ impl<H: RuntimeHost> InterpreterSession<H> {
                         }
                     };
 
+                    let initial_debug_pause = std::mem::take(&mut self.initial_debug_pause);
                     let reason = if self.control.acknowledge_pause() {
                         Some(PauseReason::Explicit)
-                    } else if self.initial_debug_pause {
-                        self.initial_debug_pause = false;
+                    } else if initial_debug_pause {
                         Some(PauseReason::DebugPoint)
                     } else if self.step_is_complete(activation_id) {
                         Some(PauseReason::Step)
