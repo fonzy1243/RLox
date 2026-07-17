@@ -7,6 +7,7 @@ mod object;
 mod runtime_host;
 mod scanner;
 mod session;
+mod snapshot;
 mod source;
 mod table;
 mod value;
@@ -21,6 +22,11 @@ pub use runtime_host::{RecordingHost, RuntimeHost};
 pub use session::{
     ActivationId, ExecutionControl, ExecutionState, InterpreterSession, PauseLocation, PauseReason,
     ResumeMode, RunOutcome, SessionError, SessionOperation,
+};
+pub use snapshot::{
+    BindingSnapshot, DebugValue, FrameSnapshot, MIN_ESTIMATED_JSON_BYTES, SnapshotBuildError,
+    SnapshotLimitError, SnapshotLimitField, SnapshotLimits, SnapshotReason, SnapshotSizeError,
+    ValueKind, VmSnapshot,
 };
 pub use source::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};
 pub use vm::InterpretResult;

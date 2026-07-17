@@ -1205,7 +1205,10 @@ fn end_compiler(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) -> (*mut ObjFunction, Vec<Upvalue>) {
-    let live_end = chunk.code.len();
+    // Function-entry debug points share offset zero with an empty body's
+    // synthetic epilogue. Keep that entry inside the otherwise half-open
+    // lifetime without extending ordinary bindings through the epilogue.
+    let live_end = chunk.code.len().max(1);
     for local in parser.compiler.locals[1..parser.compiler.local_count].iter() {
         if let Some(metadata_index) = local.metadata_index {
             unsafe {
@@ -2435,6 +2438,23 @@ mod tests {
             function_ref(function).chunk.code[parameter.live_end],
             OpCode::Nil as u8
         );
+    }
+
+    #[test]
+    fn empty_function_parameters_include_the_entry_offset_only() {
+        let (_vm, script) = compile_success("fun empty(parameter) {}\n");
+        let function = direct_function(script, "empty");
+        let parameter = function_ref(function)
+            .debug_info
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "parameter")
+            .unwrap();
+
+        assert_eq!(parameter.live_start, 0);
+        assert_eq!(parameter.live_end, 1);
+        assert_eq!(function_ref(function).chunk.code[0], OpCode::Nil as u8);
+        assert_eq!(function_ref(function).chunk.code[1], OpCode::Return as u8);
     }
 
     #[test]

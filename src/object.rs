@@ -45,6 +45,7 @@ pub type NativeFn = fn(arg_count: usize, args: &[Value]) -> Value;
 pub struct ObjNative {
     pub obj: Obj,
     pub function: NativeFn,
+    pub name: Box<str>,
 }
 
 #[repr(C)]
@@ -340,7 +341,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     ptr
 }
 
-pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
+pub fn allocate_native(vm: &mut VM, name: &str, function: NativeFn) -> *mut ObjNative {
     let native = ObjNative {
         obj: Obj {
             obj_type: ObjType::Native,
@@ -348,6 +349,7 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
             next: vm.objects,
         },
         function,
+        name: name.into(),
     };
 
     let ptr = Box::into_raw(Box::new(native));

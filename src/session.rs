@@ -5,7 +5,8 @@ use std::sync::{
 
 use crate::{
     DebugPoint, DebugPointKind, Diagnostic, DiagnosticPhase, DiagnosticSeverity, RevisionId,
-    RuntimeHost, SourceDocument, SourceId, SourceSpan, vm,
+    RuntimeHost, SnapshotLimitError, SnapshotLimits, SnapshotReason, SourceDocument, SourceId,
+    SourceSpan, VmSnapshot, snapshot, vm,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +122,23 @@ pub struct InterpreterSession<H: RuntimeHost> {
     opcode_epoch: u64,
     step_plan: Option<StepPlan>,
     initial_debug_pause: bool,
+    snapshot_limits: SnapshotLimits,
+    latest_snapshot: Option<VmSnapshot>,
 }
 
 impl<H: RuntimeHost> InterpreterSession<H> {
     pub fn new(document: SourceDocument, host: H) -> Self {
-        Self {
+        Self::with_snapshot_limits(document, host, SnapshotLimits::default())
+            .expect("default snapshot limits are valid")
+    }
+
+    pub fn with_snapshot_limits(
+        document: SourceDocument,
+        host: H,
+        snapshot_limits: SnapshotLimits,
+    ) -> Result<Self, SnapshotLimitError> {
+        snapshot_limits.validate()?;
+        Ok(Self {
             document,
             host,
             vm: vm::VM::new(),
@@ -137,7 +150,9 @@ impl<H: RuntimeHost> InterpreterSession<H> {
             opcode_epoch: 0,
             step_plan: None,
             initial_debug_pause: false,
-        }
+            snapshot_limits,
+            latest_snapshot: None,
+        })
     }
 
     pub fn host(&self) -> &H {
@@ -158,6 +173,10 @@ impl<H: RuntimeHost> InterpreterSession<H> {
 
     pub fn pause_location(&self) -> Option<&PauseLocation> {
         self.pause_location.as_ref()
+    }
+
+    pub fn snapshot(&self) -> Option<&VmSnapshot> {
+        self.latest_snapshot.as_ref()
     }
 
     pub fn start_debugging(&mut self) -> RunOutcome {
@@ -201,27 +220,39 @@ impl<H: RuntimeHost> InterpreterSession<H> {
         }
         self.state = ExecutionState::Running;
 
-        let mut forwarding = ForwardingHost {
-            inner: &mut self.host,
-            first_diagnostic: None,
-        };
-        match self.vm.prepare(&self.document, &mut forwarding) {
+        let mut compilation = CompilationHost::default();
+        match self.vm.prepare(&self.document, &mut compilation) {
             Ok(()) => {}
             Err(vm::StartError::Compile) => {
-                let had_diagnostic = forwarding.first_diagnostic.is_some();
-                let diagnostic = forwarding
-                    .first_diagnostic
-                    .take()
-                    .unwrap_or_else(|| Diagnostic {
-                        phase: DiagnosticPhase::Compiler,
-                        severity: DiagnosticSeverity::Error,
-                        code: "compiler.error".to_string(),
-                        message: "Compilation failed without a diagnostic.".to_string(),
-                        span: self.document.eof_span(),
-                        frames: Vec::new(),
-                    });
-                if !had_diagnostic {
-                    forwarding.inner.diagnostic(diagnostic.clone());
+                let diagnostic =
+                    compilation
+                        .diagnostics
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| Diagnostic {
+                            phase: DiagnosticPhase::Compiler,
+                            severity: DiagnosticSeverity::Error,
+                            code: "compiler.error".to_string(),
+                            message: "Compilation failed without a diagnostic.".to_string(),
+                            span: self.document.eof_span(),
+                            frames: Vec::new(),
+                        });
+                let request = snapshot::SnapshotRequest {
+                    reason: SnapshotReason::Faulted,
+                    active_offset: None,
+                    current_span: diagnostic.span,
+                };
+                let snapshot = match self.vm.build_snapshot(request, &self.snapshot_limits) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return self.finish_snapshot_failure(diagnostic.span),
+                };
+                self.latest_snapshot = Some(snapshot);
+                if compilation.diagnostics.is_empty() {
+                    self.host.diagnostic(diagnostic.clone());
+                } else {
+                    for value in compilation.diagnostics {
+                        self.host.diagnostic(value);
+                    }
                 }
                 self.vm.cleanup_execution();
                 self.state = ExecutionState::Faulted;
@@ -240,7 +271,11 @@ impl<H: RuntimeHost> InterpreterSession<H> {
                 return self.finish_cancelled();
             }
 
-            if let Some((activation_id, point)) = self.vm.current_semantic_point() {
+            let semantic_point = match self.vm.current_semantic_point() {
+                Ok(point) => point,
+                Err(_) => return self.finish_snapshot_failure(self.document.eof_span()),
+            };
+            if let Some((activation_id, point)) = semantic_point {
                 let arrival = (activation_id, point.id, point.offset, self.opcode_epoch);
                 if self.last_arrival != Some(arrival) {
                     self.last_arrival = Some(arrival);
@@ -291,6 +326,7 @@ impl<H: RuntimeHost> InterpreterSession<H> {
                     self.state = ExecutionState::Completed;
                     self.pause_location = None;
                     self.step_plan = None;
+                    self.latest_snapshot = None;
                     return RunOutcome::Completed;
                 }
                 Err(fault) => return self.finish_fault(fault),
@@ -329,6 +365,16 @@ impl<H: RuntimeHost> InterpreterSession<H> {
         activation_id: ActivationId,
         point: DebugPoint,
     ) -> RunOutcome {
+        let request = snapshot::SnapshotRequest {
+            reason: SnapshotReason::Paused(reason),
+            active_offset: Some(point.offset),
+            current_span: point.span,
+        };
+        let snapshot = match self.vm.build_snapshot(request, &self.snapshot_limits) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return self.finish_snapshot_failure(point.span),
+        };
+        self.latest_snapshot = Some(snapshot);
         self.state = ExecutionState::Paused;
         self.step_plan = None;
         self.pause_location = Some(PauseLocation {
@@ -343,9 +389,24 @@ impl<H: RuntimeHost> InterpreterSession<H> {
     }
 
     fn finish_fault(&mut self, fault: vm::VmFault) -> RunOutcome {
-        let diagnostic = self
+        let fault_offset = fault.offset;
+        let diagnostic = match self
             .vm
-            .diagnostic_for_fault(fault, self.document.eof_span());
+            .try_diagnostic_for_fault(fault, self.document.eof_span())
+        {
+            Ok(diagnostic) => diagnostic,
+            Err(_) => return self.finish_snapshot_failure(self.document.eof_span()),
+        };
+        let request = snapshot::SnapshotRequest {
+            reason: SnapshotReason::Faulted,
+            active_offset: Some(fault_offset),
+            current_span: diagnostic.span,
+        };
+        let snapshot = match self.vm.build_snapshot(request, &self.snapshot_limits) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return self.finish_snapshot_failure(diagnostic.span),
+        };
+        self.latest_snapshot = Some(snapshot);
         self.host.diagnostic(diagnostic.clone());
         self.vm.cleanup_execution();
         self.pause_location = None;
@@ -355,11 +416,46 @@ impl<H: RuntimeHost> InterpreterSession<H> {
     }
 
     fn finish_cancelled(&mut self) -> RunOutcome {
+        let (offset, span) = match self.vm.current_snapshot_point(self.document.eof_span()) {
+            Ok(point) => point,
+            Err(_) => return self.finish_snapshot_failure(self.document.eof_span()),
+        };
+        let request = snapshot::SnapshotRequest {
+            reason: SnapshotReason::Cancelled,
+            active_offset: Some(offset),
+            current_span: span,
+        };
+        let snapshot = match self.vm.build_snapshot(request, &self.snapshot_limits) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return self.finish_snapshot_failure(span),
+        };
+        self.latest_snapshot = Some(snapshot);
         self.vm.cleanup_execution();
         self.pause_location = None;
         self.step_plan = None;
         self.state = ExecutionState::Cancelled;
         RunOutcome::Cancelled
+    }
+
+    fn finish_snapshot_failure(&mut self, span: SourceSpan) -> RunOutcome {
+        let diagnostic = Diagnostic {
+            phase: DiagnosticPhase::Runtime,
+            severity: DiagnosticSeverity::Error,
+            code: "runtime.snapshot_unavailable".to_string(),
+            message: "Debugger state is unavailable.".to_string(),
+            span,
+            frames: Vec::new(),
+        };
+        self.latest_snapshot = Some(snapshot::unavailable_snapshot(
+            SnapshotReason::Faulted,
+            span,
+        ));
+        self.host.diagnostic(diagnostic.clone());
+        self.vm.cleanup_execution();
+        self.pause_location = None;
+        self.step_plan = None;
+        self.state = ExecutionState::Faulted;
+        RunOutcome::Faulted(diagnostic)
     }
 
     fn rejected(&self, operation: SessionOperation) -> RunOutcome {
@@ -378,21 +474,16 @@ impl<H: RuntimeHost> Drop for InterpreterSession<H> {
     }
 }
 
-struct ForwardingHost<'a, H> {
-    inner: &'a mut H,
-    first_diagnostic: Option<Diagnostic>,
+#[derive(Default)]
+struct CompilationHost {
+    diagnostics: Vec<Diagnostic>,
 }
 
-impl<H: RuntimeHost> RuntimeHost for ForwardingHost<'_, H> {
-    fn output(&mut self, text: String) {
-        self.inner.output(text);
-    }
+impl RuntimeHost for CompilationHost {
+    fn output(&mut self, _text: String) {}
 
     fn diagnostic(&mut self, value: Diagnostic) {
-        if self.first_diagnostic.is_none() {
-            self.first_diagnostic = Some(value.clone());
-        }
-        self.inner.diagnostic(value);
+        self.diagnostics.push(value);
     }
 }
 
@@ -409,4 +500,45 @@ fn select_point(points: &[DebugPoint], offset: usize) -> Option<DebugPoint> {
 
 pub(crate) fn semantic_point(points: &[DebugPoint], offset: usize) -> Option<DebugPoint> {
     select_point(points, offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RecordingHost, SourceId};
+
+    #[test]
+    fn corrupt_pause_discovery_becomes_one_bounded_snapshot_fault() {
+        let document = SourceDocument::new(SourceId(91), RevisionId(2), "corrupt.lox", "print 1;");
+        let mut session = InterpreterSession::new(document, RecordingHost::default());
+        let mut compilation = CompilationHost::default();
+        assert!(
+            session
+                .vm
+                .prepare(&session.document, &mut compilation)
+                .is_ok()
+        );
+        session.state = ExecutionState::Running;
+        let closure = session.vm.frames[0].closure;
+        let function = unsafe { (*closure).function };
+        unsafe { (*function).chunk.spans.pop() };
+
+        let outcome = session.drive();
+
+        let RunOutcome::Faulted(diagnostic) = outcome else {
+            panic!("corrupt discovery did not become a fault")
+        };
+        assert_eq!(diagnostic.code, "runtime.snapshot_unavailable");
+        assert_eq!(session.host.diagnostics().len(), 1);
+        assert_eq!(session.host.diagnostics()[0], diagnostic);
+        assert_eq!(session.state, ExecutionState::Faulted);
+        assert_eq!(session.vm.frame_count, 0);
+        assert_eq!(session.vm.stack_top, session.vm.stack.as_mut_ptr());
+        let snapshot = session.snapshot().unwrap();
+        assert_eq!(snapshot.reason, SnapshotReason::Faulted);
+        assert!(snapshot.frames.is_empty());
+        assert!(snapshot.frames_truncated);
+        assert!(snapshot.globals.is_empty());
+        assert!(snapshot.globals_truncated);
+    }
 }

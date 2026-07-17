@@ -258,9 +258,13 @@ impl VM {
         call_site: Option<(usize, SourceSpan)>,
     ) -> Result<(), VmFault> {
         let fault_offset = self.current_offset().unwrap_or(0);
-        self.require_object_kind(closure as *mut Obj, ObjType::Closure, fault_offset)?;
+        let closure =
+            self.require_object_kind(closure as *mut Obj, ObjType::Closure, fault_offset)?
+                as *mut ObjClosure;
         let function = unsafe { (*closure).function };
-        self.require_object_kind(function as *mut Obj, ObjType::Function, fault_offset)?;
+        let function =
+            self.require_object_kind(function as *mut Obj, ObjType::Function, fault_offset)?
+                as *mut ObjFunction;
         let arity = unsafe { (*function).arity };
         if arg_count != arity {
             return Err(VmFault::new(
@@ -302,12 +306,36 @@ impl VM {
         fault: VmFault,
         fallback_span: SourceSpan,
     ) -> Diagnostic {
+        let fallback_message = fault.message.clone();
+        self.try_diagnostic_for_fault(fault, fallback_span)
+            .unwrap_or(Diagnostic {
+                phase: DiagnosticPhase::Runtime,
+                severity: DiagnosticSeverity::Error,
+                code: "runtime.error".to_string(),
+                message: fallback_message,
+                span: fallback_span,
+                frames: Vec::new(),
+            })
+    }
+
+    pub(crate) fn try_diagnostic_for_fault(
+        &self,
+        fault: VmFault,
+        fallback_span: SourceSpan,
+    ) -> Result<Diagnostic, VmFault> {
+        if self.frame_count > self.frames.len() {
+            return Err(VmFault::new("Invalid frame state.", fault.offset));
+        }
         let mut frames = Vec::with_capacity(self.frame_count);
         let mut primary_span = fallback_span;
 
         for i in (0..self.frame_count).rev() {
-            let frame = &self.frames[i];
-            let chunk = unsafe { &(*(*frame.closure).function).chunk };
+            let function_ptr = self.frame_function(i, fault.offset)?;
+            let function_ref = unsafe { &*function_ptr };
+            let chunk = &function_ref.chunk;
+            if chunk.code.len() != chunk.spans.len() {
+                return Err(VmFault::new("Invalid span table.", fault.offset));
+            }
             let span = if i == self.frame_count - 1 {
                 chunk
                     .spans
@@ -326,22 +354,23 @@ impl VM {
             if i == self.frame_count - 1 {
                 primary_span = span;
             }
-            let function = if unsafe { (*(*frame.closure).function).name.is_null() } {
+            let function = if function_ref.name.is_null() {
                 "<script>".to_string()
             } else {
-                unsafe { ObjString::as_str((*(*frame.closure).function).name) }.to_string()
+                self.string_text(function_ref.name, fault.offset)?
+                    .to_string()
             };
             frames.push(RuntimeFrame { function, span });
         }
 
-        Diagnostic {
+        Ok(Diagnostic {
             phase: DiagnosticPhase::Runtime,
             severity: DiagnosticSeverity::Error,
             code: "runtime.error".to_string(),
             message: fault.message,
             span: primary_span,
             frames,
-        }
+        })
     }
 
     pub(crate) fn cleanup_execution(&mut self) {
@@ -352,7 +381,30 @@ impl VM {
     }
 
     pub(crate) fn current_offset(&self) -> Option<usize> {
-        (self.frame_count > 0).then(|| self.frames[self.frame_count - 1].ip)
+        (self.frame_count > 0 && self.frame_count <= self.frames.len())
+            .then(|| self.frames[self.frame_count - 1].ip)
+    }
+
+    pub(crate) fn current_snapshot_point(
+        &self,
+        fallback: SourceSpan,
+    ) -> Result<(usize, SourceSpan), VmFault> {
+        if self.frame_count == 0 || self.frame_count > self.frames.len() {
+            return Err(VmFault::new("No active frame.", 0));
+        }
+        let frame_index = self.frame_count - 1;
+        let offset = self.frames[frame_index].ip;
+        let function = self.frame_function(frame_index, offset)?;
+        let chunk = unsafe { &(*function).chunk };
+        if chunk.code.is_empty()
+            || chunk.code.len() != chunk.spans.len()
+            || offset >= chunk.code.len()
+            || !is_opcode_start(self, function, offset)
+        {
+            return Err(VmFault::new("Invalid snapshot point.", offset));
+        }
+        let span = chunk.spans.get(offset).copied().unwrap_or(fallback);
+        Ok((offset, span))
     }
 
     pub(crate) fn activation_chain(&self) -> Vec<crate::session::ActivationId> {
@@ -370,14 +422,26 @@ impl VM {
 
     pub(crate) fn current_semantic_point(
         &self,
-    ) -> Option<(crate::session::ActivationId, crate::DebugPoint)> {
+    ) -> Result<Option<(crate::session::ActivationId, crate::DebugPoint)>, VmFault> {
         if self.frame_count == 0 {
-            return None;
+            return Ok(None);
+        }
+        if self.frame_count > self.frames.len() {
+            return Err(VmFault::new("Invalid frame state.", 0));
         }
         let frame = self.frames[self.frame_count - 1];
-        let info = unsafe { &(*(*frame.closure).function).debug_info };
-        crate::session::semantic_point(&info.points, frame.ip)
-            .map(|point| (frame.activation_id, point))
+        let function = self.frame_function(self.frame_count - 1, frame.ip)?;
+        let function = unsafe { &*function };
+        if function.chunk.code.is_empty()
+            || function.chunk.code.len() != function.chunk.spans.len()
+            || frame.ip >= function.chunk.code.len()
+        {
+            return Err(VmFault::new("Invalid semantic point.", frame.ip));
+        }
+        Ok(
+            crate::session::semantic_point(&function.debug_info.points, frame.ip)
+                .map(|point| (frame.activation_id, point)),
+        )
     }
 
     pub(crate) fn register_object(
@@ -396,9 +460,18 @@ impl VM {
         self.object_registry.get(&object).copied()
     }
 
+    pub(crate) fn registered_object(
+        &self,
+        object: *mut Obj,
+    ) -> Option<(*mut Obj, ObjectAllocation)> {
+        self.object_registry
+            .get_key_value(&object)
+            .map(|(canonical, allocation)| (*canonical, *allocation))
+    }
+
     fn define_native(&mut self, name: &str, function: NativeFn) -> bool {
         let name_obj = copy_string(self, name);
-        let native_obj = allocate_native(self, function);
+        let native_obj = allocate_native(self, name, function);
 
         if !self.push(Value::Obj(name_obj as *mut Obj)) {
             return false;
@@ -547,9 +620,17 @@ impl VM {
         if self.frame_count == 0 {
             return Ok(DispatchResult::Complete);
         }
+        if self.frame_count > self.frames.len() {
+            return Err(VmFault::new("Invalid frame state.", 0));
+        }
 
         let frame_index = self.frame_count - 1;
         let current_offset = self.frames[frame_index].ip;
+        let frame_closure = self.require_object_kind(
+            self.frames[frame_index].closure as *mut Obj,
+            ObjType::Closure,
+            current_offset,
+        )? as *mut ObjClosure;
         let function = self.frame_function(frame_index, current_offset)?;
         let width = instruction_width_at(self, function, current_offset)
             .map_err(|message| VmFault::new(message, current_offset))?;
@@ -674,8 +755,7 @@ impl VM {
             }
             x if x == OpCode::GetUpvalue as u8 || x == OpCode::SetUpvalue as u8 => {
                 let slot = self.code_byte(function, current_offset + 1, current_offset)? as usize;
-                let closure = self.frames[frame_index].closure;
-                let upvalue = unsafe { (&(*closure).upvalues).get(slot).copied() }
+                let upvalue = unsafe { (&(*frame_closure).upvalues).get(slot).copied() }
                     .filter(|upvalue| !upvalue.is_null())
                     .ok_or_else(|| VmFault::new("Invalid upvalue.", current_offset))?;
                 let location = self.upvalue_location(upvalue, current_offset)?;
@@ -909,9 +989,8 @@ impl VM {
                     if is_local == 1 {
                         self.local_index(frame_index, capture, current_offset)?;
                     } else {
-                        let parent = self.frames[frame_index].closure;
                         let valid = unsafe {
-                            (&(*parent).upvalues)
+                            (&(*frame_closure).upvalues)
                                 .get(capture)
                                 .copied()
                                 .is_some_and(|upvalue| {
@@ -936,7 +1015,7 @@ impl VM {
                         let location = unsafe { self.stack.as_mut_ptr().add(stack_index) };
                         self.capture_upvalue_checked(location, current_offset)?
                     } else {
-                        unsafe { (*self.frames[frame_index].closure).upvalues[capture] }
+                        unsafe { (*frame_closure).upvalues[capture] }
                     };
                     unsafe {
                         (*closure).upvalues[index] = upvalue;
@@ -984,10 +1063,24 @@ impl VM {
         let stack_start = self.stack.as_ptr() as usize;
         let stack_top = self.stack_top as usize;
         let value_size = std::mem::size_of::<Value>();
+        let stack_bytes = self
+            .stack
+            .len()
+            .checked_mul(value_size)
+            .ok_or_else(|| VmFault::new("Invalid stack allocation.", offset))?;
+        let stack_end = stack_start
+            .checked_add(stack_bytes)
+            .ok_or_else(|| VmFault::new("Invalid stack allocation.", offset))?;
+        if stack_top < stack_start
+            || stack_top > stack_end
+            || (stack_top - stack_start) % value_size != 0
+        {
+            return Err(VmFault::new("Invalid stack top.", offset));
+        }
         let distance = address
             .checked_sub(stack_start)
             .ok_or_else(|| VmFault::new("Invalid upvalue location.", offset))?;
-        if address > stack_top || distance % value_size != 0 {
+        if address > stack_top || address > stack_end || distance % value_size != 0 {
             return Err(VmFault::new("Invalid upvalue location.", offset));
         }
         Ok(distance / value_size)
@@ -1011,7 +1104,8 @@ impl VM {
         let mut upvalues = Vec::new();
 
         while !current.is_null() {
-            self.require_object_kind(current as *mut Obj, ObjType::Upvalue, offset)?;
+            current = self.require_object_kind(current as *mut Obj, ObjType::Upvalue, offset)?
+                as *mut ObjUpvalue;
             if !visited.insert(current) {
                 return Err(VmFault::new("Invalid open upvalue chain.", offset));
             }
@@ -1073,9 +1167,9 @@ impl VM {
             .get(close_count)
             .map_or(std::ptr::null_mut(), |(upvalue, _)| *upvalue);
 
-        for (upvalue, _) in upvalues.into_iter().take(close_count) {
+        for (upvalue, slot) in upvalues.into_iter().take(close_count) {
             unsafe {
-                (*upvalue).closed = *(*upvalue).location;
+                (*upvalue).closed = self.stack[slot];
                 (*upvalue).location = std::ptr::addr_of_mut!((*upvalue).closed);
                 (*upvalue).next = std::ptr::null_mut();
             }
@@ -1098,8 +1192,8 @@ impl VM {
             let closed = unsafe { std::ptr::addr_of_mut!((*upvalue).closed) };
             let location = unsafe { (*upvalue).location };
             if location != closed {
-                if self.stack_slot_index(location, 0).is_ok() {
-                    unsafe { (*upvalue).closed = *location };
+                if let Ok(slot) = self.stack_slot_index(location, 0) {
+                    unsafe { (*upvalue).closed = self.stack[slot] };
                 }
                 unsafe { (*upvalue).location = closed };
             }
@@ -1107,15 +1201,27 @@ impl VM {
         }
     }
 
-    fn object_kind(&self, object: *mut Obj, offset: usize) -> Result<ObjType, VmFault> {
-        let allocation = self
-            .object_allocation(object)
+    fn checked_object(
+        &self,
+        object: *mut Obj,
+        offset: usize,
+    ) -> Result<(*mut Obj, ObjectAllocation), VmFault> {
+        let (canonical, allocation) = self
+            .registered_object(object)
             .ok_or_else(|| VmFault::new("Invalid object reference.", offset))?;
-        let stored_tag = unsafe { std::ptr::addr_of!((*object).obj_type).cast::<u8>().read() };
+        let stored_tag = unsafe {
+            std::ptr::addr_of!((*canonical).obj_type)
+                .cast::<u8>()
+                .read()
+        };
         if stored_tag != allocation.kind as u8 {
             return Err(VmFault::new("Invalid object header.", offset));
         }
-        Ok(allocation.kind)
+        Ok((canonical, allocation))
+    }
+
+    fn object_kind(&self, object: *mut Obj, offset: usize) -> Result<ObjType, VmFault> {
+        Ok(self.checked_object(object, offset)?.1.kind)
     }
 
     fn value_object(
@@ -1124,7 +1230,10 @@ impl VM {
         offset: usize,
     ) -> Result<Option<(*mut Obj, ObjType)>, VmFault> {
         match value {
-            Value::Obj(object) => Ok(Some((object, self.object_kind(object, offset)?))),
+            Value::Obj(object) => {
+                let (canonical, allocation) = self.checked_object(object, offset)?;
+                Ok(Some((canonical, allocation.kind)))
+            }
             _ => Ok(None),
         }
     }
@@ -1134,9 +1243,10 @@ impl VM {
         object: *mut Obj,
         expected: ObjType,
         offset: usize,
-    ) -> Result<(), VmFault> {
-        if self.object_kind(object, offset)? == expected {
-            Ok(())
+    ) -> Result<*mut Obj, VmFault> {
+        let (canonical, allocation) = self.checked_object(object, offset)?;
+        if allocation.kind == expected {
+            Ok(canonical)
         } else {
             Err(VmFault::new("Invalid object type.", offset))
         }
@@ -1144,10 +1254,9 @@ impl VM {
 
     fn string_text(&self, string: *mut ObjString, offset: usize) -> Result<&str, VmFault> {
         let object = string as *mut Obj;
-        self.require_object_kind(object, ObjType::String, offset)?;
-        let allocation = self
-            .object_allocation(object)
-            .ok_or_else(|| VmFault::new("Invalid string object.", offset))?;
+        let canonical = self.require_object_kind(object, ObjType::String, offset)?;
+        let string = canonical as *mut ObjString;
+        let allocation = self.registered_object(canonical).unwrap().1;
         let length = allocation
             .string_len
             .ok_or_else(|| VmFault::new("Invalid string allocation.", offset))?;
@@ -1166,11 +1275,18 @@ impl VM {
         frame_index: usize,
         offset: usize,
     ) -> Result<*mut ObjFunction, VmFault> {
-        let closure = self.frames[frame_index].closure;
-        self.require_object_kind(closure as *mut Obj, ObjType::Closure, offset)?;
+        let frame = self
+            .frames
+            .get(frame_index)
+            .ok_or_else(|| VmFault::new("Invalid frame state.", offset))?;
+        let closure =
+            self.require_object_kind(frame.closure as *mut Obj, ObjType::Closure, offset)?
+                as *mut ObjClosure;
         let function = unsafe { (*closure).function };
-        self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?;
-        Ok(function)
+        Ok(
+            self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?
+                as *mut ObjFunction,
+        )
     }
 
     fn upvalue_location(
@@ -1178,7 +1294,8 @@ impl VM {
         upvalue: *mut ObjUpvalue,
         offset: usize,
     ) -> Result<*mut Value, VmFault> {
-        self.require_object_kind(upvalue as *mut Obj, ObjType::Upvalue, offset)?;
+        let upvalue = self.require_object_kind(upvalue as *mut Obj, ObjType::Upvalue, offset)?
+            as *mut ObjUpvalue;
         let location = unsafe { (*upvalue).location };
         if location.is_null() {
             return Err(VmFault::new("Invalid upvalue location.", offset));
@@ -1226,7 +1343,8 @@ impl VM {
             Value::Nil => state.write_str("nil"),
             Value::Number(value) => state.write_str(&value.to_string()),
             Value::Obj(object) => {
-                let kind = self.object_kind(object, offset)?;
+                let (object, allocation) = self.checked_object(object, offset)?;
+                let kind = allocation.kind;
                 match kind {
                     ObjType::Closure => {
                         let closure = unsafe { &*(object as *mut ObjClosure) };
@@ -1280,7 +1398,8 @@ impl VM {
         state: &mut CheckedFormatState,
         offset: usize,
     ) -> Result<(), VmFault> {
-        self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?;
+        let function = self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?
+            as *mut ObjFunction;
         let name = unsafe { (*function).name };
         if name.is_null() {
             state.write_str("<script>");
@@ -1448,8 +1567,9 @@ fn instruction_width_at(
     function: *mut ObjFunction,
     offset: usize,
 ) -> Result<usize, String> {
-    vm.require_object_kind(function as *mut Obj, ObjType::Function, offset)
-        .map_err(|fault| fault.message)?;
+    let function = vm
+        .require_object_kind(function as *mut Obj, ObjType::Function, offset)
+        .map_err(|fault| fault.message)? as *mut ObjFunction;
     let chunk = unsafe { &(*function).chunk };
     let opcode = *chunk
         .code
@@ -1598,7 +1718,7 @@ fn instruction_width_at(
     Ok(width)
 }
 
-fn is_opcode_start(vm: &VM, function: *mut ObjFunction, target: usize) -> bool {
+pub(crate) fn is_opcode_start(vm: &VM, function: *mut ObjFunction, target: usize) -> bool {
     let code_len = unsafe { (*function).chunk.code.len() };
     if target >= code_len {
         return false;
@@ -1996,5 +2116,86 @@ mod tests {
 
         assert_eq!(fault.message, "Stack underflow.");
         assert_eq!(fault.offset, 0);
+    }
+
+    #[test]
+    fn snapshot_point_rejects_corrupt_frame_chunk_and_offset_state() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        let function = active_function(&vm);
+        let fallback = unsafe { (*function).debug_info.declaration };
+
+        let frame_count = vm.frame_count;
+        vm.frame_count = vm.frames.len() + 1;
+        assert!(vm.current_snapshot_point(fallback).is_err());
+        vm.frame_count = frame_count;
+
+        let span = unsafe { (*function).chunk.spans.pop().unwrap() };
+        assert!(vm.current_snapshot_point(fallback).is_err());
+        unsafe { (*function).chunk.spans.push(span) };
+
+        let offset = vm.frames[0].ip;
+        vm.frames[0].ip = unsafe { (*function).chunk.code.len() };
+        assert!(vm.current_snapshot_point(fallback).is_err());
+        vm.frames[0].ip = 1;
+        assert!(vm.current_snapshot_point(fallback).is_err());
+        vm.frames[0].ip = offset;
+        vm.cleanup_execution();
+    }
+
+    #[test]
+    fn semantic_point_validates_frame_objects_before_metadata_access() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        assert!(vm.current_semantic_point().unwrap().is_some());
+
+        let frame_count = vm.frame_count;
+        vm.frame_count = vm.frames.len() + 1;
+        assert!(vm.current_semantic_point().is_err());
+        vm.frame_count = frame_count;
+
+        let closure = vm.frames[0].closure;
+        vm.frames[0].closure = std::ptr::null_mut();
+        assert!(vm.current_semantic_point().is_err());
+        vm.frames[0].closure = closure;
+
+        let function = unsafe { (*closure).function };
+        unsafe { (*closure).function = std::ptr::null_mut() };
+        assert!(vm.current_semantic_point().is_err());
+        unsafe { (*closure).function = function };
+        vm.cleanup_execution();
+    }
+
+    #[test]
+    fn cleanup_refuses_stack_reads_when_stack_top_is_corrupt() {
+        let mut vm = VM::new();
+        assert!(vm.push(Value::Number(7.0)));
+        let stack_start = vm.stack.as_mut_ptr();
+        let upvalue = allocate_upvalue(&mut vm, stack_start);
+        vm.open_upvalues = upvalue;
+        let invalid_top = (stack_start as usize
+            + vm.stack.len() * std::mem::size_of::<Value>()
+            + std::mem::size_of::<Value>()) as *mut Value;
+        vm.stack_top = invalid_top;
+
+        assert!(vm.stack_boundary_index(stack_start, 0).is_err());
+        vm.cleanup_execution();
+
+        assert_eq!(unsafe { (*upvalue).closed }, Value::Nil);
+        assert_eq!(unsafe { (*upvalue).location }, unsafe {
+            std::ptr::addr_of_mut!((*upvalue).closed)
+        });
+        assert!(unsafe { (*upvalue).next }.is_null());
+        assert_eq!(vm.stack_top, stack_start);
+    }
+
+    #[test]
+    fn registry_checks_recover_canonical_frame_pointer_provenance() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        let closure = vm.frames[0].closure;
+        vm.frames[0].closure = std::ptr::without_provenance_mut(closure.addr());
+
+        assert!(vm.current_semantic_point().unwrap().is_some());
+
+        vm.frames[0].closure = closure;
+        vm.cleanup_execution();
     }
 }
