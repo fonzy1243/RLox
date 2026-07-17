@@ -1,3 +1,4 @@
+use crate::SourceSpan;
 use crate::value::{Value, values_equal};
 
 #[derive(Debug)]
@@ -52,7 +53,7 @@ impl From<OpCode> for u8 {
 
 pub struct Chunk {
     pub code: Vec<u8>,
-    pub lines: Vec<usize>,
+    pub spans: Vec<SourceSpan>,
     pub constants: Vec<Value>,
 }
 
@@ -60,33 +61,22 @@ impl Chunk {
     pub fn new() -> Self {
         Chunk {
             code: Vec::new(),
-            lines: Vec::new(),
+            spans: Vec::new(),
             constants: Vec::new(),
         }
     }
 
-    pub fn write(&mut self, byte: impl Into<u8>, line: usize) {
+    pub fn write(&mut self, byte: impl Into<u8>, span: SourceSpan) {
         self.code.push(byte.into());
-        // Here we implement the run-length encoding of the line numbers.
-        // lines[last - 1] is the line, while lines[last] is the count
-        if self.lines.len() >= 2 && self.lines[self.lines.len() - 2] == line {
-            *self.lines.last_mut().unwrap() += 1;
-        } else {
-            self.lines.push(line);
-            self.lines.push(1);
-        }
+        self.spans.push(span);
     }
 
     pub fn get_line(&self, index: usize) -> usize {
-        let mut remaining = index + 1;
-        for pair in self.lines.chunks(2) {
-            let (line, count) = (pair[0], pair[1]);
-            if remaining <= count {
-                return line;
-            }
-            remaining -= count;
-        }
-        panic!("No line info for instruction {}", index);
+        self.span_at(index).start.line
+    }
+
+    pub fn span_at(&self, index: usize) -> SourceSpan {
+        self.spans[index]
     }
 
     pub fn add_constant(&mut self, value: Value) -> usize {
@@ -100,17 +90,17 @@ impl Chunk {
         self.constants.len() - 1
     }
 
-    pub fn write_constant(&mut self, value: Value, line: usize) {
+    pub fn write_constant(&mut self, value: Value, span: SourceSpan) {
         let index = self.add_constant(value);
         if index < 256 {
-            self.write(OpCode::Constant, line);
-            self.write(index as u8, line);
+            self.write(OpCode::Constant, span);
+            self.write(index as u8, span);
         } else {
             // store as 3 big-endian bytes
-            self.write(OpCode::ConstantLong, line);
-            self.write((index & 0xFF) as u8, line);
-            self.write(((index >> 8) & 0xFF) as u8, line);
-            self.write(((index >> 16) & 0xFF) as u8, line);
+            self.write(OpCode::ConstantLong, span);
+            self.write((index & 0xFF) as u8, span);
+            self.write(((index >> 8) & 0xFF) as u8, span);
+            self.write(((index >> 16) & 0xFF) as u8, span);
         }
     }
 }

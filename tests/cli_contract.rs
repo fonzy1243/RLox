@@ -212,3 +212,25 @@ fn stack_heavy_recursion_exits_with_runtime_error() {
     assert_eq!(output.status.code(), Some(70));
     assert!(stderr.contains("Stack overflow."));
 }
+
+#[cfg(any(
+    feature = "debug_print_code",
+    feature = "debug_trace_execution",
+    feature = "debug_print_tokens",
+    feature = "debug_stress_gc",
+    feature = "debug_log_gc"
+))]
+#[test]
+fn developer_tracing_does_not_change_program_stdout() {
+    let output = run_file("print 2 + 3;");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "5\n");
+    #[cfg(any(
+        feature = "debug_print_code",
+        feature = "debug_trace_execution",
+        feature = "debug_print_tokens",
+        feature = "debug_log_gc"
+    ))]
+    assert!(!output.stderr.is_empty());
+}

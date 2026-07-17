@@ -265,7 +265,7 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -296,7 +296,7 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -325,7 +325,7 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -351,7 +351,7 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -391,7 +391,7 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         collect_garbage(vm);
 
         #[cfg(feature = "debug_log_gc")]
-        println!(
+        eprintln!(
             "{:p} allocate for {:?}",
             ptr,
             Obj::obj_type(ptr as *mut Obj)
@@ -420,7 +420,7 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -484,7 +484,7 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    println!(
+    eprintln!(
         "{:p} allocate for {:?}",
         ptr,
         Obj::obj_type(ptr as *mut Obj)
@@ -528,7 +528,7 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
 
 pub fn free_object(object: *mut Obj) {
     #[cfg(feature = "debug_log_gc")]
-    println!("{:p} free type {:?}", object, Obj::obj_type(object));
+    eprintln!("{:p} free type {:?}", object, Obj::obj_type(object));
 
     unsafe {
         match (*object).obj_type {

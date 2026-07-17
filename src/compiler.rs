@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::process::exit;
 
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
@@ -8,6 +7,10 @@ use crate::object::{Obj, ObjFunction, ObjString, allocate_function, copy_string}
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::vm::VM;
+use crate::{
+    Diagnostic, DiagnosticPhase, DiagnosticSeverity, RevisionId, RuntimeHost, SourceDocument,
+    SourceId, SourceSpan,
+};
 
 const LOCALS_MAX: usize = u8::MAX as usize + 1;
 
@@ -16,6 +19,9 @@ struct Parser<'a> {
     previous: Token<'a>,
     had_error: bool,
     panic_mode: bool,
+    source_id: SourceId,
+    revision: RevisionId,
+    diagnostics: Vec<Diagnostic>,
     compiler: Compiler<'a>,
 }
 
@@ -90,6 +96,17 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
         length: 0,
         line: 0,
         column: 0,
+        start_position: crate::TextPosition {
+            byte_offset: 0,
+            line: 0,
+            column: 0,
+        },
+        end_position: crate::TextPosition {
+            byte_offset: 0,
+            line: 0,
+            column: 0,
+        },
+        error_message: None,
     };
     let dummy_local = Local {
         name: dummy,
@@ -121,20 +138,29 @@ fn current_chunk<'a>(chunk: &'a mut Chunk) -> &'a mut Chunk {
 }
 
 fn error_at(parser: &mut Parser, token: &Token, message: &str) {
-    if parser.panic_mode {
+    let scanner_error = token.token_type == TokenType::Error;
+    if parser.panic_mode && !scanner_error {
         return;
     }
     parser.panic_mode = true;
 
-    eprint!("[line {}] Error", token.line);
-
-    match token.token_type {
-        TokenType::Eof => eprint!(" at end"),
-        TokenType::Error => {}
-        _ => eprint!(" at '{}'", &token.start[..token.length]),
-    }
-
-    eprintln!(": {}", message);
+    parser.diagnostics.push(Diagnostic {
+        phase: if scanner_error {
+            DiagnosticPhase::Scanner
+        } else {
+            DiagnosticPhase::Parser
+        },
+        severity: DiagnosticSeverity::Error,
+        code: if scanner_error {
+            "scanner.error"
+        } else {
+            "parser.error"
+        }
+        .to_string(),
+        message: message.to_string(),
+        span: token.span(parser.source_id, parser.revision),
+        frames: Vec::new(),
+    });
     parser.had_error = true;
 }
 
@@ -148,14 +174,29 @@ fn error_at_current(parser: &mut Parser, message: &str) {
     error_at(parser, &token, message);
 }
 
-pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
-    let mut scanner = Scanner::new(source);
+pub fn compile(
+    document: &SourceDocument,
+    vm: &mut VM,
+    host: &mut dyn RuntimeHost,
+) -> Option<*mut ObjFunction> {
+    let mut scanner = Scanner::new(&document.text);
     let dummy = Token {
         token_type: TokenType::Eof,
         start: "",
         length: 0,
         line: 0,
         column: 0,
+        start_position: crate::TextPosition {
+            byte_offset: 0,
+            line: 0,
+            column: 0,
+        },
+        end_position: crate::TextPosition {
+            byte_offset: 0,
+            line: 0,
+            column: 0,
+        },
+        error_message: None,
     };
     let dummy_local = Local {
         name: dummy,
@@ -185,6 +226,9 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         previous: dummy,
         had_error: false,
         panic_mode: false,
+        source_id: document.id,
+        revision: document.revision,
+        diagnostics: Vec::new(),
         compiler,
     };
 
@@ -198,11 +242,12 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
 
     let (compiled_fn, _) = end_compiler(&mut parser, chunk, vm);
 
-    if parser.had_error {
-        None
-    } else {
-        Some(compiled_fn)
+    let had_error = parser.had_error;
+    for diagnostic in parser.diagnostics.drain(..) {
+        host.diagnostic(diagnostic);
     }
+
+    if had_error { None } else { Some(compiled_fn) }
 }
 
 fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -214,12 +259,12 @@ fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
         #[cfg(feature = "debug_print_tokens")]
         {
             if parser.current.line != parser.previous.line {
-                print!("{:4} | ", parser.current.line);
+                eprint!("{:4} | ", parser.current.line);
             } else {
-                print!("   | | ");
+                eprint!("   | | ");
             }
 
-            println!(
+            eprintln!(
                 "{:3} | {:<20?} | '{}'",
                 parser.current.column,
                 parser.current.token_type,
@@ -231,7 +276,13 @@ fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
             break;
         }
 
-        error_at_current(parser, parser.current.start);
+        error_at_current(
+            parser,
+            parser
+                .current
+                .error_message
+                .unwrap_or("Unexpected scanner error."),
+        );
     }
 }
 
@@ -488,7 +539,7 @@ fn if_statement<'a>(
         parser,
         scanner,
         TokenType::RightParen,
-        "Expect '(' after condition.",
+        "Expect ')' after condition.",
     );
 
     let then_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse as u8);
@@ -782,13 +833,35 @@ fn check(parser: &Parser, token_type: TokenType) -> bool {
     parser.current.token_type == token_type
 }
 
+fn token_span(parser: &Parser, token: Token<'_>) -> SourceSpan {
+    token.span(parser.source_id, parser.revision)
+}
+
+fn merged_span(parser: &Parser, start: Token<'_>, end: Token<'_>) -> SourceSpan {
+    SourceSpan {
+        source_id: parser.source_id,
+        revision: parser.revision,
+        start: start.start_position,
+        end: end.end_position,
+    }
+}
+
 fn emit_byte(parser: &Parser, chunk: &mut Chunk, byte: u8) {
-    chunk.write(byte, parser.previous.line);
+    emit_byte_at(chunk, byte, token_span(parser, parser.previous));
+}
+
+fn emit_byte_at(chunk: &mut Chunk, byte: u8, span: SourceSpan) {
+    chunk.write(byte, span);
 }
 
 fn emit_bytes(parser: &Parser, chunk: &mut Chunk, byte1: u8, byte2: u8) {
     emit_byte(parser, chunk, byte1);
     emit_byte(parser, chunk, byte2);
+}
+
+fn emit_bytes_at(chunk: &mut Chunk, byte1: u8, byte2: u8, span: SourceSpan) {
+    emit_byte_at(chunk, byte1, span);
+    emit_byte_at(chunk, byte2, span);
 }
 
 fn emit_loop(parser: &mut Parser, chunk: &mut Chunk, loop_start: usize) {
@@ -891,7 +964,9 @@ fn binary<'a>(
     vm: &mut VM,
     _: bool,
 ) {
-    let operator_type = parser.previous.token_type;
+    let operator = parser.previous;
+    let operator_type = operator.token_type;
+    let span = token_span(parser, operator);
 
     let rule = get_rule(operator_type);
     let next_precedence =
@@ -899,17 +974,21 @@ fn binary<'a>(
     parse_precedence(parser, scanner, chunk, next_precedence, vm);
 
     match operator_type {
-        TokenType::BangEqual => emit_bytes(parser, chunk, OpCode::Equal as u8, OpCode::Not as u8),
-        TokenType::EqualEqual => emit_byte(parser, chunk, OpCode::Equal as u8),
-        TokenType::Greater => emit_byte(parser, chunk, OpCode::Greater as u8),
-        TokenType::GreaterEqual => emit_bytes(parser, chunk, OpCode::Less as u8, OpCode::Not as u8),
-        TokenType::Less => emit_byte(parser, chunk, OpCode::Less as u8),
-        TokenType::LessEqual => emit_bytes(parser, chunk, OpCode::Greater as u8, OpCode::Not as u8),
-        TokenType::Plus => emit_byte(parser, chunk, OpCode::Add as u8),
-        TokenType::Minus => emit_byte(parser, chunk, OpCode::Subtract as u8),
-        TokenType::Star => emit_byte(parser, chunk, OpCode::Multiply as u8),
-        TokenType::Slash => emit_byte(parser, chunk, OpCode::Divide as u8),
-        TokenType::Backslash => emit_byte(parser, chunk, OpCode::IntDivide as u8),
+        TokenType::BangEqual => emit_bytes_at(chunk, OpCode::Equal as u8, OpCode::Not as u8, span),
+        TokenType::EqualEqual => emit_byte_at(chunk, OpCode::Equal as u8, span),
+        TokenType::Greater => emit_byte_at(chunk, OpCode::Greater as u8, span),
+        TokenType::GreaterEqual => {
+            emit_bytes_at(chunk, OpCode::Less as u8, OpCode::Not as u8, span)
+        }
+        TokenType::Less => emit_byte_at(chunk, OpCode::Less as u8, span),
+        TokenType::LessEqual => {
+            emit_bytes_at(chunk, OpCode::Greater as u8, OpCode::Not as u8, span)
+        }
+        TokenType::Plus => emit_byte_at(chunk, OpCode::Add as u8, span),
+        TokenType::Minus => emit_byte_at(chunk, OpCode::Subtract as u8, span),
+        TokenType::Star => emit_byte_at(chunk, OpCode::Multiply as u8, span),
+        TokenType::Slash => emit_byte_at(chunk, OpCode::Divide as u8, span),
+        TokenType::Backslash => emit_byte_at(chunk, OpCode::IntDivide as u8, span),
         _ => unreachable!(),
     }
 }
@@ -921,8 +1000,10 @@ fn call<'a>(
     vm: &mut VM,
     _: bool,
 ) {
+    let opening = parser.previous;
     let arg_count = argument_list(parser, scanner, chunk, vm);
-    emit_bytes(parser, chunk, OpCode::Call as u8, arg_count);
+    let span = merged_span(parser, opening, parser.previous);
+    emit_bytes_at(chunk, OpCode::Call as u8, arg_count, span);
 }
 
 fn literal<'a>(
@@ -1044,6 +1125,7 @@ fn index<'a>(
     vm: &mut VM,
     can_assign: bool,
 ) {
+    let opening = parser.previous;
     expression(parser, scanner, chunk, vm);
     consume(
         parser,
@@ -1052,11 +1134,14 @@ fn index<'a>(
         "Expect ']' after index.",
     );
 
+    let closing = parser.previous;
+    let span = merged_span(parser, opening, closing);
+
     if can_assign && match_token(parser, scanner, TokenType::Equal) {
         expression(parser, scanner, chunk, vm);
-        emit_byte(parser, chunk, OpCode::SetIndex as u8);
+        emit_byte_at(chunk, OpCode::SetIndex as u8, span);
     } else {
-        emit_byte(parser, chunk, OpCode::GetIndex as u8);
+        emit_byte_at(chunk, OpCode::GetIndex as u8, span);
     }
 }
 
@@ -1079,6 +1164,7 @@ fn named_variable<'a>(
     name: Token<'a>,
     can_assign: bool,
 ) {
+    let span = token_span(parser, name);
     let arg;
     let get_op;
     let set_op;
@@ -1110,11 +1196,11 @@ fn named_variable<'a>(
     let op = if is_assignment { set_op } else { get_op };
 
     if op == OpCode::GetLocalLong || op == OpCode::SetLocalLong {
-        emit_byte(parser, chunk, op as u8);
-        emit_byte(parser, chunk, (arg & 0xff) as u8);
-        emit_byte(parser, chunk, ((arg >> 8) & 0xff) as u8);
+        emit_byte_at(chunk, op as u8, span);
+        emit_byte_at(chunk, (arg & 0xff) as u8, span);
+        emit_byte_at(chunk, ((arg >> 8) & 0xff) as u8, span);
     } else {
-        emit_bytes(parser, chunk, op as u8, arg as u8);
+        emit_bytes_at(chunk, op as u8, arg as u8, span);
     }
 }
 
@@ -1125,13 +1211,15 @@ fn unary<'a>(
     vm: &mut VM,
     _: bool,
 ) {
-    let operator_type = parser.previous.token_type;
+    let operator = parser.previous;
+    let operator_type = operator.token_type;
+    let span = token_span(parser, operator);
 
     parse_precedence(parser, scanner, chunk, Precedence::Unary, vm);
 
     match operator_type {
-        TokenType::Bang => emit_byte(parser, chunk, OpCode::Not as u8),
-        TokenType::Minus => emit_byte(parser, chunk, OpCode::Negate as u8),
+        TokenType::Bang => emit_byte_at(chunk, OpCode::Not as u8, span),
+        TokenType::Minus => emit_byte_at(chunk, OpCode::Negate as u8, span),
         _ => unreachable!(),
     }
 }
