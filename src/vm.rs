@@ -67,6 +67,16 @@ macro_rules! binary_op {
     }};
 }
 
+macro_rules! push_or_runtime_error {
+    ($vm:expr, $value:expr, $offset:expr) => {{
+        if !$vm.push($value) {
+            $vm.frames[$vm.frame_count - 1].ip = $offset + 1;
+            $vm.runtime_error("Stack overflow.");
+            return InterpretResult::RuntimeError;
+        }
+    }};
+}
+
 #[derive(Clone, Copy)]
 pub struct CallFrame {
     pub closure: *mut ObjClosure,
@@ -117,7 +127,8 @@ impl VM {
 
         vm.stack_top = vm.stack.as_mut_ptr();
 
-        vm.define_native("clock", clock_native);
+        let native_defined = vm.define_native("clock", clock_native);
+        debug_assert!(native_defined, "a new VM has capacity for native roots");
         vm
     }
 
@@ -127,21 +138,36 @@ impl VM {
             None => return InterpretResult::CompileError,
         };
 
-        self.push(Value::Obj(function as *mut Obj));
+        if !self.push(Value::Obj(function as *mut Obj)) {
+            self.runtime_error("Stack overflow.");
+            return InterpretResult::RuntimeError;
+        }
         let closure = allocate_closure(self, function);
         self.pop();
-        self.push(Value::Obj(closure as *mut Obj));
+        if !self.push(Value::Obj(closure as *mut Obj)) {
+            self.runtime_error("Stack overflow.");
+            return InterpretResult::RuntimeError;
+        }
 
-        self.call(closure, 0);
+        if !self.call(closure, 0) {
+            return InterpretResult::RuntimeError;
+        }
 
         run(self)
     }
 
-    pub fn push(&mut self, value: Value) {
+    #[must_use]
+    fn push(&mut self, value: Value) -> bool {
+        let stack_end = unsafe { self.stack.as_mut_ptr().add(STACK_MAX) };
+        if self.stack_top >= stack_end {
+            return false;
+        }
+
         unsafe {
             *self.stack_top = value;
             self.stack_top = self.stack_top.add(1);
         }
+        true
     }
 
     pub fn pop(&mut self) -> Value {
@@ -191,7 +217,10 @@ impl VM {
                 let result = ((*native).function)(arg_count, args_slice);
                 self.stack_top = args_start.sub(1);
 
-                self.push(result);
+                if !self.push(result) {
+                    self.runtime_error("Stack overflow.");
+                    return false;
+                }
                 return true;
             }
         }
@@ -200,7 +229,7 @@ impl VM {
         false
     }
 
-    fn concatenate(&mut self) {
+    fn concatenate(&mut self) -> Value {
         let b_val = self.pop();
         let a_val = self.pop();
 
@@ -211,7 +240,7 @@ impl VM {
 
         let result = take_string(self, chars);
 
-        self.push(Value::Obj(result as *mut Obj));
+        Value::Obj(result as *mut Obj)
     }
 
     fn runtime_error(&mut self, message: &str) {
@@ -243,17 +272,23 @@ impl VM {
         self.stack_top = stack_start;
     }
 
-    fn define_native(&mut self, name: &str, function: NativeFn) {
+    fn define_native(&mut self, name: &str, function: NativeFn) -> bool {
         let name_obj = copy_string(self, name);
         let native_obj = allocate_native(self, function);
 
-        self.push(Value::Obj(name_obj as *mut Obj));
-        self.push(Value::Obj(native_obj as *mut Obj));
+        if !self.push(Value::Obj(name_obj as *mut Obj)) {
+            return false;
+        }
+        if !self.push(Value::Obj(native_obj as *mut Obj)) {
+            self.pop();
+            return false;
+        }
 
         self.globals.set(name_obj, self.stack[1]);
 
         self.pop();
         self.pop();
+        true
     }
 }
 
@@ -409,7 +444,7 @@ fn run(vm: &mut VM) -> InterpretResult {
         match instruction {
             x if x == OpCode::Constant as u8 => {
                 let constant = read_constant!(ip, chunk);
-                vm.push(constant);
+                push_or_runtime_error!(vm, constant, current_offset);
             }
             x if x == OpCode::ConstantLong as u8 => {
                 let lo = read_byte!(ip) as usize;
@@ -419,18 +454,24 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let index = lo | (mi << 8) | (hi << 16);
 
                 let constant = chunk.constants[index];
-                vm.push(constant);
+                push_or_runtime_error!(vm, constant, current_offset);
             }
-            x if x == OpCode::Nil as u8 => vm.push(Value::Nil),
-            x if x == OpCode::True as u8 => vm.push(Value::Bool(true)),
-            x if x == OpCode::False as u8 => vm.push(Value::Bool(false)),
+            x if x == OpCode::Nil as u8 => {
+                push_or_runtime_error!(vm, Value::Nil, current_offset)
+            }
+            x if x == OpCode::True as u8 => {
+                push_or_runtime_error!(vm, Value::Bool(true), current_offset)
+            }
+            x if x == OpCode::False as u8 => {
+                push_or_runtime_error!(vm, Value::Bool(false), current_offset)
+            }
             x if x == OpCode::GetUpvalue as u8 => {
                 let slot = read_byte!(ip) as usize;
                 let value = unsafe {
                     let upvalue = (*vm.frames[vm.frame_count - 1].closure).upvalues[slot];
                     *(*upvalue).location
                 };
-                vm.push(value);
+                push_or_runtime_error!(vm, value, current_offset);
             }
             x if x == OpCode::SetUpvalue as u8 => {
                 let slot = read_byte!(ip) as usize;
@@ -443,17 +484,18 @@ fn run(vm: &mut VM) -> InterpretResult {
             x if x == OpCode::Equal as u8 => {
                 let b = vm.pop();
                 let a = vm.pop();
-                vm.push(Value::Bool(values_equal(a, b)));
+                push_or_runtime_error!(vm, Value::Bool(values_equal(a, b)), current_offset);
             }
             x if x == OpCode::Greater as u8 => binary_op!(vm, ip, chunk, Value::Bool, >),
             x if x == OpCode::Less as u8 => binary_op!(vm, ip, chunk, Value::Bool, <),
             x if x == OpCode::Add as u8 => {
                 if vm.peek(0).is_string() && vm.peek(1).is_string() {
-                    vm.concatenate();
+                    let result = vm.concatenate();
+                    push_or_runtime_error!(vm, result, current_offset);
                 } else if vm.peek(0).is_number() && vm.peek(1).is_number() {
                     let b = vm.pop().as_number();
                     let a = vm.pop().as_number();
-                    vm.push(Value::Number(a + b));
+                    push_or_runtime_error!(vm, Value::Number(a + b), current_offset);
                 } else {
                     vm.frames[vm.frame_count - 1].ip = current_offset + 1;
                     vm.runtime_error("Operands must be two numbers or two strings.");
@@ -497,14 +539,12 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::Dup as u8 => {
                 let value = vm.peek(0);
-                vm.push(value);
+                push_or_runtime_error!(vm, value, current_offset);
             }
             x if x == OpCode::GetLocal as u8 => {
                 let slot = read_byte!(ip) as usize;
-                unsafe {
-                    let value = *slots.add(slot);
-                    vm.push(value);
-                }
+                let value = unsafe { *slots.add(slot) };
+                push_or_runtime_error!(vm, value, current_offset);
             }
             x if x == OpCode::SetLocal as u8 => {
                 let slot = read_byte!(ip) as usize;
@@ -514,10 +554,8 @@ fn run(vm: &mut VM) -> InterpretResult {
             }
             x if x == OpCode::GetLocalLong as u8 => {
                 let slot = read_short!(ip) as usize;
-                unsafe {
-                    let value = *slots.add(slot);
-                    vm.push(value);
-                }
+                let value = unsafe { *slots.add(slot) };
+                push_or_runtime_error!(vm, value, current_offset);
             }
             x if x == OpCode::SetLocalLong as u8 => {
                 let slot = read_short!(ip) as usize;
@@ -529,7 +567,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let name = read_string!(ip, chunk);
 
                 if let Some(value) = vm.globals.get(name) {
-                    vm.push(value);
+                    push_or_runtime_error!(vm, value, current_offset);
                 } else {
                     let name_str = ObjString::as_str(name);
                     vm.frames[vm.frame_count - 1].ip = current_offset + 1;
@@ -568,7 +606,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 items.reverse();
 
                 let list_ptr = crate::object::allocate_list(vm, items);
-                vm.push(Value::Obj(list_ptr as *mut Obj));
+                push_or_runtime_error!(vm, Value::Obj(list_ptr as *mut Obj), current_offset);
             }
             x if x == OpCode::BuildListLong as u8 => {
                 let item_count = read_short!(ip) as usize;
@@ -580,7 +618,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                 items.reverse();
 
                 let list_ptr = allocate_list(vm, items);
-                vm.push(Value::Obj(list_ptr as *mut Obj));
+                push_or_runtime_error!(vm, Value::Obj(list_ptr as *mut Obj), current_offset);
             }
             x if x == OpCode::GetIndex as u8 => {
                 let index_val = vm.pop();
@@ -601,7 +639,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                     }
                 };
 
-                vm.push(list.items[index]);
+                push_or_runtime_error!(vm, list.items[index], current_offset);
             }
             x if x == OpCode::SetIndex as u8 => {
                 let value = vm.pop();
@@ -625,7 +663,7 @@ fn run(vm: &mut VM) -> InterpretResult {
 
                 list.items[index] = value;
 
-                vm.push(value);
+                push_or_runtime_error!(vm, value, current_offset);
             }
             x if x == OpCode::Print as u8 => {
                 println!("{}", vm.pop());
@@ -686,7 +724,7 @@ fn run(vm: &mut VM) -> InterpretResult {
                     }
                 }
 
-                vm.push(Value::Obj(closure_ptr as *mut Obj));
+                push_or_runtime_error!(vm, Value::Obj(closure_ptr as *mut Obj), current_offset);
             }
             x if x == OpCode::CloseUpvalue as u8 => {
                 close_upvalues(vm, unsafe { vm.stack_top.sub(1) });
@@ -704,7 +742,10 @@ fn run(vm: &mut VM) -> InterpretResult {
 
                 let slots_to_restore = vm.frames[vm.frame_count].slots;
                 vm.stack_top = slots_to_restore;
-                vm.push(result);
+                if !vm.push(result) {
+                    vm.runtime_error("Stack overflow.");
+                    return InterpretResult::RuntimeError;
+                }
 
                 // Swap context elements to match the parent frame we returned back into
                 chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };

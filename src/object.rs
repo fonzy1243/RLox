@@ -94,89 +94,159 @@ impl ObjString {
 
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut visited = HashSet::new();
-        format_object(self as *const Obj, f, &mut visited, 0)
+        let mut state = FormatState::new();
+        if state.consume_node() {
+            format_object(self as *const Obj, &mut state, 0);
+        }
+        f.write_str(&state.output)
     }
 }
 
 const FORMAT_DEPTH_LIMIT: usize = 64;
 const FORMAT_ELEMENT_LIMIT: usize = 100;
+const FORMAT_NODE_LIMIT: usize = 1_024;
+const FORMAT_TOTAL_ELEMENT_LIMIT: usize = 1_024;
+const FORMAT_BYTE_LIMIT: usize = 8 * 1_024;
+const TRUNCATION_MARKER: &str = "<truncated>";
 
-pub(crate) fn format_value(value: Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let mut visited = HashSet::new();
-    format_value_nested(value, f, &mut visited, 0)
+struct FormatState {
+    output: String,
+    visited: HashSet<*const Obj>,
+    nodes_remaining: usize,
+    elements_remaining: usize,
+    truncated: bool,
 }
 
-fn format_value_nested(
-    value: Value,
-    f: &mut fmt::Formatter<'_>,
-    visited: &mut HashSet<*const Obj>,
-    depth: usize,
-) -> fmt::Result {
-    match value {
-        Value::Bool(value) => write!(f, "{}", value),
-        Value::Nil => write!(f, "nil"),
-        Value::Number(value) => write!(f, "{}", value),
-        Value::Obj(ptr) => format_object(ptr, f, visited, depth),
+impl FormatState {
+    fn new() -> Self {
+        Self {
+            output: String::new(),
+            visited: HashSet::new(),
+            nodes_remaining: FORMAT_NODE_LIMIT,
+            elements_remaining: FORMAT_TOTAL_ELEMENT_LIMIT,
+            truncated: false,
+        }
+    }
+
+    fn consume_node(&mut self) -> bool {
+        if self.nodes_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.nodes_remaining -= 1;
+        true
+    }
+
+    fn consume_element(&mut self) -> bool {
+        if self.elements_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.elements_remaining -= 1;
+        true
+    }
+
+    fn write_str(&mut self, value: &str) {
+        if self.truncated {
+            return;
+        }
+
+        let content_limit = FORMAT_BYTE_LIMIT - TRUNCATION_MARKER.len();
+        let remaining = content_limit.saturating_sub(self.output.len());
+        if value.len() <= remaining {
+            self.output.push_str(value);
+            return;
+        }
+
+        let mut end = remaining.min(value.len());
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.output.push_str(&value[..end]);
+        self.truncate();
+    }
+
+    fn truncate(&mut self) {
+        if !self.truncated {
+            self.output.push_str(TRUNCATION_MARKER);
+            self.truncated = true;
+        }
     }
 }
 
-fn format_object(
-    ptr: *const Obj,
-    f: &mut fmt::Formatter<'_>,
-    visited: &mut HashSet<*const Obj>,
-    depth: usize,
-) -> fmt::Result {
+pub(crate) fn format_value(value: Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut state = FormatState::new();
+    format_value_nested(value, &mut state, 0);
+    f.write_str(&state.output)
+}
+
+fn format_value_nested(value: Value, state: &mut FormatState, depth: usize) {
+    if !state.consume_node() {
+        return;
+    }
+
+    match value {
+        Value::Bool(value) => state.write_str(if value { "true" } else { "false" }),
+        Value::Nil => state.write_str("nil"),
+        Value::Number(value) => state.write_str(&value.to_string()),
+        Value::Obj(ptr) => format_object(ptr, state, depth),
+    }
+}
+
+fn format_object(ptr: *const Obj, state: &mut FormatState, depth: usize) {
     match unsafe { (*ptr).obj_type } {
         ObjType::Closure => {
             let closure = unsafe { &*(ptr as *const ObjClosure) };
             let function = unsafe { &*closure.function };
 
             if function.name.is_null() {
-                write!(f, "<script>")
+                state.write_str("<script>");
             } else {
-                write!(f, "<fn {}>", ObjString::as_str(function.name))
+                state.write_str("<fn ");
+                state.write_str(ObjString::as_str(function.name));
+                state.write_str(">");
             }
         }
         ObjType::Function => {
             let function = unsafe { &*(ptr as *const ObjFunction) };
             if function.name.is_null() {
-                write!(f, "<script>")
+                state.write_str("<script>");
             } else {
-                write!(f, "<fn {}>", ObjString::as_str(function.name))
+                state.write_str("<fn ");
+                state.write_str(ObjString::as_str(function.name));
+                state.write_str(">");
             }
         }
-        ObjType::Native => write!(f, "<native fn>"),
-        ObjType::String => write!(f, "{}", ObjString::as_str(ptr as *const ObjString)),
-        ObjType::Upvalue => write!(f, "upvalue"),
+        ObjType::Native => state.write_str("<native fn>"),
+        ObjType::String => state.write_str(ObjString::as_str(ptr as *const ObjString)),
+        ObjType::Upvalue => state.write_str("upvalue"),
         ObjType::List => {
             if depth >= FORMAT_DEPTH_LIMIT {
-                return write!(f, "<depth-limit>");
+                state.write_str("<depth-limit>");
+                return;
             }
-            if !visited.insert(ptr) {
-                return write!(f, "<cycle>");
+            if !state.visited.insert(ptr) {
+                state.write_str("<cycle>");
+                return;
             }
 
             let list = unsafe { &*(ptr as *const ObjList) };
-            let result = (|| {
-                write!(f, "[")?;
-                for (index, item) in list.items.iter().take(FORMAT_ELEMENT_LIMIT).enumerate() {
-                    if index > 0 {
-                        write!(f, ", ")?;
-                    }
-                    format_value_nested(*item, f, visited, depth + 1)?;
+            state.write_str("[");
+            for (index, item) in list.items.iter().take(FORMAT_ELEMENT_LIMIT).enumerate() {
+                if state.truncated || !state.consume_element() {
+                    break;
                 }
-                if list.items.len() > FORMAT_ELEMENT_LIMIT {
-                    if FORMAT_ELEMENT_LIMIT > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "...")?;
+                if index > 0 {
+                    state.write_str(", ");
                 }
-                write!(f, "]")
-            })();
+                format_value_nested(*item, state, depth + 1);
+            }
+            if !state.truncated && list.items.len() > FORMAT_ELEMENT_LIMIT {
+                state.truncate();
+            }
+            state.write_str("]");
 
-            visited.remove(&ptr);
-            result
+            state.visited.remove(&ptr);
         }
     }
 }

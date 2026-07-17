@@ -88,6 +88,21 @@ fn safety_limits_recover_after_recursion_overflow() {
 }
 
 #[test]
+fn runtime_stack_boundary_recovers_for_the_next_run() {
+    let declarations = (0..255)
+        .map(|index| format!("var local{index};"))
+        .collect::<String>();
+    let source = format!("fun recurse() {{{declarations} return 1 + recurse();}} recurse();");
+    let mut interpreter = Interpreter::new();
+
+    assert_eq!(
+        interpreter.interpret(&source),
+        InterpretResult::RuntimeError
+    );
+    assert_eq!(interpreter.interpret("print 1;"), InterpretResult::Ok);
+}
+
+#[test]
 fn safety_limits_reject_excess_upvalues() {
     let middle_declarations = (0..254)
         .map(|index| format!("var middle{index};"))
