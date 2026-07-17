@@ -174,12 +174,40 @@ fn next_debug_point_id(parser: &mut Parser<'_>) -> DebugPointId {
     id
 }
 
-fn schedule_point(parser: &mut Parser<'_>, kind: DebugPointKind, span: SourceSpan) {
+fn schedule_point(parser: &mut Parser<'_>, kind: DebugPointKind, span: SourceSpan) -> DebugPointId {
     let id = next_debug_point_id(parser);
     parser
         .compiler
         .pending_points
         .push(PendingPoint { id, kind, span });
+    id
+}
+
+fn finish_point(parser: &mut Parser<'_>, id: DebugPointId, end: crate::TextPosition) {
+    if let Some(point) = parser
+        .compiler
+        .pending_points
+        .iter_mut()
+        .find(|point| point.id == id)
+    {
+        point.span.end = end;
+        return;
+    }
+
+    unsafe {
+        if let Some(point) = (*parser.compiler.function)
+            .debug_info
+            .points
+            .iter_mut()
+            .find(|point| point.id == id)
+        {
+            point.span.end = end;
+        }
+    }
+}
+
+fn finish_previous_point(parser: &mut Parser<'_>, id: DebugPointId) {
+    finish_point(parser, id, parser.previous.end_position);
 }
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
@@ -439,7 +467,7 @@ fn function<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     func_type: FunctionType,
-) {
+) -> *mut ObjFunction {
     init_compiler(parser, vm, func_type);
     begin_scope(parser);
 
@@ -500,6 +528,8 @@ fn function<'a>(
         emit_byte_operand(parser, chunk, if upvalue.is_local { 1 } else { 0 });
         emit_byte_operand(parser, chunk, upvalue.index);
     }
+
+    function_ptr
 }
 
 fn fun_declaration<'a>(
@@ -507,6 +537,7 @@ fn fun_declaration<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
+    construct_start: crate::TextPosition,
 ) {
     let global = parse_variable(
         parser,
@@ -517,7 +548,24 @@ fn fun_declaration<'a>(
         BindingKind::Local,
     );
     mark_resolver_initialized(parser);
-    function(parser, scanner, chunk, vm, FunctionType::Function);
+    let function_ptr = function(parser, scanner, chunk, vm, FunctionType::Function);
+    let declaration = SourceSpan {
+        source_id: parser.source_id,
+        revision: parser.revision,
+        start: construct_start,
+        end: parser.previous.end_position,
+    };
+    unsafe {
+        (*function_ptr).debug_info.declaration = declaration;
+        if let Some(entry) = (*function_ptr)
+            .debug_info
+            .points
+            .iter_mut()
+            .find(|point| point.kind == DebugPointKind::FunctionEntry)
+        {
+            entry.span = declaration;
+        }
+    }
     define_variable(parser, chunk, global);
 }
 
@@ -627,19 +675,21 @@ fn for_statement<'a>(
         // No initializer
     } else if match_token(parser, scanner, TokenType::Var) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::LoopInitializer, span);
+        let point = schedule_point(parser, DebugPointKind::LoopInitializer, span);
         var_declaration(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else {
         let span = token_span(parser, parser.current);
-        schedule_point(parser, DebugPointKind::LoopInitializer, span);
+        let point = schedule_point(parser, DebugPointKind::LoopInitializer, span);
         expression_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     }
     let mut loop_start = chunk.code.len();
     let mut exit_jump: Option<usize> = None;
     // Condition
     if !match_token(parser, scanner, TokenType::Semicolon) {
         let span = token_span(parser, parser.current);
-        schedule_point(parser, DebugPointKind::LoopCondition, span);
+        let point = schedule_point(parser, DebugPointKind::LoopCondition, span);
         expression(parser, scanner, chunk, vm);
         consume(
             parser,
@@ -647,6 +697,7 @@ fn for_statement<'a>(
             TokenType::Semicolon,
             "Expect ';' after loop condition.",
         );
+        finish_previous_point(parser, point);
 
         // Jump out of the loop if the condition is false.
         exit_jump = Some(emit_jump(parser, chunk, OpCode::JumpIfFalse));
@@ -657,8 +708,9 @@ fn for_statement<'a>(
         let body_jump = emit_jump(parser, chunk, OpCode::Jump);
         let increment_start = chunk.code.len();
         let span = token_span(parser, parser.current);
-        schedule_point(parser, DebugPointKind::LoopIncrement, span);
+        let point = schedule_point(parser, DebugPointKind::LoopIncrement, span);
         expression(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
         emit_opcode(parser, chunk, OpCode::Pop);
         consume(
             parser,
@@ -926,12 +978,14 @@ fn declaration<'a>(
 ) {
     if match_token(parser, scanner, TokenType::Fun) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
-        fun_declaration(parser, scanner, chunk, vm);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
+        fun_declaration(parser, scanner, chunk, vm, span.start);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Var) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         var_declaration(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else {
         statement(parser, scanner, chunk, vm);
     }
@@ -949,34 +1003,40 @@ fn statement<'a>(
 ) {
     if match_token(parser, scanner, TokenType::Print) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         print_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Return) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         return_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::For) {
         for_statement(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::If) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         if_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Switch) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         switch_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::While) {
         let span = token_span(parser, parser.previous);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         while_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::LeftBrace) {
         begin_scope(parser);
         block(parser, scanner, chunk, vm);
         end_scope(parser, chunk);
     } else {
         let span = token_span(parser, parser.current);
-        schedule_point(parser, DebugPointKind::Statement, span);
+        let point = schedule_point(parser, DebugPointKind::Statement, span);
         expression_statement(parser, scanner, chunk, vm);
+        finish_previous_point(parser, point);
     }
 }
 
@@ -1968,7 +2028,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::compile;
-    use crate::chunk::OpCode;
+    use crate::chunk::{Chunk, OpCode};
     use crate::debug_info::{BindingKind, DebugPointKind};
     use crate::object::{ObjFunction, ObjString};
     use crate::value::Value;
@@ -2046,6 +2106,54 @@ mod tests {
         }
     }
 
+    fn assert_golden_code(function: *mut ObjFunction, expected: &[u8]) {
+        let chunk = &function_ref(function).chunk;
+        assert_eq!(chunk.code, expected);
+        assert_eq!(chunk.spans.len(), chunk.code.len());
+        chunk
+            .opcode_starts()
+            .unwrap_or_else(|error| panic!("invalid golden bytecode: {error}"));
+    }
+
+    fn position_at(source: &str, byte_offset: usize) -> crate::TextPosition {
+        let mut line = 1;
+        let mut column = 1;
+        for scalar in source[..byte_offset].chars() {
+            if scalar == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        crate::TextPosition {
+            byte_offset,
+            line,
+            column,
+        }
+    }
+
+    fn assert_point_span(
+        function: *mut ObjFunction,
+        source: &str,
+        kind: DebugPointKind,
+        expected: &str,
+    ) {
+        let start = source
+            .find(expected)
+            .unwrap_or_else(|| panic!("missing expected construct {expected:?}"));
+        let end = start + expected.len();
+        let point = &function_ref(function)
+            .debug_info
+            .points
+            .iter()
+            .find(|point| point.kind == kind && point.span.start.byte_offset == start)
+            .unwrap_or_else(|| panic!("missing {kind:?} point at byte {start}"));
+        assert_eq!(point.span.start, position_at(source, start));
+        assert_eq!(point.span.end, position_at(source, end));
+        assert_eq!(&source[start..end], expected);
+    }
+
     #[test]
     fn debug_points_preserve_distinct_same_line_statement_spans() {
         let source = "var a=1; a=a+1; print a;";
@@ -2062,7 +2170,7 @@ mod tests {
                 .iter()
                 .map(|point| &source[point.span.start.byte_offset..point.span.end.byte_offset])
                 .collect::<Vec<_>>(),
-            ["var", "a", "print"]
+            ["var a=1;", "a=a+1;", "print a;"]
         );
         assert!(statements.iter().all(|point| point.span.start.line == 1));
         assert_eq!(
@@ -2096,7 +2204,8 @@ mod tests {
 
     #[test]
     fn multiline_expression_has_one_statement_point() {
-        let (_vm, function) = compile_success("print (1 +\n  2);\n");
+        let source = "\n// lead\nprint (1 +\n  2);\n";
+        let (_vm, function) = compile_success(source);
         let points = unsafe { &(*function).debug_info.points };
         let statements: Vec<_> = points
             .iter()
@@ -2104,8 +2213,123 @@ mod tests {
             .collect();
 
         assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0].span.start.line, 1);
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::Statement,
+            "print (1 +\n  2);",
+        );
         assert_points_are_opcode_starts(function);
+    }
+
+    #[test]
+    fn declarations_functions_and_returns_use_full_construct_spans() {
+        let source = "var global =\n  1;\nfun f(p) {\n  var local;\n  return\n    p;\n}\n";
+        let (_vm, script) = compile_success(source);
+        let function = direct_function(script, "f");
+
+        assert_point_span(
+            script,
+            source,
+            DebugPointKind::Statement,
+            "var global =\n  1;",
+        );
+        let function_construct = "fun f(p) {\n  var local;\n  return\n    p;\n}";
+        assert_point_span(
+            script,
+            source,
+            DebugPointKind::Statement,
+            function_construct,
+        );
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::FunctionEntry,
+            function_construct,
+        );
+        assert_point_span(function, source, DebugPointKind::Statement, "var local;");
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::Statement,
+            "return\n    p;",
+        );
+    }
+
+    #[test]
+    fn assignment_if_else_and_nested_statement_spans_are_complete() {
+        let source = "var a=0;\na = a +\n  1;\nif (a)\n  print 1;\nelse\n  print 2;\n";
+        let (_vm, function) = compile_success(source);
+
+        assert_point_span(function, source, DebugPointKind::Statement, "a = a +\n  1;");
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::Statement,
+            "if (a)\n  print 1;\nelse\n  print 2;",
+        );
+        assert_point_span(function, source, DebugPointKind::Statement, "print 1;");
+        assert_point_span(function, source, DebugPointKind::Statement, "print 2;");
+    }
+
+    #[test]
+    fn while_switch_and_nested_block_spans_exclude_comments_and_braces() {
+        let source = "while (false) {\n  // loop comment\n  print 1;\n}\nswitch (1) {\n  case 1: print 2;\n  default: {\n    // empty\n  }\n}\n{\n  // blank block\n}\n";
+        let (_vm, function) = compile_success(source);
+
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::Statement,
+            "while (false) {\n  // loop comment\n  print 1;\n}",
+        );
+        assert_point_span(function, source, DebugPointKind::Statement, "print 1;");
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::Statement,
+            "switch (1) {\n  case 1: print 2;\n  default: {\n    // empty\n  }\n}",
+        );
+        assert_point_span(function, source, DebugPointKind::Statement, "print 2;");
+        assert_eq!(
+            function_ref(function)
+                .debug_info
+                .points
+                .iter()
+                .filter(|point| point.kind == DebugPointKind::Statement)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn for_clause_and_body_spans_cover_only_present_executable_constructs() {
+        let source = "for (var i = 0;\n     i < 2;\n     i = i + 1)\n  print i;\nfor (;;) {\n  // omitted\n}\n";
+        let (_vm, function) = compile_success(source);
+
+        assert_point_span(
+            function,
+            source,
+            DebugPointKind::LoopInitializer,
+            "var i = 0;",
+        );
+        assert_point_span(function, source, DebugPointKind::LoopCondition, "i < 2;");
+        assert_point_span(function, source, DebugPointKind::LoopIncrement, "i = i + 1");
+        assert_point_span(function, source, DebugPointKind::Statement, "print i;");
+        assert_eq!(
+            function_ref(function)
+                .debug_info
+                .points
+                .iter()
+                .filter(|point| matches!(
+                    point.kind,
+                    DebugPointKind::LoopInitializer
+                        | DebugPointKind::LoopCondition
+                        | DebugPointKind::LoopIncrement
+                ))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -2228,7 +2452,7 @@ mod tests {
         assert_eq!(
             &source[local_function_point.span.start.byte_offset
                 ..local_function_point.span.end.byte_offset],
-            "fun"
+            "fun recurse(n) { print seed; if (n>0) recurse(n-1); }"
         );
         let upvalue = unsafe { &(*recurse).debug_info.upvalues }
             .iter()
@@ -2407,5 +2631,266 @@ mod tests {
         assert_eq!(vm.run(&document, &mut host), crate::InterpretResult::Ok);
         assert_eq!(host.output(), ["2"]);
         assert!(host.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn golden_jumps_loops_and_logical_operators_preserve_exact_bytes() {
+        let (_vm, while_function) = compile_success("while (false) print 1;");
+        assert_golden_code(
+            while_function,
+            &[
+                OpCode::False as u8,
+                OpCode::JumpIfFalse as u8,
+                7,
+                0,
+                OpCode::Pop as u8,
+                OpCode::Constant as u8,
+                0,
+                OpCode::Print as u8,
+                OpCode::Loop as u8,
+                11,
+                0,
+                OpCode::Pop as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+
+        let (_vm, if_function) = compile_success("if (true) print 1; else print 2;");
+        assert_golden_code(
+            if_function,
+            &[
+                OpCode::True as u8,
+                OpCode::JumpIfFalse as u8,
+                7,
+                0,
+                OpCode::Pop as u8,
+                OpCode::Constant as u8,
+                0,
+                OpCode::Print as u8,
+                OpCode::Jump as u8,
+                4,
+                0,
+                OpCode::Pop as u8,
+                OpCode::Constant as u8,
+                1,
+                OpCode::Print as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+
+        let (_vm, logical_function) = compile_success("print true and false or true;");
+        assert_golden_code(
+            logical_function,
+            &[
+                OpCode::True as u8,
+                OpCode::JumpIfFalse as u8,
+                2,
+                0,
+                OpCode::Pop as u8,
+                OpCode::False as u8,
+                OpCode::JumpIfFalse as u8,
+                3,
+                0,
+                OpCode::Jump as u8,
+                2,
+                0,
+                OpCode::Pop as u8,
+                OpCode::True as u8,
+                OpCode::Print as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+    }
+
+    #[test]
+    fn golden_calls_lists_indexing_and_returns_preserve_exact_bytes() {
+        let source = "fun id(x){ return x; } var a=[1,2]; a[0]=id(a[1]); print a[0];";
+        let (_vm, script) = compile_success(source);
+        let identity = direct_function(script, "id");
+
+        assert_golden_code(
+            script,
+            &[
+                OpCode::Closure as u8,
+                1,
+                OpCode::DefineGlobal as u8,
+                0,
+                OpCode::Constant as u8,
+                3,
+                OpCode::Constant as u8,
+                4,
+                OpCode::BuildList as u8,
+                2,
+                OpCode::DefineGlobal as u8,
+                2,
+                OpCode::GetGlobal as u8,
+                2,
+                OpCode::Constant as u8,
+                5,
+                OpCode::GetGlobal as u8,
+                0,
+                OpCode::GetGlobal as u8,
+                2,
+                OpCode::Constant as u8,
+                3,
+                OpCode::GetIndex as u8,
+                OpCode::Call as u8,
+                1,
+                OpCode::SetIndex as u8,
+                OpCode::Pop as u8,
+                OpCode::GetGlobal as u8,
+                2,
+                OpCode::Constant as u8,
+                5,
+                OpCode::GetIndex as u8,
+                OpCode::Print as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+        assert_golden_code(
+            identity,
+            &[
+                OpCode::GetLocal as u8,
+                1,
+                OpCode::Return as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+    }
+
+    #[test]
+    fn golden_long_constants_and_lists_preserve_exact_bytes() {
+        let mut constants_source = String::new();
+        let mut constants_expected = Vec::new();
+        for index in 0..=256usize {
+            constants_source.push_str(&format!("print {index};"));
+            if index <= u8::MAX as usize {
+                constants_expected.extend([OpCode::Constant as u8, index as u8]);
+            } else {
+                constants_expected.extend([OpCode::ConstantLong as u8, 0, 1, 0]);
+            }
+            constants_expected.push(OpCode::Print as u8);
+        }
+        constants_expected.extend([OpCode::Nil as u8, OpCode::Return as u8]);
+        let (_vm, constants_function) = compile_success(&constants_source);
+        assert_golden_code(constants_function, &constants_expected);
+
+        let list_source = format!("print [{}];", vec!["nil"; 255].join(","));
+        let mut list_expected = vec![OpCode::Nil as u8; 255];
+        list_expected.extend([
+            OpCode::BuildList as u8,
+            255,
+            OpCode::Print as u8,
+            OpCode::Nil as u8,
+            OpCode::Return as u8,
+        ]);
+        let (_vm, list_function) = compile_success(&list_source);
+        assert_golden_code(list_function, &list_expected);
+
+        let long_list_source = format!("print [{}];", vec!["nil"; 256].join(","));
+        let (_vm, function, host) = compile_result(&long_list_source);
+        assert!(function.is_none());
+        assert!(
+            host.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Error processing list literal.")
+        );
+
+        let span = crate::SourceSpan {
+            source_id: SourceId(41),
+            revision: RevisionId(7),
+            start: position_at("", 0),
+            end: position_at("", 0),
+        };
+        let mut encoded_long_list = Chunk::new();
+        encoded_long_list.code = vec![
+            OpCode::BuildListLong as u8,
+            0,
+            1,
+            OpCode::Nil as u8,
+            OpCode::Return as u8,
+        ];
+        encoded_long_list.spans = vec![span; encoded_long_list.code.len()];
+        assert_eq!(
+            encoded_long_list.opcode_starts().unwrap(),
+            HashSet::from([0, 3, 4])
+        );
+        assert_eq!(encoded_long_list.spans.len(), encoded_long_list.code.len());
+    }
+
+    #[test]
+    fn golden_maximum_local_slot_uses_the_exact_byte_operand() {
+        let mut source = String::from("fun f(){");
+        let mut expected = Vec::new();
+        for index in 0..255usize {
+            source.push_str(&format!("var v{index}={index};"));
+            expected.extend([OpCode::Constant as u8, index as u8]);
+        }
+        source.push_str("print v254;}");
+        expected.extend([
+            OpCode::GetLocal as u8,
+            255,
+            OpCode::Print as u8,
+            OpCode::Nil as u8,
+            OpCode::Return as u8,
+        ]);
+
+        let (_vm, script) = compile_success(&source);
+        let function = direct_function(script, "f");
+        assert_golden_code(function, &expected);
+        let starts = opcode_starts(function);
+        assert!(starts.iter().all(|offset| {
+            function_ref(function).chunk.code[*offset] != OpCode::GetLocalLong as u8
+        }));
+    }
+
+    #[test]
+    fn golden_closure_descriptors_and_cleanup_preserve_exact_bytes() {
+        let source = "fun outer(){ {var x=1; fun inner(){print x;} } }";
+        let (_vm, script) = compile_success(source);
+        let outer = direct_function(script, "outer");
+        let inner = direct_function(outer, "inner");
+
+        assert_golden_code(
+            script,
+            &[
+                OpCode::Closure as u8,
+                1,
+                OpCode::DefineGlobal as u8,
+                0,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+        assert_golden_code(
+            outer,
+            &[
+                OpCode::Constant as u8,
+                0,
+                OpCode::Closure as u8,
+                1,
+                1,
+                1,
+                OpCode::Pop as u8,
+                OpCode::CloseUpvalue as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
+        assert_golden_code(
+            inner,
+            &[
+                OpCode::GetUpvalue as u8,
+                0,
+                OpCode::Print as u8,
+                OpCode::Nil as u8,
+                OpCode::Return as u8,
+            ],
+        );
     }
 }
