@@ -26,6 +26,8 @@ struct Parser<'a> {
     source_id: SourceId,
     revision: RevisionId,
     diagnostics: Vec<Diagnostic>,
+    diagnostic_limit: Option<usize>,
+    diagnostic_count: usize,
     next_binding_id: u64,
     next_debug_point_id: u64,
     compiler: Compiler<'a>,
@@ -274,14 +276,20 @@ fn report_at(
     }
     parser.panic_mode = true;
 
-    parser.diagnostics.push(Diagnostic {
-        phase,
-        severity: DiagnosticSeverity::Error,
-        code: code.to_string(),
-        message: message.to_string(),
-        span: token.span(parser.source_id, parser.revision),
-        frames: Vec::new(),
-    });
+    parser.diagnostic_count += 1;
+    if parser
+        .diagnostic_limit
+        .is_none_or(|limit| parser.diagnostics.len() < limit)
+    {
+        parser.diagnostics.push(Diagnostic {
+            phase,
+            severity: DiagnosticSeverity::Error,
+            code: code.to_string(),
+            message: message.to_string(),
+            span: token.span(parser.source_id, parser.revision),
+            frames: Vec::new(),
+        });
+    }
     parser.had_error = true;
 }
 
@@ -324,6 +332,20 @@ pub fn compile(
     vm: &mut VM,
     host: &mut dyn RuntimeHost,
 ) -> Option<*mut ObjFunction> {
+    compile_with_diagnostic_limit(document, vm, host, None).function
+}
+
+pub(crate) struct CompileOutcome {
+    pub function: Option<*mut ObjFunction>,
+    pub diagnostic_count: usize,
+}
+
+pub(crate) fn compile_with_diagnostic_limit(
+    document: &SourceDocument,
+    vm: &mut VM,
+    host: &mut dyn RuntimeHost,
+    diagnostic_limit: Option<usize>,
+) -> CompileOutcome {
     let mut scanner = Scanner::new(&document.text);
     let dummy = Token {
         token_type: TokenType::Eof,
@@ -380,6 +402,8 @@ pub fn compile(
         source_id: document.id,
         revision: document.revision,
         diagnostics: Vec::new(),
+        diagnostic_limit,
+        diagnostic_count: 0,
         next_binding_id: 0,
         next_debug_point_id: 1,
         compiler,
@@ -400,7 +424,10 @@ pub fn compile(
         host.diagnostic(diagnostic);
     }
 
-    if had_error { None } else { Some(compiled_fn) }
+    CompileOutcome {
+        function: (!had_error).then_some(compiled_fn),
+        diagnostic_count: parser.diagnostic_count,
+    }
 }
 
 fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {

@@ -1,6 +1,6 @@
 use crate::{RevisionId, SourceId, SourceSpan, TextPosition};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
     // Single-character tokens
     LeftParen,
@@ -94,6 +94,18 @@ pub struct Scanner<'a> {
     start_position: TextPosition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScannerItemKind {
+    Token(TokenType),
+    Comment,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScannerItem<'a> {
+    pub kind: ScannerItemKind,
+    pub token: Token<'a>,
+}
+
 impl<'a> Scanner<'a> {
     pub fn new(source: &'a str) -> Self {
         Scanner {
@@ -119,25 +131,42 @@ impl<'a> Scanner<'a> {
     }
 
     pub fn scan_token(&mut self) -> Token<'a> {
+        loop {
+            let item = self.scan_item();
+            if item.kind != ScannerItemKind::Comment {
+                return item.token;
+            }
+        }
+    }
+
+    pub(crate) fn scan_item(&mut self) -> ScannerItem<'a> {
         self.skip_whitespace();
         self.start = self.current;
         self.start_position = self.current_position();
 
         if self.is_at_end() {
-            return self.make_token(TokenType::Eof);
+            return self.token_item(TokenType::Eof);
         }
 
         let c = self.advance();
 
         if Self::is_alpha(c) {
-            return self.identifier();
+            let token = self.identifier();
+            return ScannerItem {
+                kind: ScannerItemKind::Token(token.token_type),
+                token,
+            };
         }
 
         if Self::is_digit(c) {
-            return self.number();
+            let token = self.number();
+            return ScannerItem {
+                kind: ScannerItemKind::Token(token.token_type),
+                token,
+            };
         }
 
-        match c {
+        let token = match c {
             '(' => self.make_token(TokenType::LeftParen),
             ')' => self.make_token(TokenType::RightParen),
             '[' => self.make_token(TokenType::LeftBracket),
@@ -150,6 +179,15 @@ impl<'a> Scanner<'a> {
             '.' => self.make_token(TokenType::Dot),
             '-' => self.make_token(TokenType::Minus),
             '+' => self.make_token(TokenType::Plus),
+            '/' if self.match_char('/') => {
+                while self.peek() != '\n' && !self.is_at_end() {
+                    self.advance();
+                }
+                return ScannerItem {
+                    kind: ScannerItemKind::Comment,
+                    token: self.make_token(TokenType::Slash),
+                };
+            }
             '/' => self.make_token(TokenType::Slash),
             '\\' => self.make_token(TokenType::Backslash),
             '*' => self.make_token(TokenType::Star),
@@ -193,6 +231,17 @@ impl<'a> Scanner<'a> {
             }
             '"' => self.string(),
             _ => self.error_token("Unexpected character."),
+        };
+        ScannerItem {
+            kind: ScannerItemKind::Token(token.token_type),
+            token,
+        }
+    }
+
+    fn token_item(&self, token_type: TokenType) -> ScannerItem<'a> {
+        ScannerItem {
+            kind: ScannerItemKind::Token(token_type),
+            token: self.make_token(token_type),
         }
     }
 
@@ -277,16 +326,6 @@ impl<'a> Scanner<'a> {
                 }
                 '\n' => {
                     self.advance();
-                }
-                '/' => {
-                    if self.peek_next() == '/' {
-                        // A comment goes until the end of the line.
-                        while self.peek() != '\n' && !self.is_at_end() {
-                            self.advance();
-                        }
-                    } else {
-                        return;
-                    }
                 }
                 _ => return,
             }
@@ -404,7 +443,7 @@ impl<'a> Scanner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scanner, TokenType};
+    use super::{Scanner, ScannerItemKind, TokenType};
     use crate::{RevisionId, SourceId};
 
     #[test]
@@ -431,6 +470,59 @@ mod tests {
         assert_eq!((span.start.line, span.start.column), (2, 2));
         assert_eq!(span.end.byte_offset, 14);
         assert_eq!((span.end.line, span.end.column), (2, 7));
+    }
+
+    #[test]
+    fn item_scanning_reports_adjacent_comments_and_comment_at_eof() {
+        let mut scanner = Scanner::new("// one\n// two");
+        let first = scanner.scan_item();
+        let second = scanner.scan_item();
+        let eof = scanner.scan_item();
+
+        assert_eq!(first.kind, ScannerItemKind::Comment);
+        assert_eq!(first.token.lexeme(), "// one");
+        assert_eq!(second.kind, ScannerItemKind::Comment);
+        assert_eq!(second.token.lexeme(), "// two");
+        assert_eq!(second.token.end_position.byte_offset, 13);
+        assert_eq!(eof.kind, ScannerItemKind::Token(TokenType::Eof));
+    }
+
+    #[test]
+    fn token_scanning_matches_item_scanning_after_comments_are_filtered() {
+        let source = "var x=1;// note\nprint x/2;";
+        let mut token_scanner = Scanner::new(source);
+        let mut ordinary = Vec::new();
+        loop {
+            let token = token_scanner.scan_token();
+            ordinary.push((
+                token.token_type,
+                token.lexeme().to_string(),
+                token.start_position,
+                token.end_position,
+            ));
+            if token.token_type == TokenType::Eof {
+                break;
+            }
+        }
+
+        let mut item_scanner = Scanner::new(source);
+        let mut through_items = Vec::new();
+        loop {
+            let item = item_scanner.scan_item();
+            if let ScannerItemKind::Token(token_type) = item.kind {
+                through_items.push((
+                    token_type,
+                    item.token.lexeme().to_string(),
+                    item.token.start_position,
+                    item.token.end_position,
+                ));
+                if token_type == TokenType::Eof {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(ordinary, through_items);
     }
 
     #[test]
