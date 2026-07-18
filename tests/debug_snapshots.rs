@@ -109,6 +109,37 @@ fn paused_snapshot_owns_frames_spans_bindings_and_sorted_globals() {
 }
 
 #[test]
+fn stepped_function_snapshot_has_protocol_safe_shape_and_size() {
+    let mut session =
+        session("fun add(a, b) {\n  var total = a + b;\n  print total;\n}\n\nadd(2, 3);\n");
+    assert!(matches!(session.start_debugging(), RunOutcome::Paused(_)));
+    assert!(matches!(
+        session.resume(ResumeMode::StepOver),
+        RunOutcome::Paused(PauseReason::Step)
+    ));
+    assert!(matches!(
+        session.resume(ResumeMode::StepInto),
+        RunOutcome::Paused(PauseReason::Step)
+    ));
+
+    let location = *session.pause_location().expect("function pause location");
+    let snapshot = session.snapshot().expect("function pause snapshot");
+    assert_eq!(snapshot.current_span, location.span);
+    assert_eq!(snapshot.frames[0].activation_id, location.activation_id);
+    assert_eq!(snapshot.frames[0].function, "add");
+    assert_eq!(snapshot.frames[0].parameters[0].binding_id.unwrap().0, 0);
+    let estimated = snapshot
+        .conservative_json_size()
+        .expect("snapshot size estimate");
+    let encoded = serde_json::to_vec(snapshot).expect("serialize snapshot");
+    assert!(
+        encoded.len() <= estimated,
+        "encoded snapshot uses {} bytes but estimate is {estimated}",
+        encoded.len()
+    );
+}
+
+#[test]
 fn suspended_caller_uses_the_child_call_site_for_liveness() {
     let source = "fun inner() {\n  print 0;\n}\nfun outer() {\n  {\n    var keep = 42;\n    inner();\n  }\n}\nouter();";
     let mut session = session(source);
