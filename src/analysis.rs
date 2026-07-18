@@ -167,7 +167,7 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
                     }
                 }
                 TokenType::Semicolon if parenthesis_depth == 0 => {
-                    control_depth -= pending_controls;
+                    pending_control_retirement = Some(pending_controls);
                     pending_controls = 0;
                 }
                 _ => {}

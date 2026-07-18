@@ -363,3 +363,34 @@ fn genuinely_nested_block_controls_still_enforce_the_combined_depth_limit() {
         MAX_ANALYSIS_NESTING_DEPTH + 1,
     );
 }
+
+fn unbraced_else_if_chain(controls: usize) -> String {
+    let mut source = String::from("if (true) nil;");
+    for _ in 1..controls {
+        source.push_str(" // completed body\nelse if (true) nil;");
+    }
+    source
+}
+
+#[test]
+fn unbraced_else_if_chains_enforce_exact_combined_depth_128_and_129() {
+    let at_limit_controls = MAX_ANALYSIS_NESTING_DEPTH - 1;
+    let at_limit = unbraced_else_if_chain(at_limit_controls);
+    assert!(analyze(&document(at_limit)).is_ok());
+
+    let over_limit_controls = MAX_ANALYSIS_NESTING_DEPTH;
+    let over_limit = unbraced_else_if_chain(over_limit_controls);
+    assert_limit(
+        over_limit,
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
+}
+
+#[test]
+fn sequential_unbraced_if_statements_do_not_accumulate_nesting_depth() {
+    let source = "if (true) nil;\n".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1);
+    let analysis = analyze(&document(source)).expect("sequential controls are not nested");
+
+    assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+}
