@@ -177,8 +177,10 @@ impl VM {
 
         vm.stack_top = vm.stack.as_mut_ptr();
 
-        let native_defined = vm.define_native("clock", clock_native);
-        debug_assert!(native_defined, "a new VM has capacity for native roots");
+        for &(name, function) in NATIVE_FUNCTIONS {
+            let native_defined = vm.define_native(name, function);
+            debug_assert!(native_defined, "a new VM has capacity for native roots");
+        }
         vm
     }
 
@@ -507,6 +509,14 @@ impl Drop for VM {
 }
 
 // Native functions
+const NATIVE_FUNCTIONS: &[(&str, NativeFn)] = &[("clock", clock_native)];
+
+pub(crate) fn is_native_name(name: &str) -> bool {
+    NATIVE_FUNCTIONS
+        .iter()
+        .any(|(native_name, _)| *native_name == name)
+}
+
 fn clock_native(_: usize, _: &[Value]) -> Value {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)

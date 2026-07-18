@@ -1,7 +1,8 @@
 use rlox::{
     AnalysisError, AnalysisLimit, HighlightKind, Interpreter, MAX_ANALYSIS_DIAGNOSTICS,
     MAX_ANALYSIS_LEXICAL_ITEMS, MAX_ANALYSIS_NESTING_DEPTH, MAX_ANALYSIS_SOURCE_BYTES,
-    RecordingHost, RevisionId, SemanticStatus, SourceDocument, SourceId, analyze,
+    RecordingHost, RevisionId, SemanticStatus, SourceDocument, SourceId, SymbolKind,
+    SymbolOccurrenceKind, SymbolResolution, analyze,
 };
 
 fn document(text: impl AsRef<str>) -> SourceDocument {
@@ -176,7 +177,13 @@ fn valid_analysis_compiles_without_executing_the_program() {
 
     assert!(analysis.diagnostics.is_empty());
     assert_eq!(analysis.semantic_status, SemanticStatus::Available);
-    assert!(analysis.symbol_occurrences.is_empty());
+    assert_eq!(analysis.symbol_occurrences.len(), 1);
+    let missing = &analysis.symbol_occurrences[0];
+    assert_eq!(missing.name, "missing");
+    assert_eq!(missing.kind, SymbolOccurrenceKind::Read);
+    assert_eq!(missing.symbol_kind, SymbolKind::Unknown);
+    assert_eq!(missing.resolution, SymbolResolution::Unresolved);
+    assert!(missing.declaration_targets.is_empty());
 }
 
 #[test]

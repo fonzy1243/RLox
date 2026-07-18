@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use crate::analysis::{
+    AnalysisCollector, ResolvedStorage, SymbolKind, SymbolOccurrence, SymbolOccurrenceKind,
+};
 use crate::chunk::{Chunk, OpCode};
 #[cfg(feature = "debug_print_code")]
 use crate::debug::disassemble_chunk;
@@ -32,6 +35,7 @@ struct Parser<'a> {
     recursion_depth: usize,
     next_binding_id: u64,
     next_debug_point_id: u64,
+    analysis: Option<AnalysisCollector>,
     compiler: Compiler<'a>,
 }
 
@@ -352,12 +356,14 @@ type CompileResult<T = ()> = Result<T, CompileAbort>;
 pub(crate) struct CompileOptions {
     pub diagnostic_limit: Option<usize>,
     pub recursion_limit: Option<usize>,
+    pub collect_symbols: bool,
 }
 
 pub(crate) struct CompileOutcome {
     pub function: Option<*mut ObjFunction>,
     pub diagnostic_count: usize,
     pub limit: Option<CompileLimit>,
+    pub symbol_occurrences: Vec<SymbolOccurrence>,
 }
 
 pub(crate) fn compile_with_options(
@@ -428,6 +434,7 @@ pub(crate) fn compile_with_options(
         recursion_depth: 0,
         next_binding_id: 0,
         next_debug_point_id: 1,
+        analysis: options.collect_symbols.then(AnalysisCollector::default),
         compiler,
     };
 
@@ -451,10 +458,21 @@ pub(crate) fn compile_with_options(
         host.diagnostic(diagnostic);
     }
 
+    let function = (!had_error && limit.is_none()).then_some(compiled_fn);
+    let symbol_occurrences = if function.is_some() {
+        parser
+            .analysis
+            .take()
+            .map_or_else(Vec::new, |value| value.finish())
+    } else {
+        Vec::new()
+    };
+
     CompileOutcome {
-        function: (!had_error && limit.is_none()).then_some(compiled_fn),
+        function,
         diagnostic_count: parser.diagnostic_count,
         limit,
+        symbol_occurrences,
     }
 }
 
@@ -594,6 +612,7 @@ fn function<'a>(
                 vm,
                 "Expect parameter name.",
                 BindingKind::Parameter,
+                SymbolKind::Parameter,
             );
             define_variable(parser, new_chunk, constant);
 
@@ -654,6 +673,7 @@ fn fun_declaration<'a>(
         vm,
         "Expect function name.",
         BindingKind::Local,
+        SymbolKind::Function,
     );
     mark_resolver_initialized(parser);
     let function_ptr = with_recursion(parser, |parser| {
@@ -734,6 +754,7 @@ fn var_declaration<'a>(
         vm,
         "Expect variable name.",
         BindingKind::Local,
+        SymbolKind::Variable,
     );
 
     if match_token(parser, scanner, TokenType::Equal) {
@@ -1612,9 +1633,16 @@ fn named_variable<'a>(
     let arg;
     let get_op;
     let set_op;
+    let storage;
+    let binding_id;
+    let declaration;
 
     if let Some(local_arg) = resolve_local(parser, &name) {
         arg = local_arg;
+        let local = &parser.compiler.locals[local_arg];
+        storage = ResolvedStorage::Local;
+        binding_id = local.binding_id;
+        declaration = Some(local.declaration);
         if arg <= 255 {
             get_op = OpCode::GetLocal;
             set_op = OpCode::SetLocal;
@@ -1624,10 +1652,17 @@ fn named_variable<'a>(
         }
     } else if let Some(upvalue_arg) = resolve_upvalue(parser, &name) {
         arg = upvalue_arg;
+        let upvalue = &parser.compiler.upvalues[upvalue_arg];
+        storage = ResolvedStorage::CapturedUpvalue;
+        binding_id = Some(upvalue.binding_id);
+        declaration = Some(upvalue.declaration);
         get_op = OpCode::GetUpvalue;
         set_op = OpCode::SetUpvalue;
     } else {
         arg = identifier_constant(parser, chunk, vm, name) as usize;
+        storage = ResolvedStorage::Global;
+        binding_id = None;
+        declaration = None;
         get_op = OpCode::GetGlobal;
         set_op = OpCode::SetGlobal;
     }
@@ -1635,6 +1670,21 @@ fn named_variable<'a>(
     let is_assignment = can_assign && match_token(parser, scanner, TokenType::Equal);
     if is_assignment {
         nested_expression(parser, scanner, chunk, vm)?;
+    }
+
+    if let Some(analysis) = parser.analysis.as_mut() {
+        analysis.record_reference(
+            &name.start[..name.length],
+            if is_assignment {
+                SymbolOccurrenceKind::Write
+            } else {
+                SymbolOccurrenceKind::Read
+            },
+            storage,
+            span,
+            binding_id,
+            declaration,
+        );
     }
 
     let op = if is_assignment { set_op } else { get_op };
@@ -1953,10 +2003,32 @@ fn parse_variable<'a>(
     vm: &mut VM,
     error_message: &str,
     binding_kind: BindingKind,
+    symbol_kind: SymbolKind,
 ) -> u8 {
+    let valid_identifier = check(parser, TokenType::Identifier);
     consume(parser, scanner, TokenType::Identifier, error_message);
 
     declare_variable(parser, binding_kind);
+
+    if valid_identifier {
+        let name = parser.previous;
+        let span = token_span(parser, name);
+        let (storage, binding_id) = if parser.compiler.scope_depth > 0 {
+            let local = &parser.compiler.locals[parser.compiler.local_count - 1];
+            (ResolvedStorage::Local, local.binding_id)
+        } else {
+            (ResolvedStorage::Global, None)
+        };
+        if let Some(analysis) = parser.analysis.as_mut() {
+            analysis.record_declaration(
+                &name.start[..name.length],
+                symbol_kind,
+                storage,
+                span,
+                binding_id,
+            );
+        }
+    }
 
     if parser.compiler.scope_depth > 0 {
         return 0;
@@ -2229,6 +2301,7 @@ mod tests {
             CompileOptions {
                 diagnostic_limit: None,
                 recursion_limit: Some(1),
+                collect_symbols: false,
             },
         );
 

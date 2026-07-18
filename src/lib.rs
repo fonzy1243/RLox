@@ -17,7 +17,8 @@ mod vm;
 pub use analysis::{
     AnalysisError, AnalysisLimit, HighlightKind, HighlightSpan, LanguageAnalysis,
     MAX_ANALYSIS_DIAGNOSTICS, MAX_ANALYSIS_LEXICAL_ITEMS, MAX_ANALYSIS_NESTING_DEPTH,
-    MAX_ANALYSIS_SOURCE_BYTES, SemanticStatus, SymbolOccurrence, SymbolOccurrenceKind, analyze,
+    MAX_ANALYSIS_SOURCE_BYTES, SemanticStatus, SymbolKind, SymbolOccurrence, SymbolOccurrenceKind,
+    SymbolResolution, analyze,
 };
 pub use debug_info::{
     BindingDebugInfo, BindingId, BindingKind, DebugPoint, DebugPointId, DebugPointKind,
