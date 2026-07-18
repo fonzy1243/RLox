@@ -8,17 +8,35 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.97.0"
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
+
 jobs:
-  test-and-package:
+  test-and-build:
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-      - name: Select pinned Rust toolchain
-        run: rustup show active-toolchain
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: >-
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN
+          --profile minimal
+          --component rustfmt
+          --component clippy
+          --target $env:WINDOWS_TARGET
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -26,21 +44,22 @@ jobs:
       - name: Test workspace
         run: cargo test --locked --workspace --all-targets
 
-      - name: Lint IDE targets
-        run: cargo clippy --locked -p oxide-ide --all-targets --no-deps -- -D warnings
+      - name: Lint protocol and language server
+        run: >-
+          cargo clippy
+          --locked
+          -p rlox-protocol
+          -p rlox-lsp
+          --all-targets
+          --no-deps
+          --
+          -D warnings
 
       - name: Build Windows release binaries
-        run: cargo build --locked --release --workspace --target x86_64-pc-windows-msvc
-
-      - name: Package release
-        shell: pwsh
-        run: ./scripts/package-windows.ps1 -SkipBuild
-
-      - name: Upload Windows package
-        uses: actions/upload-artifact@v7
-        with:
-          name: oxide-ide-windows-x86_64
-          path: |
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
+        run: >-
+          cargo build
+          --locked
+          --release
+          -p rlox
+          -p rlox-lsp
+          --target $env:WINDOWS_TARGET
