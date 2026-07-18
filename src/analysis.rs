@@ -1,7 +1,7 @@
 use crate::compiler::{CompileLimit, CompileOptions, compile_with_options};
 use crate::scanner::{Scanner, ScannerItemKind, TokenType};
 use crate::vm::VM;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     BindingId, Diagnostic, RecordingHost, RevisionId, SourceDocument, SourceId, SourceSpan,
@@ -68,7 +68,7 @@ pub struct SymbolOccurrence {
     pub symbol_kind: SymbolKind,
     pub resolution: SymbolResolution,
     pub span: SourceSpan,
-    pub declaration_targets: Vec<SourceSpan>,
+    pub declaration_targets: Arc<[SourceSpan]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +86,11 @@ struct CollectedOccurrence {
     storage: ResolvedStorage,
     span: SourceSpan,
     declaration: Option<SourceSpan>,
+}
+
+struct GlobalCandidates {
+    symbol_kind: SymbolKind,
+    declaration_targets: Arc<[SourceSpan]>,
 }
 
 #[derive(Debug, Default)]
@@ -151,17 +156,42 @@ impl AnalysisCollector {
             )
         });
 
-        let mut globals: HashMap<String, Vec<(SourceSpan, SymbolKind)>> = HashMap::new();
+        let mut global_declarations: HashMap<String, Vec<(SourceSpan, SymbolKind)>> =
+            HashMap::new();
         for value in &self.occurrences {
             if value.kind == SymbolOccurrenceKind::Declaration
                 && value.storage == ResolvedStorage::Global
             {
-                globals
+                global_declarations
                     .entry(value.name.clone())
                     .or_default()
                     .push((value.span, value.symbol_kind));
             }
         }
+        let globals = global_declarations
+            .into_iter()
+            .map(|(name, candidates)| {
+                let first_kind = candidates[0].1;
+                let symbol_kind = if candidates.iter().all(|candidate| candidate.1 == first_kind) {
+                    first_kind
+                } else {
+                    SymbolKind::Unknown
+                };
+                let declaration_targets = candidates
+                    .into_iter()
+                    .map(|candidate| candidate.0)
+                    .collect::<Vec<_>>()
+                    .into();
+                (
+                    name,
+                    GlobalCandidates {
+                        symbol_kind,
+                        declaration_targets,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let no_targets: Arc<[SourceSpan]> = Arc::from([]);
 
         self.occurrences
             .into_iter()
@@ -170,40 +200,37 @@ impl AnalysisCollector {
                     ResolvedStorage::Local => (
                         value.symbol_kind,
                         SymbolResolution::Local,
-                        value.declaration.into_iter().collect(),
+                        value
+                            .declaration
+                            .map_or_else(|| no_targets.clone(), |span| Arc::from([span])),
                     ),
                     ResolvedStorage::CapturedUpvalue => (
                         value.symbol_kind,
                         SymbolResolution::CapturedUpvalue,
-                        value.declaration.into_iter().collect(),
+                        value
+                            .declaration
+                            .map_or_else(|| no_targets.clone(), |span| Arc::from([span])),
                     ),
                     ResolvedStorage::Global if value.kind == SymbolOccurrenceKind::Declaration => (
                         value.symbol_kind,
                         SymbolResolution::Global,
-                        vec![value.span],
+                        Arc::from([value.span]),
                     ),
                     ResolvedStorage::Global => match globals.get(&value.name) {
-                        Some(candidates) if !candidates.is_empty() => {
-                            let first_kind = candidates[0].1;
-                            let symbol_kind =
-                                if candidates.iter().all(|candidate| candidate.1 == first_kind) {
-                                    first_kind
-                                } else {
-                                    SymbolKind::Unknown
-                                };
-                            (
-                                symbol_kind,
-                                SymbolResolution::Global,
-                                candidates.iter().map(|candidate| candidate.0).collect(),
-                            )
-                        }
-                        _ if crate::vm::is_native_name(&value.name) => {
-                            (SymbolKind::BuiltIn, SymbolResolution::BuiltIn, Vec::new())
-                        }
+                        Some(candidates) => (
+                            candidates.symbol_kind,
+                            SymbolResolution::Global,
+                            candidates.declaration_targets.clone(),
+                        ),
+                        _ if crate::vm::is_native_name(&value.name) => (
+                            SymbolKind::BuiltIn,
+                            SymbolResolution::BuiltIn,
+                            no_targets.clone(),
+                        ),
                         _ => (
                             SymbolKind::Unknown,
                             SymbolResolution::Unresolved,
-                            Vec::new(),
+                            no_targets.clone(),
                         ),
                     },
                 };

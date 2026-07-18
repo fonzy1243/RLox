@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rlox::{
     Interpreter, RecordingHost, RevisionId, SemanticStatus, SourceDocument, SourceId, SymbolKind,
     SymbolOccurrence, SymbolOccurrenceKind, SymbolResolution, analyze,
@@ -223,7 +225,8 @@ fn globals_are_finalized_after_compile_and_duplicate_candidates_are_observable()
     assert_eq!(declarations[0].symbol_kind, SymbolKind::Variable);
     assert_eq!(declarations[1].symbol_kind, SymbolKind::Function);
     assert!(declarations.iter().all(|value| {
-        value.declaration_targets == [value.span] && value.resolution == SymbolResolution::Global
+        value.declaration_targets.as_ref() == [value.span]
+            && value.resolution == SymbolResolution::Global
     }));
     for reference in duplicate
         .iter()
@@ -232,7 +235,7 @@ fn globals_are_finalized_after_compile_and_duplicate_candidates_are_observable()
         assert_eq!(reference.resolution, SymbolResolution::Global);
         assert_eq!(reference.symbol_kind, SymbolKind::Unknown);
         assert_eq!(
-            reference.declaration_targets,
+            reference.declaration_targets.as_ref(),
             declarations
                 .iter()
                 .map(|value| value.span)
@@ -250,6 +253,55 @@ fn globals_are_finalized_after_compile_and_duplicate_candidates_are_observable()
         named(&values, "assigned")[0].kind,
         SymbolOccurrenceKind::Write
     );
+}
+
+#[test]
+fn duplicate_global_references_share_one_source_ordered_target_allocation() {
+    let declaration_count = 96;
+    let reference_count = 96;
+    let mut source = String::new();
+    for index in 0..declaration_count {
+        source.push_str(&format!("var shared = {index};\n"));
+    }
+    for _ in 0..reference_count {
+        source.push_str("print shared;\n");
+    }
+
+    let values = occurrences(&source);
+    let shared = named(&values, "shared");
+    let declarations = shared
+        .iter()
+        .filter(|value| value.kind == SymbolOccurrenceKind::Declaration)
+        .copied()
+        .collect::<Vec<_>>();
+    let references = shared
+        .iter()
+        .filter(|value| value.kind == SymbolOccurrenceKind::Read)
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert_eq!(declarations.len(), declaration_count);
+    assert_eq!(references.len(), reference_count);
+    let expected = declarations
+        .iter()
+        .map(|value| value.span)
+        .collect::<Vec<_>>();
+    assert!(
+        declarations
+            .iter()
+            .all(|value| value.declaration_targets.as_ref() == [value.span])
+    );
+    assert!(
+        references
+            .iter()
+            .all(|value| value.declaration_targets.as_ref() == expected)
+    );
+    assert!(references[1..].iter().all(|value| {
+        Arc::ptr_eq(
+            &references[0].declaration_targets,
+            &value.declaration_targets,
+        )
+    }));
 }
 
 #[test]
