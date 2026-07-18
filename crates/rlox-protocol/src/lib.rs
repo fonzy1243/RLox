@@ -2,6 +2,7 @@ mod codec;
 mod diagnostic;
 mod types;
 mod validation;
+mod wire;
 
 pub use codec::{DecodeError, EncodeError, LineCodec};
 pub use diagnostic::{
@@ -16,3 +17,9 @@ pub use types::{
     WireDocumentError, WorkerEvent, WorkerSessionId,
 };
 pub use validation::{CommandStreamValidator, StreamValidationError, WorkerEventStreamValidator};
+pub use wire::{
+    ActivationId, BindingId, BindingSnapshot, DebugPointId, DebugValue, DiagnosticPhase,
+    DiagnosticSeverity, FrameSnapshot, MAX_SNAPSHOT_JSON_BYTES, PauseLocation, PauseReason,
+    RevisionId, SnapshotReason, SnapshotSizeError, SourceId, SourceSpan, TextPosition, ValueKind,
+    VmSnapshot,
+};

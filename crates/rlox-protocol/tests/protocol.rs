@@ -1,19 +1,32 @@
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
-use oxide_ide::{
+use rlox_protocol::{
+    ActivationId, BindingId, BindingSnapshot, DebugPointId, DebugValue, DiagnosticPhase,
+    DiagnosticSeverity, FrameSnapshot, MAX_SNAPSHOT_JSON_BYTES, PauseLocation, PauseReason,
+    RevisionId, SnapshotReason, SourceId, SourceSpan, TextPosition, ValueKind, VmSnapshot,
+};
+use rlox_protocol::{
     Command, CommandStreamValidator, DecodeError, EncodeError, Envelope, EventSequence, LineCodec,
     MAX_DIAGNOSTIC_CODE_BYTES, MAX_DIAGNOSTIC_FRAMES, MAX_DIAGNOSTIC_FUNCTION_BYTES,
     MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_OUTPUT_CHUNK_TEXT_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
     RequestId, RunId, StreamValidationError, WireDiagnostic, WireDocument, WireDocumentError,
     WireRuntimeFrame, WorkerEvent, WorkerEventStreamValidator, WorkerSessionId,
 };
-use rlox::{
-    ActivationId, BindingId, BindingSnapshot, DebugPointId, DebugValue, Diagnostic,
-    DiagnosticPhase, DiagnosticSeverity, FrameSnapshot, MAX_SNAPSHOT_JSON_BYTES, PauseLocation,
-    PauseReason, RevisionId, RuntimeFrame, SnapshotReason, SourceId, SourceSpan, TextPosition,
-    ValueKind, VmSnapshot,
-};
 use serde::{Serialize, de::DeserializeOwned};
+
+struct Diagnostic {
+    phase: DiagnosticPhase,
+    severity: DiagnosticSeverity,
+    code: String,
+    message: String,
+    span: SourceSpan,
+    frames: Vec<RuntimeFrame>,
+}
+
+struct RuntimeFrame {
+    function: String,
+    span: SourceSpan,
+}
 
 fn span(source_id: u64, revision: u64) -> SourceSpan {
     SourceSpan {
@@ -75,6 +88,20 @@ fn diagnostic(source_id: u64, revision: u64) -> Diagnostic {
             span: span(source_id, revision),
         }],
     }
+}
+
+fn wire_diagnostic(value: &Diagnostic) -> WireDiagnostic {
+    WireDiagnostic::bounded(
+        value.phase,
+        value.severity,
+        &value.code,
+        &value.message,
+        value.span,
+        value
+            .frames
+            .iter()
+            .map(|frame| (frame.function.clone(), frame.span)),
+    )
 }
 
 fn document() -> WireDocument {
@@ -222,7 +249,7 @@ fn canonical_envelopes_and_all_payload_variants_round_trip() {
         activation_id: ActivationId(1),
         dynamic_event: 4,
     };
-    let wire_diagnostic = WireDiagnostic::from(diagnostic(21, 9));
+    let wire_diagnostic = wire_diagnostic(&diagnostic(21, 9));
     let events = vec![
         WorkerEvent::Hello,
         WorkerEvent::Output {
@@ -258,7 +285,7 @@ fn canonical_envelopes_and_all_payload_variants_round_trip() {
 }
 
 #[test]
-fn every_command_and_worker_event_has_a_stable_compact_json_shape() {
+fn old_v1_goldens_match_new_representative_and_boundary_command_event_shapes() {
     let document_json =
         r#"{"source_id":21,"revision":9,"display_name":"main.lox","text":"print 1;\n"}"#;
     let command_goldens = vec![
@@ -422,6 +449,34 @@ fn every_command_and_worker_event_has_a_stable_compact_json_shape() {
             r#"{{"version":1,"worker_session_id":7,"run_id":4,"source_revision":9,"request_id":12,"sequence":8,"payload":{{"kind":"paused","payload":{{"location":{{"source_id":21,"revision":9,"span":{span_json},"debug_point_id":3,"activation_id":1,"dynamic_event":4}},"snapshot":{paused_snapshot_json}}}}}}}"#
         ),
     );
+
+    let boundary_command = Envelope {
+        version: PROTOCOL_VERSION,
+        worker_session_id: WorkerSessionId(u64::MAX),
+        run_id: RunId(u64::MAX),
+        source_revision: RevisionId(u64::MAX),
+        request_id: RequestId(u64::MAX),
+        sequence: EventSequence(u64::MAX),
+        payload: Command::Shutdown,
+    };
+    assert_golden(
+        &boundary_command,
+        r#"{"version":1,"worker_session_id":18446744073709551615,"run_id":18446744073709551615,"source_revision":18446744073709551615,"request_id":18446744073709551615,"sequence":18446744073709551615,"payload":{"kind":"shutdown"}}"#,
+    );
+
+    let boundary_event = Envelope {
+        version: PROTOCOL_VERSION,
+        worker_session_id: WorkerSessionId(u64::MAX),
+        run_id: RunId(u64::MAX),
+        source_revision: RevisionId(u64::MAX),
+        request_id: RequestId(u64::MAX),
+        sequence: EventSequence(u64::MAX),
+        payload: WorkerEvent::Completed,
+    };
+    assert_golden(
+        &boundary_event,
+        r#"{"version":1,"worker_session_id":18446744073709551615,"run_id":18446744073709551615,"source_revision":18446744073709551615,"request_id":18446744073709551615,"sequence":18446744073709551615,"payload":{"kind":"completed"}}"#,
+    );
 }
 
 #[test]
@@ -466,9 +521,6 @@ fn strict_tagged_shapes_reject_null_duplicates_and_unknown_fields() {
 fn wire_documents_are_normalized_and_never_carry_paths() {
     let valid = document();
     valid.validate().unwrap();
-    let source = valid.clone().into_source_document().unwrap();
-    assert_eq!(&*source.text, valid.text);
-    assert_eq!(source.name, "main.lox");
 
     let invalid = [
         (
@@ -550,7 +602,7 @@ fn bounded_diagnostics_truncate_at_utf8_boundaries_and_preserve_order() {
         span: span(21, 9),
         frames,
     };
-    let wire = WireDiagnostic::from(&value);
+    let wire = wire_diagnostic(&value);
 
     assert_eq!(wire.code, "worker.invalid_diagnostic_code");
     assert!(wire.code_truncated);
@@ -984,7 +1036,7 @@ fn semantic_validation_rejects_inconsistent_snapshots_without_advancing() {
         3,
         2,
         WorkerEvent::Faulted {
-            diagnostic: WireDiagnostic::from(diagnostic(21, 9)),
+            diagnostic: wire_diagnostic(&diagnostic(21, 9)),
             snapshot: invalid_value,
         },
     );
@@ -1027,7 +1079,7 @@ fn debug_number_text_accepts_only_the_runtime_canonical_domain() {
             1,
             1,
             WorkerEvent::Faulted {
-                diagnostic: WireDiagnostic::from(diagnostic(21, 9)),
+                diagnostic: wire_diagnostic(&diagnostic(21, 9)),
                 snapshot: value_snapshot,
             },
         );
@@ -1055,7 +1107,7 @@ fn debug_number_text_accepts_only_the_runtime_canonical_domain() {
             1,
             1,
             WorkerEvent::Faulted {
-                diagnostic: WireDiagnostic::from(diagnostic(21, 9)),
+                diagnostic: wire_diagnostic(&diagnostic(21, 9)),
                 snapshot: value_snapshot,
             },
         );
@@ -1079,7 +1131,7 @@ fn full_width_terminal_envelope_stays_inside_frame_budget() {
         request_id: RequestId(u64::MAX),
         sequence: EventSequence(u64::MAX),
         payload: WorkerEvent::Faulted {
-            diagnostic: WireDiagnostic::from(diagnostic(source_id, revision)),
+            diagnostic: wire_diagnostic(&diagnostic(source_id, revision)),
             snapshot: snapshot(SnapshotReason::Faulted, source_id, revision),
         },
     };

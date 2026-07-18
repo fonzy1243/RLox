@@ -155,6 +155,22 @@ fn extra_argument_exits_64() {
 }
 
 #[test]
+fn exact_debug_worker_bootstrap_emits_protocol_hello() {
+    let output = rlox()
+        .args(["--debug-worker", "--worker-session", "42"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run debug worker bootstrap");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"version\":1,\"worker_session_id\":42,\"run_id\":0,\"source_revision\":0,\"request_id\":0,\"sequence\":1,\"payload\":{\"kind\":\"hello\"}}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn repl_keeps_globals_between_lines() {
     let mut child = rlox()
         .stdin(Stdio::piped())

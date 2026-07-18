@@ -4,13 +4,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use oxide_ide::{
+use rlox_protocol::{
     Command, Envelope, EventSequence, LineCodec, PROTOCOL_VERSION, RequestId, RunId, WireDocument,
     WorkerEvent, WorkerEventStreamValidator, WorkerSessionId,
 };
-use rlox::{PauseReason, RevisionId, SnapshotReason, SourceId};
+use rlox_protocol::{PauseReason, RevisionId, SnapshotReason, SourceId};
 
-type EventRead = Result<Option<Envelope<WorkerEvent>>, oxide_ide::DecodeError>;
+type EventRead = Result<Option<Envelope<WorkerEvent>>, rlox_protocol::DecodeError>;
 
 struct ChildGuard(Option<Child>);
 
@@ -87,8 +87,8 @@ impl WorkerProcess {
     fn spawn(session: WorkerSessionId) -> Self {
         let session_text = session.0.to_string();
         let mut child = ChildGuard(Some(
-            ProcessCommand::new(env!("CARGO_BIN_EXE_oxide-ide"))
-                .args(["--worker", "--worker-session", &session_text])
+            ProcessCommand::new(env!("CARGO_BIN_EXE_rlox"))
+                .args(["--debug-worker", "--worker-session", &session_text])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -510,7 +510,7 @@ fn output_budget_emits_one_marker_then_preserves_the_terminal() {
     loop {
         match worker.receive().payload {
             WorkerEvent::Output { text } => {
-                assert!(text.len() <= oxide_ide::MAX_OUTPUT_CHUNK_TEXT_BYTES);
+                assert!(text.len() <= rlox_protocol::MAX_OUTPUT_CHUNK_TEXT_BYTES);
                 output_events += 1;
             }
             WorkerEvent::OutputTruncated => break,
@@ -593,16 +593,17 @@ fn malformed_live_command_fatally_stops_an_infinite_run() {
 #[test]
 fn worker_bootstrap_rejects_noncanonical_or_incomplete_arguments() {
     let invalid: &[&[&str]] = &[
-        &["--worker"],
-        &["--worker", "--worker-session"],
-        &["--worker", "--worker-session", "0"],
-        &["--worker", "--worker-session", "01"],
-        &["--worker", "--worker-session", "+1"],
-        &["--worker", "--worker-session", "nope"],
-        &["--worker", "--worker-session", "1", "extra"],
+        &["--debug-worker"],
+        &["--debug-worker", "--worker-session"],
+        &["--debug-worker", "--worker-session", "0"],
+        &["--debug-worker", "--worker-session", "01"],
+        &["--debug-worker", "--worker-session", "+1"],
+        &["--debug-worker", "--worker-session", "nope"],
+        &["--debug-worker", "--worker-session", "1", "extra"],
+        &["--worker", "--worker-session", "1"],
     ];
     for arguments in invalid {
-        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_oxide-ide"))
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_rlox"))
             .args(*arguments)
             .output()
             .expect("run invalid worker bootstrap");

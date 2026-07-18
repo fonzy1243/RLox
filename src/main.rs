@@ -7,6 +7,9 @@ use rlox::{
     Diagnostic, DiagnosticPhase, InterpretResult, Interpreter, RevisionId, RuntimeHost,
     SourceDocument, SourceId,
 };
+use rlox_protocol::WorkerSessionId;
+
+mod debug_worker;
 
 struct ConsoleHost {
     source: Arc<str>,
@@ -90,8 +93,32 @@ fn run_file(interpreter: &mut Interpreter, path: &str) {
 }
 
 fn main() {
-    let mut interpreter = Interpreter::new();
     let args: Vec<String> = env::args().collect();
+
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--debug-worker")
+    {
+        let session = match args.as_slice() {
+            [_, mode, session_flag, session]
+                if mode == "--debug-worker" && session_flag == "--worker-session" =>
+            {
+                parse_worker_session(session)
+            }
+            _ => None,
+        };
+        let Some(session) = session else {
+            eprintln!("Usage: lox [path]");
+            std::process::exit(64);
+        };
+        if let Err(error) = debug_worker::run_worker(std::io::stdin(), std::io::stdout(), session) {
+            eprintln!("Oxide IDE worker failed: {error:?}");
+            std::process::exit(70);
+        }
+        return;
+    }
+
+    let mut interpreter = Interpreter::new();
 
     match args.len() {
         1 => repl(&mut interpreter),
@@ -101,4 +128,15 @@ fn main() {
             std::process::exit(64);
         }
     }
+}
+
+fn parse_worker_session(value: &str) -> Option<WorkerSessionId> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(WorkerSessionId(parsed))
 }

@@ -1,4 +1,4 @@
-use rlox::{Diagnostic, DiagnosticPhase, DiagnosticSeverity, RuntimeFrame, SourceSpan};
+use crate::{DiagnosticPhase, DiagnosticSeverity, SourceSpan};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_DIAGNOSTIC_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -45,36 +45,42 @@ pub enum WireDiagnosticError {
 }
 
 impl WireDiagnostic {
-    pub fn from_diagnostic(value: &Diagnostic) -> Self {
-        let (code, code_truncated) = if valid_code(&value.code) {
-            (value.code.clone(), false)
+    pub fn bounded(
+        phase: DiagnosticPhase,
+        severity: DiagnosticSeverity,
+        code: &str,
+        message: &str,
+        span: SourceSpan,
+        frames: impl IntoIterator<Item = (String, SourceSpan)>,
+    ) -> Self {
+        let (code, code_truncated) = if valid_code(code) {
+            (code.to_string(), false)
         } else {
             (INVALID_CODE.to_string(), true)
         };
-        let (message, message_truncated) =
-            truncate_utf8(&value.message, MAX_DIAGNOSTIC_MESSAGE_BYTES);
-        let frames_truncated = value.frames.len() > MAX_DIAGNOSTIC_FRAMES;
-        let frames = value
-            .frames
-            .iter()
+        let (message, message_truncated) = truncate_utf8(message, MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        let mut input_frames = frames.into_iter();
+        let frames: Vec<_> = input_frames
+            .by_ref()
             .take(MAX_DIAGNOSTIC_FRAMES)
-            .map(WireRuntimeFrame::from_runtime_frame)
+            .map(|(function, span)| WireRuntimeFrame::bounded(function, span))
             .collect();
+        let frames_truncated = input_frames.next().is_some();
         let candidate = Self {
-            phase: value.phase,
-            severity: value.severity,
+            phase,
+            severity,
             code,
             code_truncated,
             message,
             message_truncated,
-            span: value.span,
+            span,
             frames,
             frames_truncated,
         };
 
         match candidate.json_size() {
             Ok(size) if size <= MAX_DIAGNOSTIC_JSON_BYTES => candidate,
-            _ => Self::fallback(value.phase, value.severity, value.span),
+            _ => Self::fallback(phase, severity, span),
         }
     }
 
@@ -126,26 +132,14 @@ impl WireDiagnostic {
 }
 
 impl WireRuntimeFrame {
-    fn from_runtime_frame(value: &RuntimeFrame) -> Self {
+    fn bounded(function: String, span: SourceSpan) -> Self {
         let (function, function_truncated) =
-            truncate_utf8(&value.function, MAX_DIAGNOSTIC_FUNCTION_BYTES);
+            truncate_utf8(&function, MAX_DIAGNOSTIC_FUNCTION_BYTES);
         Self {
             function,
             function_truncated,
-            span: value.span,
+            span,
         }
-    }
-}
-
-impl From<&Diagnostic> for WireDiagnostic {
-    fn from(value: &Diagnostic) -> Self {
-        Self::from_diagnostic(value)
-    }
-}
-
-impl From<Diagnostic> for WireDiagnostic {
-    fn from(value: Diagnostic) -> Self {
-        Self::from_diagnostic(&value)
     }
 }
 

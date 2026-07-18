@@ -2,8 +2,8 @@ use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 
-use super::validation::{validate_command_envelope, validate_worker_event_envelope};
-use super::{Command, Envelope, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, WorkerEvent};
+use crate::validation::{validate_command_envelope, validate_worker_event_envelope};
+use crate::{Command, Envelope, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, WorkerEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeError {

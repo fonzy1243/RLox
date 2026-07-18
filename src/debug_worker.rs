@@ -4,14 +4,29 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 
 use rlox::{
-    Diagnostic, ExecutionControl, InterpreterSession, PauseReason, ResumeMode, RevisionId,
-    RunOutcome, RuntimeHost, SourceId,
+    BindingSnapshot as EngineBindingSnapshot, DebugValue as EngineDebugValue,
+    Diagnostic as EngineDiagnostic, DiagnosticPhase as EngineDiagnosticPhase,
+    DiagnosticSeverity as EngineDiagnosticSeverity, ExecutionControl as EngineExecutionControl,
+    FrameSnapshot as EngineFrameSnapshot, InterpreterSession as EngineInterpreterSession,
+    PauseLocation as EnginePauseLocation, PauseReason as EnginePauseReason,
+    ResumeMode as EngineResumeMode, RevisionId as EngineRevisionId, RunOutcome as EngineRunOutcome,
+    RuntimeHost as EngineRuntimeHost, SnapshotReason as EngineSnapshotReason,
+    SourceDocument as EngineSourceDocument, SourceId as EngineSourceId,
+    SourceSpan as EngineSourceSpan, TextPosition as EngineTextPosition,
+    ValueKind as EngineValueKind, VmSnapshot as EngineVmSnapshot,
 };
 
-use crate::protocol::{
-    Command, CommandStreamValidator, DecodeError, EncodeError, Envelope, EventSequence, LineCodec,
-    MAX_OUTPUT_CHUNK_TEXT_BYTES, MAX_RUN_OUTPUT_FRAME_BYTES, PROTOCOL_VERSION, RequestId, RunId,
-    WireDiagnostic, WireDocument, WorkerEvent, WorkerSessionId,
+use rlox_protocol::{
+    ActivationId as WireActivationId, BindingId as WireBindingId,
+    BindingSnapshot as WireBindingSnapshot, Command, CommandStreamValidator,
+    DebugPointId as WireDebugPointId, DebugValue as WireDebugValue, DecodeError, EncodeError,
+    Envelope, EventSequence, FrameSnapshot as WireFrameSnapshot, LineCodec,
+    MAX_OUTPUT_CHUNK_TEXT_BYTES, MAX_RUN_OUTPUT_FRAME_BYTES, PROTOCOL_VERSION,
+    PauseLocation as WirePauseLocation, PauseReason as WirePauseReason, RequestId,
+    RevisionId as WireRevisionId, RunId, SnapshotReason as WireSnapshotReason,
+    SourceId as WireSourceId, SourceSpan as WireSourceSpan, TextPosition as WireTextPosition,
+    ValueKind as WireValueKind, VmSnapshot as WireVmSnapshot, WireDiagnostic, WireDocument,
+    WorkerEvent, WorkerSessionId,
 };
 
 const EVENT_QUEUE_ITEMS: usize = 256;
@@ -34,7 +49,7 @@ pub enum WorkerError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CausalRequest {
     run_id: RunId,
-    revision: RevisionId,
+    revision: WireRevisionId,
     request_id: RequestId,
 }
 
@@ -51,8 +66,8 @@ impl CausalRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveRun {
     run_id: RunId,
-    revision: RevisionId,
-    source_id: SourceId,
+    revision: WireRevisionId,
+    source_id: WireSourceId,
 }
 
 impl ActiveRun {
@@ -73,7 +88,7 @@ enum WorkerPhase {
 struct ControlState {
     phase: WorkerPhase,
     active: Option<ActiveRun>,
-    control: Option<ExecutionControl>,
+    control: Option<EngineExecutionControl>,
     pending_pause: Option<CausalRequest>,
     pending_stop: Option<CausalRequest>,
     fatal: bool,
@@ -104,7 +119,7 @@ enum OwnerAction {
         driver: CausalRequest,
     },
     Resume {
-        mode: ResumeMode,
+        mode: EngineResumeMode,
         driver: CausalRequest,
     },
     CancelPaused,
@@ -136,7 +151,7 @@ impl ControlPlane {
             .map_err(|_| WorkerError::StateCorrupted)
     }
 
-    fn install_control(&self, control: ExecutionControl) -> Result<(), WorkerError> {
+    fn install_control(&self, control: EngineExecutionControl) -> Result<(), WorkerError> {
         let mut state = self.state.lock().map_err(|_| WorkerError::StateCorrupted)?;
         if state.phase != WorkerPhase::Active || state.control.is_some() {
             return Err(WorkerError::StateCorrupted);
@@ -153,7 +168,7 @@ impl ControlPlane {
 
     fn commit_pause(
         &self,
-        reason: PauseReason,
+        reason: EnginePauseReason,
         driver: CausalRequest,
     ) -> Result<PauseCommit, WorkerError> {
         let mut state = self.state.lock().map_err(|_| WorkerError::StateCorrupted)?;
@@ -164,7 +179,7 @@ impl ControlPlane {
             state.pending_pause = None;
             return Ok(PauseCommit::StopWon);
         }
-        let causal = if reason == PauseReason::Explicit {
+        let causal = if reason == EnginePauseReason::Explicit {
             state
                 .pending_pause
                 .take()
@@ -459,7 +474,7 @@ impl WorkerHost {
     }
 }
 
-impl RuntimeHost for WorkerHost {
+impl EngineRuntimeHost for WorkerHost {
     fn output(&mut self, mut text: String) {
         text.push('\n');
         let result = self
@@ -468,16 +483,169 @@ impl RuntimeHost for WorkerHost {
         self.record(result);
     }
 
-    fn diagnostic(&mut self, value: Diagnostic) {
+    fn diagnostic(&mut self, value: EngineDiagnostic) {
         let result = self.causal().and_then(|causal| {
             self.sink.event(
                 causal,
                 WorkerEvent::Diagnostic {
-                    diagnostic: WireDiagnostic::from(value),
+                    diagnostic: wire_diagnostic(&value),
                 },
             )
         });
         self.record(result);
+    }
+}
+
+fn engine_document(document: WireDocument) -> Result<EngineSourceDocument, WorkerError> {
+    document
+        .validate()
+        .map_err(|_| WorkerError::InvalidCommandStream)?;
+    Ok(EngineSourceDocument::new(
+        EngineSourceId(document.source_id.0),
+        EngineRevisionId(document.revision.0),
+        document.display_name,
+        document.text,
+    ))
+}
+
+fn wire_diagnostic(value: &EngineDiagnostic) -> WireDiagnostic {
+    WireDiagnostic::bounded(
+        match value.phase {
+            EngineDiagnosticPhase::Scanner => rlox_protocol::DiagnosticPhase::Scanner,
+            EngineDiagnosticPhase::Parser => rlox_protocol::DiagnosticPhase::Parser,
+            EngineDiagnosticPhase::Compiler => rlox_protocol::DiagnosticPhase::Compiler,
+            EngineDiagnosticPhase::Runtime => rlox_protocol::DiagnosticPhase::Runtime,
+            EngineDiagnosticPhase::Worker => rlox_protocol::DiagnosticPhase::Worker,
+        },
+        match value.severity {
+            EngineDiagnosticSeverity::Error => rlox_protocol::DiagnosticSeverity::Error,
+            EngineDiagnosticSeverity::Warning => rlox_protocol::DiagnosticSeverity::Warning,
+        },
+        &value.code,
+        &value.message,
+        wire_span(value.span),
+        value
+            .frames
+            .iter()
+            .map(|frame| (frame.function.clone(), wire_span(frame.span))),
+    )
+}
+
+fn wire_pause_reason(value: EnginePauseReason) -> WirePauseReason {
+    match value {
+        EnginePauseReason::DebugPoint => WirePauseReason::DebugPoint,
+        EnginePauseReason::Step => WirePauseReason::Step,
+        EnginePauseReason::Explicit => WirePauseReason::Explicit,
+    }
+}
+
+fn wire_pause_location(value: EnginePauseLocation) -> WirePauseLocation {
+    WirePauseLocation {
+        source_id: WireSourceId(value.source_id.0),
+        revision: WireRevisionId(value.revision.0),
+        span: wire_span(value.span),
+        debug_point_id: WireDebugPointId(value.debug_point_id.0),
+        activation_id: WireActivationId(value.activation_id.0),
+        dynamic_event: value.dynamic_event,
+    }
+}
+
+fn wire_span(value: EngineSourceSpan) -> WireSourceSpan {
+    WireSourceSpan {
+        source_id: WireSourceId(value.source_id.0),
+        revision: WireRevisionId(value.revision.0),
+        start: wire_position(value.start),
+        end: wire_position(value.end),
+    }
+}
+
+fn wire_position(value: EngineTextPosition) -> WireTextPosition {
+    WireTextPosition {
+        byte_offset: value.byte_offset,
+        line: value.line,
+        column: value.column,
+    }
+}
+
+fn wire_snapshot(value: EngineVmSnapshot) -> WireVmSnapshot {
+    WireVmSnapshot {
+        reason: match value.reason {
+            EngineSnapshotReason::Paused(reason) => {
+                WireSnapshotReason::Paused(wire_pause_reason(reason))
+            }
+            EngineSnapshotReason::Faulted => WireSnapshotReason::Faulted,
+            EngineSnapshotReason::Cancelled => WireSnapshotReason::Cancelled,
+        },
+        current_span: wire_span(value.current_span),
+        frames: value.frames.into_iter().map(wire_frame).collect(),
+        frames_truncated: value.frames_truncated,
+        globals: value.globals.into_iter().map(wire_binding).collect(),
+        globals_truncated: value.globals_truncated,
+    }
+}
+
+fn wire_frame(value: EngineFrameSnapshot) -> WireFrameSnapshot {
+    WireFrameSnapshot {
+        activation_id: WireActivationId(value.activation_id.0),
+        function: value.function,
+        function_truncated: value.function_truncated,
+        current_span: wire_span(value.current_span),
+        call_site: value.call_site.map(wire_span),
+        parameters: value.parameters.into_iter().map(wire_binding).collect(),
+        parameters_truncated: value.parameters_truncated,
+        locals: value.locals.into_iter().map(wire_binding).collect(),
+        locals_truncated: value.locals_truncated,
+        upvalues: value.upvalues.into_iter().map(wire_binding).collect(),
+        upvalues_truncated: value.upvalues_truncated,
+    }
+}
+
+fn wire_binding(value: EngineBindingSnapshot) -> WireBindingSnapshot {
+    WireBindingSnapshot {
+        binding_id: value.binding_id.map(|id| WireBindingId(id.0)),
+        name: value.name,
+        name_truncated: value.name_truncated,
+        binding_kind: value.binding_kind,
+        value_kind: wire_value_kind(value.value_kind),
+        value: wire_value(value.value),
+    }
+}
+
+fn wire_value_kind(value: EngineValueKind) -> WireValueKind {
+    match value {
+        EngineValueKind::Nil => WireValueKind::Nil,
+        EngineValueKind::Bool => WireValueKind::Bool,
+        EngineValueKind::Number => WireValueKind::Number,
+        EngineValueKind::String => WireValueKind::String,
+        EngineValueKind::Function => WireValueKind::Function,
+        EngineValueKind::Closure => WireValueKind::Closure,
+        EngineValueKind::Native => WireValueKind::Native,
+        EngineValueKind::List => WireValueKind::List,
+        EngineValueKind::Cycle => WireValueKind::Cycle,
+        EngineValueKind::Truncated => WireValueKind::Truncated,
+    }
+}
+
+fn wire_value(value: EngineDebugValue) -> WireDebugValue {
+    match value {
+        EngineDebugValue::Nil => WireDebugValue::Nil,
+        EngineDebugValue::Bool(value) => WireDebugValue::Bool(value),
+        EngineDebugValue::Number(value) => WireDebugValue::Number(value),
+        EngineDebugValue::String(value) => WireDebugValue::String(value),
+        EngineDebugValue::Function(value) => WireDebugValue::Function(value),
+        EngineDebugValue::Closure(value) => WireDebugValue::Closure(value),
+        EngineDebugValue::Native(value) => WireDebugValue::Native(value),
+        EngineDebugValue::List {
+            object_id,
+            items,
+            truncated,
+        } => WireDebugValue::List {
+            object_id,
+            items: items.into_iter().map(wire_value).collect(),
+            truncated,
+        },
+        EngineDebugValue::Cycle { object_id } => WireDebugValue::Cycle { object_id },
+        EngineDebugValue::Truncated => WireDebugValue::Truncated,
     }
 }
 
@@ -498,7 +666,7 @@ where
         version: PROTOCOL_VERSION,
         worker_session_id,
         run_id: RunId(0),
-        source_revision: RevisionId(0),
+        source_revision: WireRevisionId(0),
         request_id: RequestId(0),
         sequence: EventSequence(1),
         payload: WorkerEvent::Hello,
@@ -571,9 +739,7 @@ fn owner_loop(
         };
     };
 
-    let source = document
-        .into_source_document()
-        .map_err(|_| WorkerError::InvalidCommandStream)?;
+    let source = engine_document(document)?;
     let driver_slot = Arc::new(Mutex::new(driver));
     let host_failure = Arc::new(Mutex::new(None));
     let host = WorkerHost {
@@ -581,7 +747,7 @@ fn owner_loop(
         driver: driver_slot.clone(),
         failed: host_failure.clone(),
     };
-    let mut session = InterpreterSession::new(source, host);
+    let mut session = EngineInterpreterSession::new(source, host);
     control.install_control(session.control())?;
     let mut current_driver = driver;
     let mut outcome = if debugging {
@@ -601,10 +767,10 @@ fn owner_loop(
             return Err(WorkerError::InvalidCommandStream);
         }
         match outcome {
-            RunOutcome::Paused(reason) => {
+            EngineRunOutcome::Paused(reason) => {
                 match control.commit_pause(reason, current_driver)? {
                     PauseCommit::StopWon => {
-                        outcome = session.resume(ResumeMode::Continue);
+                        outcome = session.resume(EngineResumeMode::Continue);
                         continue;
                     }
                     PauseCommit::Emit(causal) => {
@@ -615,7 +781,13 @@ fn owner_loop(
                             .snapshot()
                             .cloned()
                             .ok_or(WorkerError::StateCorrupted)?;
-                        sink.event(causal, WorkerEvent::Paused { location, snapshot })?;
+                        sink.event(
+                            causal,
+                            WorkerEvent::Paused {
+                                location: wire_pause_location(location),
+                                snapshot: wire_snapshot(snapshot),
+                            },
+                        )?;
                     }
                 }
 
@@ -628,7 +800,7 @@ fn owner_loop(
                         outcome = session.resume(mode);
                     }
                     OwnerAction::CancelPaused => {
-                        outcome = session.resume(ResumeMode::Continue);
+                        outcome = session.resume(EngineResumeMode::Continue);
                     }
                     OwnerAction::WriterFailed | OwnerAction::Fatal => {
                         return Err(WorkerError::ChannelClosed);
@@ -637,12 +809,12 @@ fn owner_loop(
                     _ => return Err(WorkerError::StateCorrupted),
                 }
             }
-            RunOutcome::Completed => {
+            EngineRunOutcome::Completed => {
                 let causal = control.commit_terminal(false, current_driver)?;
                 sink.event(causal, WorkerEvent::Completed)?;
                 return wait_for_shutdown(actions);
             }
-            RunOutcome::Faulted(ref diagnostic) => {
+            EngineRunOutcome::Faulted(ref diagnostic) => {
                 let causal = control.commit_terminal(false, current_driver)?;
                 let snapshot = session
                     .snapshot()
@@ -651,22 +823,27 @@ fn owner_loop(
                 sink.event(
                     causal,
                     WorkerEvent::Faulted {
-                        diagnostic: WireDiagnostic::from(diagnostic),
-                        snapshot,
+                        diagnostic: wire_diagnostic(diagnostic),
+                        snapshot: wire_snapshot(snapshot),
                     },
                 )?;
                 return wait_for_shutdown(actions);
             }
-            RunOutcome::Cancelled => {
+            EngineRunOutcome::Cancelled => {
                 let causal = control.commit_terminal(true, current_driver)?;
                 let snapshot = session
                     .snapshot()
                     .cloned()
                     .ok_or(WorkerError::StateCorrupted)?;
-                sink.event(causal, WorkerEvent::Cancelled { snapshot })?;
+                sink.event(
+                    causal,
+                    WorkerEvent::Cancelled {
+                        snapshot: wire_snapshot(snapshot),
+                    },
+                )?;
                 return wait_for_shutdown(actions);
             }
-            RunOutcome::Rejected(_) => return Err(WorkerError::StateCorrupted),
+            EngineRunOutcome::Rejected(_) => return Err(WorkerError::StateCorrupted),
         }
     }
 }
@@ -882,10 +1059,10 @@ fn admit_command(
                                     ));
                                 } else {
                                     let mode = match envelope.payload {
-                                        Command::Continue => ResumeMode::Continue,
-                                        Command::StepInto => ResumeMode::StepInto,
-                                        Command::StepOver => ResumeMode::StepOver,
-                                        Command::StepOut => ResumeMode::StepOut,
+                                        Command::Continue => EngineResumeMode::Continue,
+                                        Command::StepInto => EngineResumeMode::StepInto,
+                                        Command::StepOver => EngineResumeMode::StepOver,
+                                        Command::StepOut => EngineResumeMode::StepOut,
                                         _ => unreachable!(),
                                     };
                                     state.phase = WorkerPhase::Active;

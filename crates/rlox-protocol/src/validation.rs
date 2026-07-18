@@ -1,9 +1,9 @@
-use rlox::{
+use crate::{
     BindingSnapshot, DebugValue, MAX_SNAPSHOT_JSON_BYTES, RevisionId, SnapshotReason, SourceId,
     SourceSpan, ValueKind, VmSnapshot,
 };
 
-use super::{
+use crate::{
     Command, Envelope, EventSequence, MAX_CONTROL_TEXT_BYTES, MAX_OUTPUT_CHUNK_TEXT_BYTES,
     PROTOCOL_VERSION, RequestId, RunId, WorkerEvent, WorkerSessionId,
 };
@@ -504,7 +504,7 @@ fn valid_number_text(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Command, Envelope, WorkerEvent};
+    use crate::{Command, Envelope, WorkerEvent};
 
     fn command(sequence: u64, payload: Command) -> Envelope<Command> {
         Envelope {

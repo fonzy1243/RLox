@@ -2186,7 +2186,7 @@ dependencies = [
  "egui_kittest",
  "embed-resource",
  "rfd",
- "rlox",
+ "rlox-protocol",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
@@ -2566,6 +2566,15 @@ dependencies = [
 
 [[package]]
 name = "rlox"
+version = "0.1.0"
+dependencies = [
+ "rlox-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rlox-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",

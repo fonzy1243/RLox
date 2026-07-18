@@ -1,4 +1,4 @@
-use rlox::{PauseLocation, RevisionId, SourceDocument, SourceId, VmSnapshot};
+use crate::{PauseLocation, RevisionId, SourceId, VmSnapshot};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::WireDiagnostic;
@@ -106,16 +106,6 @@ impl WireDocument {
         }
         Ok(())
     }
-
-    pub fn into_source_document(self) -> Result<SourceDocument, WireDocumentError> {
-        self.validate()?;
-        Ok(SourceDocument::new(
-            self.source_id,
-            self.revision,
-            self.display_name,
-            self.text,
-        ))
-    }
 }
 
 fn conservative_json_string_size(value: &str) -> usize {
@@ -132,14 +122,6 @@ fn conservative_json_string_size(value: &str) -> usize {
         size = updated;
     }
     size
-}
-
-impl TryFrom<WireDocument> for SourceDocument {
-    type Error = WireDocumentError;
-
-    fn try_from(value: WireDocument) -> Result<Self, Self::Error> {
-        value.into_source_document()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
