@@ -325,3 +325,41 @@ fn mismatched_closers_do_not_hide_open_delimiter_depth() {
         MAX_ANALYSIS_NESTING_DEPTH + 1,
     );
 }
+
+#[test]
+fn sequential_block_controls_do_not_accumulate_nesting_depth() {
+    for count in [MAX_ANALYSIS_NESTING_DEPTH, MAX_ANALYSIS_NESTING_DEPTH + 1] {
+        let source = "if (true) {}\n".repeat(count);
+        let analysis = analyze(&document(&source))
+            .unwrap_or_else(|error| panic!("{count} sequential if statements: {error:?}"));
+        assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+    }
+
+    let mixed = ["if (true) {}", "while (false) {}", "switch (nil) {}"]
+        .into_iter()
+        .cycle()
+        .take(MAX_ANALYSIS_NESTING_DEPTH + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let analysis = analyze(&document(mixed)).expect("sequential mixed controls are not nested");
+    assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+}
+
+#[test]
+fn genuinely_nested_block_controls_still_enforce_the_combined_depth_limit() {
+    let at_limit = MAX_ANALYSIS_NESTING_DEPTH / 2;
+    let source = format!("{}{}", "if (true) {".repeat(at_limit), "}".repeat(at_limit));
+    assert!(analyze(&document(source)).is_ok());
+
+    let over_limit = at_limit + 1;
+    let source = format!(
+        "{}{}",
+        "if (true) {".repeat(over_limit),
+        "}".repeat(over_limit)
+    );
+    assert_limit(
+        source,
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
+}

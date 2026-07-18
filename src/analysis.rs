@@ -88,6 +88,8 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
     let mut delimiters = Vec::with_capacity(MAX_ANALYSIS_NESTING_DEPTH + 1);
     let mut parenthesis_depth = 0usize;
     let mut control_depth = 0usize;
+    let mut pending_controls = 0usize;
+    let mut pending_control_retirement = None;
     let mut unary_depth = 0usize;
     loop {
         let item = scanner.scan_item();
@@ -110,15 +112,27 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
         }
 
         if let ScannerItemKind::Token(token_type) = item.kind {
+            if let Some(completed_controls) = pending_control_retirement.take() {
+                if token_type == TokenType::Else {
+                    pending_controls += completed_controls;
+                } else {
+                    control_depth -= completed_controls;
+                }
+            }
+
             match token_type {
                 TokenType::LeftParen => {
-                    delimiters.push(TokenType::LeftParen);
+                    delimiters.push((TokenType::LeftParen, 0));
                     parenthesis_depth += 1;
                 }
-                TokenType::LeftBracket => delimiters.push(TokenType::LeftBracket),
-                TokenType::LeftBrace => delimiters.push(TokenType::LeftBrace),
+                TokenType::LeftBracket => delimiters.push((TokenType::LeftBracket, 0)),
+                TokenType::LeftBrace => {
+                    delimiters.push((TokenType::LeftBrace, pending_controls));
+                    pending_controls = 0;
+                }
                 TokenType::If | TokenType::While | TokenType::For | TokenType::Switch => {
                     control_depth += 1;
+                    pending_controls += 1;
                 }
                 TokenType::Bang | TokenType::Minus => unary_depth += 1,
                 _ => {}
@@ -135,18 +149,27 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
 
             match token_type {
                 TokenType::RightParen => {
-                    if delimiters.last() == Some(&TokenType::LeftParen) {
+                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftParen) {
                         delimiters.pop();
                         parenthesis_depth -= 1;
                     }
                 }
-                TokenType::RightBracket if delimiters.last() == Some(&TokenType::LeftBracket) => {
+                TokenType::RightBracket
+                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftBracket) =>
+                {
                     delimiters.pop();
                 }
-                TokenType::RightBrace if delimiters.last() == Some(&TokenType::LeftBrace) => {
-                    delimiters.pop();
+                TokenType::RightBrace
+                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftBrace) =>
+                {
+                    if let Some((_, completed_controls)) = delimiters.pop() {
+                        pending_control_retirement = Some(completed_controls);
+                    }
                 }
-                TokenType::Semicolon if parenthesis_depth == 0 => control_depth = 0,
+                TokenType::Semicolon if parenthesis_depth == 0 => {
+                    control_depth -= pending_controls;
+                    pending_controls = 0;
+                }
                 _ => {}
             }
             if !matches!(
