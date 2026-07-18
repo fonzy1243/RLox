@@ -33,6 +33,14 @@ fn start_debugging_pauses_before_the_first_statement_and_resume_makes_progress()
 }
 
 #[test]
+fn blank_script_debug_entry_has_a_protocol_safe_nonzero_id() {
+    let mut session = session("");
+
+    assert!(matches!(session.start_debugging(), RunOutcome::Paused(_)));
+    assert_ne!(session.pause_location().unwrap().debug_point_id.0, 0);
+}
+
+#[test]
 fn empty_function_uses_its_entry_without_a_zero_progress_pause_chain() {
     let mut session = session("fun empty() {} empty(); print 1;");
     assert!(matches!(session.start_debugging(), RunOutcome::Paused(_)));

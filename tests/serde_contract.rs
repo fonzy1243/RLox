@@ -378,3 +378,108 @@ fn snapshot_records_round_trip_and_reject_unknown_fields() {
     );
     assert_rejects::<ValueKind>(r#""other""#);
 }
+
+#[test]
+fn snapshot_estimator_covers_every_schema_variant_and_exact_cap_edges() {
+    let escaped = "\0\"\\é😀\u{007f}".to_string();
+    let values = vec![
+        (ValueKind::Nil, DebugValue::Nil),
+        (ValueKind::Bool, DebugValue::Bool(true)),
+        (ValueKind::Number, DebugValue::Number(escaped.clone())),
+        (ValueKind::String, DebugValue::String(escaped.clone())),
+        (ValueKind::Function, DebugValue::Function(escaped.clone())),
+        (ValueKind::Closure, DebugValue::Closure(escaped.clone())),
+        (ValueKind::Native, DebugValue::Native(escaped.clone())),
+        (
+            ValueKind::List,
+            DebugValue::List {
+                object_id: u64::MAX,
+                items: vec![DebugValue::Bool(false), DebugValue::String(escaped)],
+                truncated: true,
+            },
+        ),
+        (
+            ValueKind::Cycle,
+            DebugValue::Cycle {
+                object_id: u64::MAX,
+            },
+        ),
+        (ValueKind::Truncated, DebugValue::Truncated),
+    ];
+    let bindings = values
+        .into_iter()
+        .enumerate()
+        .map(|(index, (value_kind, value))| BindingSnapshot {
+            binding_id: (index % 2 == 0).then_some(BindingId(u64::MAX)),
+            name: format!("binding-{index}"),
+            name_truncated: index % 2 == 0,
+            binding_kind: "local".to_string(),
+            value_kind,
+            value,
+        })
+        .collect::<Vec<_>>();
+
+    for reason in [
+        SnapshotReason::Paused(PauseReason::DebugPoint),
+        SnapshotReason::Paused(PauseReason::Step),
+        SnapshotReason::Paused(PauseReason::Explicit),
+        SnapshotReason::Faulted,
+        SnapshotReason::Cancelled,
+    ] {
+        for call_site in [None, Some(span())] {
+            let snapshot = VmSnapshot {
+                reason,
+                current_span: span(),
+                frames: vec![FrameSnapshot {
+                    activation_id: ActivationId(u64::MAX),
+                    function: "\0\"\\é😀".to_string(),
+                    function_truncated: true,
+                    current_span: span(),
+                    call_site,
+                    parameters: bindings.clone(),
+                    parameters_truncated: true,
+                    locals: bindings.clone(),
+                    locals_truncated: true,
+                    upvalues: bindings.clone(),
+                    upvalues_truncated: true,
+                }],
+                frames_truncated: true,
+                globals: bindings.clone(),
+                globals_truncated: true,
+            };
+            let estimate = snapshot.conservative_json_size().unwrap();
+            let actual = serde_json::to_vec(&snapshot).unwrap().len();
+            assert!(actual <= estimate, "actual={actual}, estimate={estimate}");
+        }
+    }
+
+    for target in [
+        MAX_SNAPSHOT_JSON_BYTES - 1,
+        MAX_SNAPSHOT_JSON_BYTES,
+        MAX_SNAPSHOT_JSON_BYTES + 1,
+    ] {
+        let mut snapshot = VmSnapshot {
+            reason: SnapshotReason::Faulted,
+            current_span: span(),
+            frames: Vec::new(),
+            frames_truncated: true,
+            globals: vec![BindingSnapshot {
+                binding_id: None,
+                name: "boundary".to_string(),
+                name_truncated: false,
+                binding_kind: "global".to_string(),
+                value_kind: ValueKind::String,
+                value: DebugValue::String(String::new()),
+            }],
+            globals_truncated: true,
+        };
+        let base = snapshot.conservative_json_size().unwrap();
+        let DebugValue::String(payload) = &mut snapshot.globals[0].value else {
+            unreachable!()
+        };
+        *payload = "x".repeat(target - base);
+
+        assert_eq!(snapshot.conservative_json_size().unwrap(), target);
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= target);
+    }
+}

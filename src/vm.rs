@@ -6,8 +6,8 @@ use crate::compiler::compile;
 use crate::object::{
     FORMAT_BYTE_LIMIT, FORMAT_DEPTH_LIMIT, FORMAT_ELEMENT_LIMIT, FORMAT_NODE_LIMIT,
     FORMAT_TOTAL_ELEMENT_LIMIT, NativeFn, Obj, ObjClosure, ObjFunction, ObjList, ObjString,
-    ObjType, ObjUpvalue, TRUNCATION_MARKER, allocate_closure, allocate_list, allocate_native,
-    allocate_upvalue, copy_string, free_object, take_string,
+    ObjType, ObjUpvalue, SemanticMetadataCache, TRUNCATION_MARKER, allocate_closure, allocate_list,
+    allocate_native, allocate_upvalue, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -433,17 +433,16 @@ impl VM {
         }
         let frame = self.frames[self.frame_count - 1];
         let function = self.frame_function(self.frame_count - 1, frame.ip)?;
-        let function = unsafe { &*function };
-        if function.chunk.code.is_empty()
-            || function.chunk.code.len() != function.chunk.spans.len()
-            || frame.ip >= function.chunk.code.len()
+        let function_ref = unsafe { &*function };
+        if function_ref.chunk.code.is_empty()
+            || function_ref.chunk.code.len() != function_ref.chunk.spans.len()
+            || frame.ip >= function_ref.chunk.code.len()
         {
             return Err(VmFault::new("Invalid semantic point.", frame.ip));
         }
-        Ok(
-            crate::session::semantic_point(&function.debug_info.points, frame.ip)
-                .map(|point| (frame.activation_id, point)),
-        )
+        let metadata = self.validate_semantic_metadata(function, frame.ip)?;
+        Ok(crate::session::semantic_point(&metadata.points, frame.ip)
+            .map(|point| (frame.activation_id, point)))
     }
 
     pub(crate) fn register_object(
@@ -1297,6 +1296,89 @@ impl VM {
             self.require_object_kind(function as *mut Obj, ObjType::Function, offset)?
                 as *mut ObjFunction,
         )
+    }
+
+    fn validate_semantic_metadata<'a>(
+        &'a self,
+        function: *mut ObjFunction,
+        offset: usize,
+    ) -> Result<&'a SemanticMetadataCache, VmFault> {
+        let function_ref: &'a ObjFunction = unsafe { &*function };
+        if let Some(cache) = function_ref.semantic_metadata_cache.get() {
+            return if cache.opcode_starts.get(offset).copied() == Some(true) {
+                Ok(cache)
+            } else {
+                Err(VmFault::new("Invalid debug metadata.", offset))
+            };
+        }
+        #[cfg(test)]
+        function_ref
+            .semantic_metadata_validation_runs
+            .set(function_ref.semantic_metadata_validation_runs.get() + 1);
+        let metadata = &function_ref.debug_info;
+        let span_is_valid = |span: SourceSpan| {
+            span.source_id.0 != 0
+                && span.revision.0 != 0
+                && span.source_id == metadata.source_id
+                && span.revision == metadata.revision
+                && span.start.byte_offset <= span.end.byte_offset
+                && span.start.line > 0
+                && span.start.column > 0
+                && span.end.line > 0
+                && span.end.column > 0
+                && (span.start.byte_offset != span.end.byte_offset
+                    || (span.start.line == span.end.line && span.start.column == span.end.column))
+                && span.start.line <= span.end.line
+                && (span.start.line != span.end.line || span.start.column <= span.end.column)
+        };
+        if metadata.source_id.0 == 0
+            || metadata.revision.0 == 0
+            || !span_is_valid(metadata.declaration)
+            || metadata.points.is_empty()
+        {
+            return Err(VmFault::new("Invalid debug metadata.", offset));
+        }
+
+        let code_len = function_ref.chunk.code.len();
+        let mut opcode_starts = vec![false; code_len];
+        let mut instruction_offset = 0usize;
+        while instruction_offset < code_len {
+            opcode_starts[instruction_offset] = true;
+            let width = instruction_width_at(self, function, instruction_offset)
+                .map_err(|_| VmFault::new("Invalid debug metadata.", offset))?;
+            instruction_offset = instruction_offset
+                .checked_add(width)
+                .filter(|next| *next <= code_len)
+                .ok_or_else(|| VmFault::new("Invalid debug metadata.", offset))?;
+        }
+        if opcode_starts.get(offset).copied() != Some(true) {
+            return Err(VmFault::new("Invalid debug metadata.", offset));
+        }
+
+        let mut previous_point_offset = None;
+        for point in &metadata.points {
+            if point.id.0 == 0
+                || previous_point_offset.is_some_and(|previous| point.offset < previous)
+                || opcode_starts.get(point.offset).copied() != Some(true)
+                || !span_is_valid(point.span)
+            {
+                return Err(VmFault::new("Invalid debug metadata.", offset));
+            }
+            previous_point_offset = Some(point.offset);
+        }
+
+        let cache = SemanticMetadataCache {
+            opcode_starts: opcode_starts.into_boxed_slice(),
+            points: metadata.points.clone().into_boxed_slice(),
+        };
+        function_ref
+            .semantic_metadata_cache
+            .set(cache)
+            .map_err(|_| VmFault::new("Invalid debug metadata.", offset))?;
+        function_ref
+            .semantic_metadata_cache
+            .get()
+            .ok_or_else(|| VmFault::new("Invalid debug metadata.", offset))
     }
 
     fn upvalue_location(
@@ -2175,6 +2257,120 @@ mod tests {
     }
 
     #[test]
+    fn semantic_point_rejects_invalid_debug_point_metadata() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        let function = active_function(&vm);
+        let original_points = unsafe { (*function).debug_info.points.clone() };
+
+        unsafe {
+            (&mut (*function).debug_info.points)[0].offset = (*function).chunk.code.len();
+        }
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe {
+            (*function).debug_info.points = original_points.clone();
+            (&mut (*function).debug_info.points)[0].span.source_id = SourceId(999);
+        }
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe { (*function).debug_info.points = original_points };
+        vm.cleanup_execution();
+    }
+
+    #[test]
+    fn semantic_point_rejects_wire_invalid_ids_and_spans() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        let function = active_function(&vm);
+        let original = unsafe { (*function).debug_info.clone() };
+
+        unsafe { (&mut (*function).debug_info.points)[1].id = crate::DebugPointId(0) };
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe {
+            (*function).debug_info = original.clone();
+            let span = &mut (&mut (*function).debug_info.points)[1].span;
+            span.end.byte_offset = span.start.byte_offset;
+            span.end.column = span.start.column + 1;
+        }
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe {
+            (*function).debug_info = original.clone();
+            let span = &mut (&mut (*function).debug_info.points)[1].span;
+            span.start.line = span.end.line + 1;
+        }
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe {
+            (*function).debug_info = original.clone();
+            (*function).debug_info.source_id = SourceId(0);
+            (*function).debug_info.declaration.source_id = SourceId(0);
+            for point in &mut (*function).debug_info.points {
+                point.span.source_id = SourceId(0);
+            }
+        }
+        assert!(vm.current_semantic_point().is_err());
+
+        unsafe { (*function).debug_info = original };
+        vm.cleanup_execution();
+    }
+
+    #[test]
+    fn semantic_point_rejects_an_operand_ip_after_metadata_is_cached() {
+        let (mut vm, _host) = prepared_vm("print 1;");
+        assert!(vm.current_semantic_point().unwrap().is_some());
+        let original_ip = vm.frames[0].ip;
+        vm.frames[0].ip = 1;
+
+        assert!(vm.current_semantic_point().is_err());
+
+        vm.frames[0].ip = original_ip;
+        vm.cleanup_execution();
+    }
+
+    #[test]
+    fn semantic_metadata_full_validation_runs_once_in_a_large_hot_loop() {
+        let loop_body = std::iter::repeat_n("i = i + 1;", 64)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!(
+            "fun hot() {{\n  var i = 0;\n  while (i < 8192) {{\n{loop_body}\n  }}\n}}\nhot();"
+        );
+        let (mut vm, mut host) = prepared_vm(&source);
+        let script_function = active_function(&vm);
+        let mut hot_function = None;
+        let mut dispatched = 0usize;
+
+        loop {
+            vm.current_semantic_point().unwrap();
+            if vm.frame_count == 2 {
+                hot_function = Some(unsafe { (*vm.frames[1].closure).function });
+            }
+            dispatched += 1;
+            match vm.dispatch_one(&mut host).unwrap() {
+                DispatchResult::Continue => {}
+                DispatchResult::Complete => break,
+            }
+        }
+
+        assert!(dispatched > 8_000);
+        assert_eq!(
+            unsafe {
+                (*hot_function.expect("hot function was called"))
+                    .semantic_metadata_validation_runs
+                    .get()
+            },
+            1,
+            "immutable function metadata must not be rescanned per opcode"
+        );
+        assert_eq!(
+            unsafe { (*script_function).semantic_metadata_validation_runs.get() },
+            1
+        );
+        vm.cleanup_execution();
+    }
+
+    #[test]
     fn cleanup_refuses_stack_reads_when_stack_top_is_corrupt() {
         let mut vm = VM::new();
         assert!(vm.push(Value::Number(7.0)));
@@ -2194,6 +2390,45 @@ mod tests {
             std::ptr::addr_of_mut!((*upvalue).closed)
         });
         assert!(unsafe { (*upvalue).next }.is_null());
+        assert_eq!(vm.stack_top, stack_start);
+    }
+
+    #[test]
+    fn cleanup_rejects_misaligned_stack_top_and_upvalue_locations() {
+        for corrupt_top in [
+            |start: usize, _: usize| start - 1,
+            |start: usize, _: usize| start + 1,
+            |_: usize, end: usize| end + std::mem::size_of::<Value>(),
+        ] {
+            let mut vm = VM::new();
+            assert!(vm.push(Value::Number(7.0)));
+            let stack_start = vm.stack.as_mut_ptr();
+            let stack_end = stack_start as usize + vm.stack.len() * std::mem::size_of::<Value>();
+            let upvalue = allocate_upvalue(&mut vm, stack_start);
+            vm.open_upvalues = upvalue;
+            vm.stack_top = corrupt_top(stack_start as usize, stack_end) as *mut Value;
+
+            vm.cleanup_execution();
+
+            assert_eq!(unsafe { (*upvalue).closed }, Value::Nil);
+            assert_eq!(unsafe { (*upvalue).location }, unsafe {
+                std::ptr::addr_of_mut!((*upvalue).closed)
+            });
+            assert_eq!(vm.stack_top, stack_start);
+        }
+
+        let mut vm = VM::new();
+        assert!(vm.push(Value::Number(7.0)));
+        let stack_start = vm.stack.as_mut_ptr();
+        let upvalue = allocate_upvalue(&mut vm, (stack_start as usize + 1) as *mut Value);
+        vm.open_upvalues = upvalue;
+
+        vm.cleanup_execution();
+
+        assert_eq!(unsafe { (*upvalue).closed }, Value::Nil);
+        assert_eq!(unsafe { (*upvalue).location }, unsafe {
+            std::ptr::addr_of_mut!((*upvalue).closed)
+        });
         assert_eq!(vm.stack_top, stack_start);
     }
 

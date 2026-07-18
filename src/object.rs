@@ -1,11 +1,14 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     alloc::{Layout, alloc, dealloc},
+    cell::OnceCell,
     collections::HashSet,
     fmt,
 };
 
 use crate::chunk::Chunk;
-use crate::debug_info::FunctionDebugInfo;
+use crate::debug_info::{DebugPoint, FunctionDebugInfo};
 use crate::value::Value;
 use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
@@ -36,7 +39,17 @@ pub struct ObjFunction {
     pub upvalue_count: usize,
     pub chunk: Chunk,
     pub debug_info: FunctionDebugInfo,
+    // Compiler-owned metadata is frozen into this validated projection before
+    // first use. Keeping it on the function avoids a growing VM-wide cache.
+    pub(crate) semantic_metadata_cache: OnceCell<SemanticMetadataCache>,
+    #[cfg(test)]
+    pub(crate) semantic_metadata_validation_runs: Cell<usize>,
     pub name: *mut ObjString,
+}
+
+pub(crate) struct SemanticMetadataCache {
+    pub(crate) opcode_starts: Box<[bool]>,
+    pub(crate) points: Box<[DebugPoint]>,
 }
 
 pub type NativeFn = fn(arg_count: usize, args: &[Value]) -> Value;
@@ -321,6 +334,9 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
         upvalue_count: 0,
         chunk: Chunk::new(),
         debug_info: FunctionDebugInfo::default(),
+        semantic_metadata_cache: OnceCell::new(),
+        #[cfg(test)]
+        semantic_metadata_validation_runs: Cell::new(0),
         name: std::ptr::null_mut(),
     };
 

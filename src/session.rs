@@ -493,9 +493,10 @@ impl RuntimeHost for CompilationHost {
 }
 
 fn select_point(points: &[DebugPoint], offset: usize) -> Option<DebugPoint> {
-    points
+    let first_match = points.partition_point(|point| point.offset < offset);
+    points[first_match..]
         .iter()
-        .filter(|point| point.offset == offset)
+        .take_while(|point| point.offset == offset)
         .min_by_key(|point| match point.kind {
             DebugPointKind::FunctionEntry => 1,
             _ => 0,

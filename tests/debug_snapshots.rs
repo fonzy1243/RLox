@@ -918,3 +918,76 @@ fn control_heavy_values_truncate_below_the_encoded_cap() {
     assert!(estimate <= 5 * 1_048_576);
     assert!(estimate < 6 * 1_048_576);
 }
+
+#[test]
+fn exact_encoded_budget_edges_truncate_without_snapshot_unavailable() {
+    let payload = "\u{0001}".repeat(4_096);
+    let aliases = std::iter::repeat_n("payload", 255)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "fun fill() {{\n  var payload = \"{payload}\";\n  var values = [{aliases}];\n  print 0;\n}}\nfill();"
+    );
+
+    let baseline_limits = SnapshotLimits {
+        max_collection_items: 256,
+        ..SnapshotLimits::default()
+    };
+    let mut baseline = InterpreterSession::with_snapshot_limits(
+        SourceDocument::new(SourceId(89), RevisionId(1), "boundary.lox", &source),
+        RecordingHost::default(),
+        baseline_limits,
+    )
+    .unwrap();
+    assert!(matches!(baseline.start_debugging(), RunOutcome::Paused(_)));
+    let baseline = pause_at_line(&mut baseline, 4);
+    let baseline_estimate = baseline.conservative_json_size().unwrap();
+    assert!(
+        baseline_estimate > 4 * 1_048_576,
+        "baseline estimate was {baseline_estimate}"
+    );
+
+    let mut limits_to_check = vec![
+        5 * 1_048_576 - 1,
+        5 * 1_048_576,
+        baseline_estimate - 1,
+        baseline_estimate,
+    ];
+    limits_to_check.sort_unstable();
+    limits_to_check.dedup();
+    for encoded_limit in limits_to_check {
+        let limits = SnapshotLimits {
+            max_collection_items: 256,
+            max_estimated_json_bytes: encoded_limit,
+            ..SnapshotLimits::default()
+        };
+        let mut session = InterpreterSession::with_snapshot_limits(
+            SourceDocument::new(SourceId(89), RevisionId(1), "boundary.lox", &source),
+            RecordingHost::default(),
+            limits,
+        )
+        .unwrap();
+
+        assert!(matches!(session.start_debugging(), RunOutcome::Paused(_)));
+        let snapshot = pause_at_line(&mut session, 4);
+        let estimate = snapshot.conservative_json_size().unwrap();
+        let actual = serde_json::to_vec(&snapshot).unwrap().len();
+        assert!(estimate <= encoded_limit);
+        assert!(actual <= estimate);
+        assert!(
+            session
+                .host()
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != "runtime.snapshot_unavailable")
+        );
+        let values = binding(&snapshot.frames[0].locals, "values");
+        assert!(matches!(
+            values.value,
+            DebugValue::List {
+                truncated: true,
+                ..
+            }
+        ));
+    }
+}

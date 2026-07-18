@@ -405,7 +405,7 @@ pub(crate) fn compile_with_options(
         document.id,
         document.revision,
         script_declaration,
-        DebugPointId(0),
+        DebugPointId(1),
     );
 
     let compiler = Compiler {
@@ -433,7 +433,7 @@ pub(crate) fn compile_with_options(
         recursion_limit: options.recursion_limit,
         recursion_depth: 0,
         next_binding_id: 0,
-        next_debug_point_id: 1,
+        next_debug_point_id: 2,
         analysis: options.collect_symbols.then(AnalysisCollector::default),
         compiler,
     };
