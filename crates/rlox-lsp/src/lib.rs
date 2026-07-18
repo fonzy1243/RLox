@@ -12,8 +12,8 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     WorkDoneProgressOptions,
     notification::{
-        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Notification as _,
-        PublishDiagnostics,
+        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
+        Notification as _, PublishDiagnostics,
     },
     request::{GotoDefinition, Request as _, SemanticTokensFullRequest, Shutdown},
 };
@@ -50,6 +50,12 @@ impl fmt::Display for ServerError {
 }
 
 impl Error for ServerError {}
+
+enum InitializeFinish {
+    Initialized,
+    Stop(ServerOutcome),
+    Error(ServerError),
+}
 
 pub fn run_connection(connection: Connection) -> Result<ServerOutcome, ServerError> {
     let (initialize_id, raw_params) = match connection.initialize_start() {
@@ -123,8 +129,13 @@ pub fn run_connection(connection: Connection) -> Result<ServerOutcome, ServerErr
     };
     let result =
         serde_json::to_value(result).map_err(|error| ServerError::Protocol(error.to_string()))?;
-    if let Err(error) = connection.initialize_finish(initialize_id, result) {
-        return classify_handshake_error(error);
+    if send_response(&connection, Response::new_ok(initialize_id, result)).is_err() {
+        return Ok(ServerOutcome::OutputClosed);
+    }
+    match receive_initialized(&connection) {
+        InitializeFinish::Initialized => {}
+        InitializeFinish::Stop(outcome) => return Ok(outcome),
+        InitializeFinish::Error(error) => return Err(error),
     }
 
     run_initialized(connection, diagnostic_data_support)
@@ -145,9 +156,32 @@ fn classify_handshake_error(
 fn is_exit_notification_handshake_error(message: &str) -> bool {
     message.starts_with(
         "expected initialize request, got Notification(Notification { method: \"exit\", params: ",
-    ) || message.starts_with(
-        "expected initialized notification, got: Notification(Notification { method: \"exit\", params: ",
     )
+}
+
+fn receive_initialized(connection: &Connection) -> InitializeFinish {
+    match connection.receiver.recv() {
+        Ok(Message::Notification(notification)) if notification.method == Initialized::METHOD => {
+            InitializeFinish::Initialized
+        }
+        Ok(Message::Notification(notification)) if notification.method == Exit::METHOD => {
+            InitializeFinish::Stop(ServerOutcome::ExitWithoutShutdown)
+        }
+        Ok(Message::Notification(notification)) => {
+            InitializeFinish::Error(ServerError::Protocol(format!(
+                "expected initialized notification, got notification method: {}",
+                notification.method.escape_default()
+            )))
+        }
+        Ok(Message::Request(request)) => InitializeFinish::Error(ServerError::Protocol(format!(
+            "expected initialized notification, got request method: {}",
+            request.method.escape_default()
+        ))),
+        Ok(Message::Response(_)) => InitializeFinish::Error(ServerError::Protocol(
+            "expected initialized notification, got response".to_owned(),
+        )),
+        Err(_) => InitializeFinish::Stop(ServerOutcome::ChannelClosed),
+    }
 }
 
 fn run_initialized(

@@ -202,10 +202,41 @@ fn request_named_exit_during_initialization_exits_while_stdin_remains_open() {
 
     let output = wait_for_child(child);
     assert!(!output.status.success());
-    assert!(!output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "rlox-lsp: expected initialized notification, got request method: exit\n"
+    );
     let messages = parse_stdout(output.stdout);
     assert_eq!(messages.len(), 1, "{messages:#?}");
     let response = serde_json::to_value(&messages[0]).unwrap();
     assert_eq!(response["id"], 1);
     assert!(response.get("result").is_some());
+}
+
+#[test]
+fn initialization_protocol_errors_escape_request_methods_on_stderr() {
+    let input = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"capabilities": {}}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "exit\nINJECTED\u{1b}[31m",
+            "params": null
+        }),
+    ]
+    .into_iter()
+    .flat_map(frame)
+    .collect::<Vec<_>>();
+
+    let output = run_child(&input);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "rlox-lsp: expected initialized notification, got request method: exit\\nINJECTED\\u{1b}[31m\n"
+    );
 }

@@ -192,9 +192,11 @@ fn request_named_exit_during_initialization_is_a_protocol_error() {
     drop(client);
 
     let result = thread.join().unwrap();
-    assert!(
-        matches!(result, Err(ServerError::Protocol(ref message)) if message.contains("Request")),
-        "unexpected result: {result:?}"
+    assert_eq!(
+        result,
+        Err(ServerError::Protocol(
+            "expected initialized notification, got request method: exit".to_owned()
+        ))
     );
 }
 
