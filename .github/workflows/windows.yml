@@ -1,0 +1,46 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Lint IDE targets
+        run: cargo clippy --locked -p oxide-ide --all-targets --no-deps -- -D warnings
+
+      - name: Build Windows release binaries
+        run: cargo build --locked --release --workspace --target x86_64-pc-windows-msvc
+
+      - name: Package release
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -SkipBuild
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxide-ide-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
