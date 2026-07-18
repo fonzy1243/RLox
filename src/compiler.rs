@@ -28,6 +28,8 @@ struct Parser<'a> {
     diagnostics: Vec<Diagnostic>,
     diagnostic_limit: Option<usize>,
     diagnostic_count: usize,
+    recursion_limit: Option<usize>,
+    recursion_depth: usize,
     next_binding_id: u64,
     next_debug_point_id: u64,
     compiler: Compiler<'a>,
@@ -49,7 +51,8 @@ enum Precedence {
     Primary,
 }
 
-type ParseFn = for<'a> fn(&mut Parser<'a>, &mut Scanner<'a>, &mut Chunk, &mut VM, bool);
+type ParseFn =
+    for<'a> fn(&mut Parser<'a>, &mut Scanner<'a>, &mut Chunk, &mut VM, bool) -> CompileResult;
 
 struct ParseRule {
     prefix: Option<ParseFn>,
@@ -332,19 +335,36 @@ pub fn compile(
     vm: &mut VM,
     host: &mut dyn RuntimeHost,
 ) -> Option<*mut ObjFunction> {
-    compile_with_diagnostic_limit(document, vm, host, None).function
+    compile_with_options(document, vm, host, CompileOptions::default()).function
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompileLimit {
+    RecursionDepth { max: usize, actual: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompileAbort(CompileLimit);
+
+type CompileResult<T = ()> = Result<T, CompileAbort>;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompileOptions {
+    pub diagnostic_limit: Option<usize>,
+    pub recursion_limit: Option<usize>,
 }
 
 pub(crate) struct CompileOutcome {
     pub function: Option<*mut ObjFunction>,
     pub diagnostic_count: usize,
+    pub limit: Option<CompileLimit>,
 }
 
-pub(crate) fn compile_with_diagnostic_limit(
+pub(crate) fn compile_with_options(
     document: &SourceDocument,
     vm: &mut VM,
     host: &mut dyn RuntimeHost,
-    diagnostic_limit: Option<usize>,
+    options: CompileOptions,
 ) -> CompileOutcome {
     let mut scanner = Scanner::new(&document.text);
     let dummy = Token {
@@ -402,8 +422,10 @@ pub(crate) fn compile_with_diagnostic_limit(
         source_id: document.id,
         revision: document.revision,
         diagnostics: Vec::new(),
-        diagnostic_limit,
+        diagnostic_limit: options.diagnostic_limit,
         diagnostic_count: 0,
+        recursion_limit: options.recursion_limit,
+        recursion_depth: 0,
         next_binding_id: 0,
         next_debug_point_id: 1,
         compiler,
@@ -413,9 +435,14 @@ pub(crate) fn compile_with_diagnostic_limit(
 
     let chunk = unsafe { &mut (*function).chunk };
 
-    while !match_token(&mut parser, &mut scanner, TokenType::Eof) {
-        declaration(&mut parser, &mut scanner, chunk, vm);
-    }
+    let limit = loop {
+        if match_token(&mut parser, &mut scanner, TokenType::Eof) {
+            break None;
+        }
+        if let Err(abort) = declaration(&mut parser, &mut scanner, chunk, vm) {
+            break Some(abort.0);
+        }
+    };
 
     let (compiled_fn, _) = end_compiler(&mut parser, chunk, vm);
 
@@ -425,9 +452,27 @@ pub(crate) fn compile_with_diagnostic_limit(
     }
 
     CompileOutcome {
-        function: (!had_error).then_some(compiled_fn),
+        function: (!had_error && limit.is_none()).then_some(compiled_fn),
         diagnostic_count: parser.diagnostic_count,
+        limit,
     }
+}
+
+fn with_recursion<'a, T>(
+    parser: &mut Parser<'a>,
+    parse: impl FnOnce(&mut Parser<'a>) -> CompileResult<T>,
+) -> CompileResult<T> {
+    let actual = parser.recursion_depth + 1;
+    if let Some(max) = parser.recursion_limit
+        && actual > max
+    {
+        return Err(CompileAbort(CompileLimit::RecursionDepth { max, actual }));
+    }
+
+    parser.recursion_depth = actual;
+    let result = parse(parser);
+    parser.recursion_depth -= 1;
+    result
 }
 
 fn advance<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -471,13 +516,39 @@ fn expression<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
-    parse_precedence(parser, scanner, chunk, Precedence::Assignment, vm);
+) -> CompileResult {
+    parse_precedence(parser, scanner, chunk, Precedence::Assignment, vm)
 }
 
-fn block<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk, vm: &mut VM) {
+fn nested_expression<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> CompileResult {
+    with_recursion(parser, |parser| expression(parser, scanner, chunk, vm))
+}
+
+fn nested_precedence<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    precedence: Precedence,
+    vm: &mut VM,
+) -> CompileResult {
+    with_recursion(parser, |parser| {
+        parse_precedence(parser, scanner, chunk, precedence, vm)
+    })
+}
+
+fn block<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> CompileResult {
     while !check(parser, TokenType::RightBrace) && !check(parser, TokenType::Eof) {
-        declaration(parser, scanner, chunk, vm);
+        declaration(parser, scanner, chunk, vm)?;
     }
 
     consume(
@@ -486,6 +557,7 @@ fn block<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chu
         TokenType::RightBrace,
         "Expect '}' after block.",
     );
+    Ok(())
 }
 
 fn function<'a>(
@@ -494,18 +566,17 @@ fn function<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     func_type: FunctionType,
-) -> *mut ObjFunction {
+) -> CompileResult<*mut ObjFunction> {
     init_compiler(parser, vm, func_type);
     begin_scope(parser);
 
+    let new_chunk = unsafe { &mut (*parser.compiler.function).chunk };
     consume(
         parser,
         scanner,
         TokenType::LeftParen,
         "Expect '(' after function name.",
     );
-
-    let new_chunk = unsafe { &mut (*parser.compiler.function).chunk };
 
     if !check(parser, TokenType::RightParen) {
         loop {
@@ -545,9 +616,10 @@ fn function<'a>(
         "Expect '{' before function body.",
     );
 
-    block(parser, scanner, new_chunk, vm);
+    let parse_result = block(parser, scanner, new_chunk, vm);
 
     let (function_ptr, upvalues) = end_compiler(parser, new_chunk, vm);
+    parse_result?;
     let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
     if constant <= u8::MAX as usize {
         emit_opcode_with_byte(parser, chunk, OpCode::Closure, constant as u8);
@@ -565,7 +637,7 @@ fn function<'a>(
         emit_byte_operand(parser, chunk, upvalue.index);
     }
 
-    function_ptr
+    Ok(function_ptr)
 }
 
 fn fun_declaration<'a>(
@@ -574,7 +646,7 @@ fn fun_declaration<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     construct_start: crate::TextPosition,
-) {
+) -> CompileResult {
     let global = parse_variable(
         parser,
         scanner,
@@ -584,7 +656,9 @@ fn fun_declaration<'a>(
         BindingKind::Local,
     );
     mark_resolver_initialized(parser);
-    let function_ptr = function(parser, scanner, chunk, vm, FunctionType::Function);
+    let function_ptr = with_recursion(parser, |parser| {
+        function(parser, scanner, chunk, vm, FunctionType::Function)
+    })?;
     let declaration = SourceSpan {
         source_id: parser.source_id,
         revision: parser.revision,
@@ -603,6 +677,7 @@ fn fun_declaration<'a>(
         }
     }
     define_variable(parser, chunk, global);
+    Ok(())
 }
 
 fn begin_scope(parser: &mut Parser) {
@@ -651,7 +726,7 @@ fn var_declaration<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     let global = parse_variable(
         parser,
         scanner,
@@ -662,7 +737,7 @@ fn var_declaration<'a>(
     );
 
     if match_token(parser, scanner, TokenType::Equal) {
-        expression(parser, scanner, chunk, vm);
+        expression(parser, scanner, chunk, vm)?;
     } else {
         emit_opcode(parser, chunk, OpCode::Nil);
     }
@@ -675,6 +750,7 @@ fn var_declaration<'a>(
     );
 
     define_variable(parser, chunk, global);
+    Ok(())
 }
 
 fn expression_statement<'a>(
@@ -682,8 +758,8 @@ fn expression_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
-    expression(parser, scanner, chunk, vm);
+) -> CompileResult {
+    expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -691,6 +767,7 @@ fn expression_statement<'a>(
         "Expect ';' after expression.",
     );
     emit_opcode(parser, chunk, OpCode::Pop);
+    Ok(())
 }
 
 fn for_statement<'a>(
@@ -698,8 +775,19 @@ fn for_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     begin_scope(parser);
+    let result = for_statement_scoped(parser, scanner, chunk, vm);
+    end_scope(parser, chunk);
+    result
+}
+
+fn for_statement_scoped<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> CompileResult {
     consume(
         parser,
         scanner,
@@ -712,12 +800,12 @@ fn for_statement<'a>(
     } else if match_token(parser, scanner, TokenType::Var) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::LoopInitializer, span);
-        var_declaration(parser, scanner, chunk, vm);
+        var_declaration(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     } else {
         let span = token_span(parser, parser.current);
         let point = schedule_point(parser, DebugPointKind::LoopInitializer, span);
-        expression_statement(parser, scanner, chunk, vm);
+        expression_statement(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     }
     let mut loop_start = chunk.code.len();
@@ -726,7 +814,7 @@ fn for_statement<'a>(
     if !match_token(parser, scanner, TokenType::Semicolon) {
         let span = token_span(parser, parser.current);
         let point = schedule_point(parser, DebugPointKind::LoopCondition, span);
-        expression(parser, scanner, chunk, vm);
+        expression(parser, scanner, chunk, vm)?;
         consume(
             parser,
             scanner,
@@ -745,7 +833,7 @@ fn for_statement<'a>(
         let increment_start = chunk.code.len();
         let span = token_span(parser, parser.current);
         let point = schedule_point(parser, DebugPointKind::LoopIncrement, span);
-        expression(parser, scanner, chunk, vm);
+        expression(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
         emit_opcode(parser, chunk, OpCode::Pop);
         consume(
@@ -760,7 +848,7 @@ fn for_statement<'a>(
         patch_jump(parser, chunk, body_jump);
     }
     // Body
-    statement(parser, scanner, chunk, vm);
+    statement(parser, scanner, chunk, vm)?;
     emit_loop(parser, chunk, loop_start);
 
     if let Some(jump) = exit_jump {
@@ -768,7 +856,7 @@ fn for_statement<'a>(
         emit_opcode(parser, chunk, OpCode::Pop);
     }
 
-    end_scope(parser, chunk);
+    Ok(())
 }
 
 fn if_statement<'a>(
@@ -776,14 +864,14 @@ fn if_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     consume(
         parser,
         scanner,
         TokenType::LeftParen,
         "Expect '(' after 'if'.",
     );
-    expression(parser, scanner, chunk, vm);
+    expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -793,7 +881,7 @@ fn if_statement<'a>(
 
     let then_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
     emit_opcode(parser, chunk, OpCode::Pop);
-    statement(parser, scanner, chunk, vm);
+    statement(parser, scanner, chunk, vm)?;
 
     let else_jump = emit_jump(parser, chunk, OpCode::Jump);
 
@@ -801,9 +889,10 @@ fn if_statement<'a>(
     emit_opcode(parser, chunk, OpCode::Pop);
 
     if match_token(parser, scanner, TokenType::Else) {
-        statement(parser, scanner, chunk, vm);
+        statement(parser, scanner, chunk, vm)?;
     }
     patch_jump(parser, chunk, else_jump);
+    Ok(())
 }
 
 fn switch_statement<'a>(
@@ -811,14 +900,14 @@ fn switch_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     consume(
         parser,
         scanner,
         TokenType::LeftParen,
         "Expect '(' after 'switch'",
     );
-    expression(parser, scanner, chunk, vm);
+    expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -833,7 +922,17 @@ fn switch_statement<'a>(
     );
 
     begin_scope(parser);
+    let result = switch_statement_scoped(parser, scanner, chunk, vm);
+    end_scope(parser, chunk);
+    result
+}
 
+fn switch_statement_scoped<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) -> CompileResult {
     let mut exit_jumps = Vec::new();
     let mut has_default = false;
 
@@ -844,7 +943,7 @@ fn switch_statement<'a>(
             }
 
             emit_opcode(parser, chunk, OpCode::Dup);
-            expression(parser, scanner, chunk, vm);
+            expression(parser, scanner, chunk, vm)?;
             consume(
                 parser,
                 scanner,
@@ -862,7 +961,7 @@ fn switch_statement<'a>(
                 && !check(parser, TokenType::RightBrace)
                 && !check(parser, TokenType::Eof)
             {
-                declaration(parser, scanner, chunk, vm);
+                declaration(parser, scanner, chunk, vm)?;
             }
 
             let exit_jump = emit_jump(parser, chunk, OpCode::Jump);
@@ -888,7 +987,7 @@ fn switch_statement<'a>(
                 && !check(parser, TokenType::RightBrace)
                 && !check(parser, TokenType::Eof)
             {
-                declaration(parser, scanner, chunk, vm);
+                declaration(parser, scanner, chunk, vm)?;
             }
         } else {
             error_at_current(parser, "Expect 'case' or 'default'.");
@@ -909,7 +1008,7 @@ fn switch_statement<'a>(
 
     emit_opcode(parser, chunk, OpCode::Pop);
 
-    end_scope(parser, chunk);
+    Ok(())
 }
 
 fn print_statement<'a>(
@@ -917,8 +1016,8 @@ fn print_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
-    expression(parser, scanner, chunk, vm);
+) -> CompileResult {
+    expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -926,6 +1025,7 @@ fn print_statement<'a>(
         "Expect ';' after value.",
     );
     emit_opcode(parser, chunk, OpCode::Print);
+    Ok(())
 }
 
 fn return_statement<'a>(
@@ -933,7 +1033,7 @@ fn return_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     if parser.compiler.function_type == FunctionType::Script {
         compiler_error(parser, "Cannot return from top-level code.");
     }
@@ -941,7 +1041,7 @@ fn return_statement<'a>(
     if match_token(parser, scanner, TokenType::Semicolon) {
         emit_return(parser, chunk);
     } else {
-        expression(parser, scanner, chunk, vm);
+        expression(parser, scanner, chunk, vm)?;
         consume(
             parser,
             scanner,
@@ -950,6 +1050,7 @@ fn return_statement<'a>(
         );
         emit_opcode(parser, chunk, OpCode::Return);
     }
+    Ok(())
 }
 
 fn while_statement<'a>(
@@ -957,7 +1058,7 @@ fn while_statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     let loop_start = chunk.code.len();
     consume(
         parser,
@@ -965,7 +1066,7 @@ fn while_statement<'a>(
         TokenType::LeftParen,
         "Expect '(' after 'while'.",
     );
-    expression(parser, scanner, chunk, vm);
+    expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -975,11 +1076,12 @@ fn while_statement<'a>(
 
     let exit_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
     emit_opcode(parser, chunk, OpCode::Pop);
-    statement(parser, scanner, chunk, vm);
+    statement(parser, scanner, chunk, vm)?;
     emit_loop(parser, chunk, loop_start);
 
     patch_jump(parser, chunk, exit_jump);
     emit_opcode(parser, chunk, OpCode::Pop);
+    Ok(())
 }
 
 fn synchronize<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>) {
@@ -1011,24 +1113,25 @@ fn declaration<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     if match_token(parser, scanner, TokenType::Fun) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        fun_declaration(parser, scanner, chunk, vm, span.start);
+        fun_declaration(parser, scanner, chunk, vm, span.start)?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Var) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        var_declaration(parser, scanner, chunk, vm);
+        var_declaration(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     } else {
-        statement(parser, scanner, chunk, vm);
+        statement(parser, scanner, chunk, vm)?;
     }
 
     if parser.panic_mode {
         synchronize(parser, scanner);
     }
+    Ok(())
 }
 
 fn statement<'a>(
@@ -1036,44 +1139,48 @@ fn statement<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) {
+) -> CompileResult {
     if match_token(parser, scanner, TokenType::Print) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        print_statement(parser, scanner, chunk, vm);
+        print_statement(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Return) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        return_statement(parser, scanner, chunk, vm);
+        return_statement(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::For) {
-        for_statement(parser, scanner, chunk, vm);
+        with_recursion(parser, |parser| for_statement(parser, scanner, chunk, vm))?;
     } else if match_token(parser, scanner, TokenType::If) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        if_statement(parser, scanner, chunk, vm);
+        with_recursion(parser, |parser| if_statement(parser, scanner, chunk, vm))?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::Switch) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        switch_statement(parser, scanner, chunk, vm);
+        with_recursion(parser, |parser| {
+            switch_statement(parser, scanner, chunk, vm)
+        })?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::While) {
         let span = token_span(parser, parser.previous);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        while_statement(parser, scanner, chunk, vm);
+        with_recursion(parser, |parser| while_statement(parser, scanner, chunk, vm))?;
         finish_previous_point(parser, point);
     } else if match_token(parser, scanner, TokenType::LeftBrace) {
         begin_scope(parser);
-        block(parser, scanner, chunk, vm);
+        let result = with_recursion(parser, |parser| block(parser, scanner, chunk, vm));
         end_scope(parser, chunk);
+        result?;
     } else {
         let span = token_span(parser, parser.current);
         let point = schedule_point(parser, DebugPointKind::Statement, span);
-        expression_statement(parser, scanner, chunk, vm);
+        expression_statement(parser, scanner, chunk, vm)?;
         finish_previous_point(parser, point);
     }
+    Ok(())
 }
 
 fn consume<'a>(
@@ -1287,7 +1394,7 @@ fn binary<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let operator = parser.previous;
     let operator_type = operator.token_type;
     let span = token_span(parser, operator);
@@ -1295,7 +1402,7 @@ fn binary<'a>(
     let rule = get_rule(operator_type);
     let next_precedence =
         unsafe { std::mem::transmute::<u8, Precedence>(rule.precedence as u8 + 1) };
-    parse_precedence(parser, scanner, chunk, next_precedence, vm);
+    nested_precedence(parser, scanner, chunk, next_precedence, vm)?;
 
     match operator_type {
         TokenType::BangEqual => {
@@ -1320,6 +1427,7 @@ fn binary<'a>(
         TokenType::Backslash => emit_opcode_at(parser, chunk, OpCode::IntDivide, span),
         _ => unreachable!(),
     }
+    Ok(())
 }
 
 fn call<'a>(
@@ -1328,11 +1436,12 @@ fn call<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let opening = parser.previous;
-    let arg_count = argument_list(parser, scanner, chunk, vm);
+    let arg_count = argument_list(parser, scanner, chunk, vm)?;
     let span = merged_span(parser, opening, parser.previous);
     emit_opcode_with_byte_at(parser, chunk, OpCode::Call, arg_count, span);
+    Ok(())
 }
 
 fn literal<'a>(
@@ -1341,13 +1450,14 @@ fn literal<'a>(
     chunk: &mut Chunk,
     _: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     match parser.previous.token_type {
         TokenType::False => emit_opcode(parser, chunk, OpCode::False),
         TokenType::Nil => emit_opcode(parser, chunk, OpCode::Nil),
         TokenType::True => emit_opcode(parser, chunk, OpCode::True),
         _ => unreachable!(),
     }
+    Ok(())
 }
 
 fn grouping<'a>(
@@ -1356,14 +1466,15 @@ fn grouping<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
-    expression(parser, scanner, chunk, vm);
+) -> CompileResult {
+    nested_expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
         TokenType::RightParen,
         "Expect ')' after expression.",
     );
+    Ok(())
 }
 
 fn number<'a>(
@@ -1372,11 +1483,12 @@ fn number<'a>(
     chunk: &mut Chunk,
     _: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let value: f64 = parser.previous.start[..parser.previous.length]
         .parse()
         .unwrap();
     emit_constant(parser, chunk, Value::Number(value));
+    Ok(())
 }
 
 fn or<'a>(
@@ -1385,15 +1497,16 @@ fn or<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let else_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
     let end_jump = emit_jump(parser, chunk, OpCode::Jump);
 
     patch_jump(parser, chunk, else_jump);
     emit_opcode(parser, chunk, OpCode::Pop);
 
-    parse_precedence(parser, scanner, chunk, Precedence::Or, vm);
+    nested_precedence(parser, scanner, chunk, Precedence::Or, vm)?;
     patch_jump(parser, chunk, end_jump);
+    Ok(())
 }
 
 fn string<'a>(
@@ -1402,10 +1515,11 @@ fn string<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let s = &parser.previous.start[1..parser.previous.length - 1];
     let ptr = copy_string(vm, s);
     emit_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
+    Ok(())
 }
 
 fn list<'a>(
@@ -1414,12 +1528,12 @@ fn list<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let mut item_count = 0;
 
     if !check(parser, TokenType::RightBracket) {
         loop {
-            expression(parser, scanner, chunk, vm);
+            nested_expression(parser, scanner, chunk, vm)?;
             item_count += 1;
 
             if item_count > 255 {
@@ -1444,6 +1558,7 @@ fn list<'a>(
         emit_opcode(parser, chunk, OpCode::BuildListLong);
         emit_u16_operand(parser, chunk, item_count as u16);
     }
+    Ok(())
 }
 
 fn index<'a>(
@@ -1452,9 +1567,9 @@ fn index<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     can_assign: bool,
-) {
+) -> CompileResult {
     let opening = parser.previous;
-    expression(parser, scanner, chunk, vm);
+    nested_expression(parser, scanner, chunk, vm)?;
     consume(
         parser,
         scanner,
@@ -1466,11 +1581,12 @@ fn index<'a>(
     let span = merged_span(parser, opening, closing);
 
     if can_assign && match_token(parser, scanner, TokenType::Equal) {
-        expression(parser, scanner, chunk, vm);
+        nested_expression(parser, scanner, chunk, vm)?;
         emit_opcode_at(parser, chunk, OpCode::SetIndex, span);
     } else {
         emit_opcode_at(parser, chunk, OpCode::GetIndex, span);
     }
+    Ok(())
 }
 
 fn variable<'a>(
@@ -1479,9 +1595,9 @@ fn variable<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     can_assign: bool,
-) {
+) -> CompileResult {
     let name = parser.previous;
-    named_variable(parser, scanner, chunk, vm, name, can_assign);
+    named_variable(parser, scanner, chunk, vm, name, can_assign)
 }
 
 fn named_variable<'a>(
@@ -1491,7 +1607,7 @@ fn named_variable<'a>(
     vm: &mut VM,
     name: Token<'a>,
     can_assign: bool,
-) {
+) -> CompileResult {
     let span = token_span(parser, name);
     let arg;
     let get_op;
@@ -1518,7 +1634,7 @@ fn named_variable<'a>(
 
     let is_assignment = can_assign && match_token(parser, scanner, TokenType::Equal);
     if is_assignment {
-        expression(parser, scanner, chunk, vm);
+        nested_expression(parser, scanner, chunk, vm)?;
     }
 
     let op = if is_assignment { set_op } else { get_op };
@@ -1529,6 +1645,7 @@ fn named_variable<'a>(
     } else {
         emit_opcode_with_byte_at(parser, chunk, op, arg as u8, span);
     }
+    Ok(())
 }
 
 fn unary<'a>(
@@ -1537,18 +1654,19 @@ fn unary<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let operator = parser.previous;
     let operator_type = operator.token_type;
     let span = token_span(parser, operator);
 
-    parse_precedence(parser, scanner, chunk, Precedence::Unary, vm);
+    nested_precedence(parser, scanner, chunk, Precedence::Unary, vm)?;
 
     match operator_type {
         TokenType::Bang => emit_opcode_at(parser, chunk, OpCode::Not, span),
         TokenType::Minus => emit_opcode_at(parser, chunk, OpCode::Negate, span),
         _ => unreachable!(),
     }
+    Ok(())
 }
 
 fn parse_precedence<'a>(
@@ -1557,7 +1675,7 @@ fn parse_precedence<'a>(
     chunk: &mut Chunk,
     precedence: Precedence,
     vm: &mut VM,
-) {
+) -> CompileResult {
     advance(parser, scanner);
 
     let prefix_rule = get_rule(parser.previous.token_type).prefix;
@@ -1565,25 +1683,26 @@ fn parse_precedence<'a>(
         Some(func) => func,
         None => {
             error(parser, "Expect expression.");
-            return;
+            return Ok(());
         }
     };
 
     let can_assign = precedence <= Precedence::Assignment;
 
-    prefix_fn(parser, scanner, chunk, vm, can_assign);
+    prefix_fn(parser, scanner, chunk, vm, can_assign)?;
 
     while precedence <= get_rule(parser.current.token_type).precedence {
         advance(parser, scanner);
         let infix_rule = get_rule(parser.previous.token_type).infix;
         if let Some(infix_fn) = infix_rule {
-            infix_fn(parser, scanner, chunk, vm, can_assign);
+            infix_fn(parser, scanner, chunk, vm, can_assign)?;
         }
     }
 
     if can_assign && match_token(parser, scanner, TokenType::Equal) {
         error(parser, "Invalid assignment target.");
     }
+    Ok(())
 }
 
 fn identifier_constant<'a>(
@@ -1881,11 +2000,11 @@ fn argument_list<'a>(
     scanner: &mut Scanner<'a>,
     chunk: &mut Chunk,
     vm: &mut VM,
-) -> u8 {
+) -> CompileResult<u8> {
     let mut arg_count = 0;
     if !check(parser, TokenType::RightParen) {
         loop {
-            expression(parser, scanner, chunk, vm);
+            nested_expression(parser, scanner, chunk, vm)?;
             if arg_count == 255 {
                 compiler_error(parser, "Cannot have more than 255 arguments.");
             }
@@ -1903,7 +2022,7 @@ fn argument_list<'a>(
         TokenType::RightParen,
         "Expect ')' after arguments.",
     );
-    arg_count
+    Ok(arg_count)
 }
 
 fn and<'a>(
@@ -1912,13 +2031,14 @@ fn and<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
     _: bool,
-) {
+) -> CompileResult {
     let end_jump = emit_jump(parser, chunk, OpCode::JumpIfFalse);
 
     emit_opcode(parser, chunk, OpCode::Pop);
-    parse_precedence(parser, scanner, chunk, Precedence::And, vm);
+    nested_precedence(parser, scanner, chunk, Precedence::And, vm)?;
 
     patch_jump(parser, chunk, end_jump);
+    Ok(())
 }
 
 fn get_rule(token_type: TokenType) -> ParseRule {
@@ -2066,7 +2186,7 @@ fn get_rule(token_type: TokenType) -> ParseRule {
 mod tests {
     use std::collections::HashSet;
 
-    use super::compile;
+    use super::{CompileLimit, CompileOptions, compile, compile_with_options};
     use crate::chunk::{Chunk, OpCode};
     use crate::debug_info::{BindingKind, DebugPointKind};
     use crate::object::{ObjFunction, ObjString};
@@ -2090,6 +2210,36 @@ mod tests {
             host.diagnostics()
         );
         (vm, function.expect("source should compile"))
+    }
+
+    #[test]
+    fn recursion_abort_is_typed_silent_and_unwinds_nested_compilers() {
+        let document = SourceDocument::new(
+            SourceId(41),
+            RevisionId(7),
+            "test.lox",
+            "fun outer() { fun inner() {} }",
+        );
+        let mut vm = VM::new();
+        let mut host = RecordingHost::default();
+        let outcome = compile_with_options(
+            &document,
+            &mut vm,
+            &mut host,
+            CompileOptions {
+                diagnostic_limit: None,
+                recursion_limit: Some(1),
+            },
+        );
+
+        assert_eq!(
+            outcome.limit,
+            Some(CompileLimit::RecursionDepth { max: 1, actual: 2 })
+        );
+        assert!(outcome.function.is_none());
+        assert_eq!(outcome.diagnostic_count, 0);
+        assert!(host.diagnostics().is_empty());
+        assert!(vm.compiler_roots.is_empty());
     }
 
     fn function_name(function: *mut ObjFunction) -> &'static str {

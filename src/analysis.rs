@@ -1,4 +1,4 @@
-use crate::compiler::compile_with_diagnostic_limit;
+use crate::compiler::{CompileLimit, CompileOptions, compile_with_options};
 use crate::scanner::{Scanner, ScannerItemKind, TokenType};
 use crate::vm::VM;
 use crate::{Diagnostic, RecordingHost, RevisionId, SourceDocument, SourceId, SourceSpan};
@@ -85,12 +85,6 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
     let mut scanner = Scanner::new(&document.text);
     let mut highlights = Vec::with_capacity(document.text.len().min(MAX_ANALYSIS_LEXICAL_ITEMS));
     let mut item_count = 0usize;
-    let mut delimiters = Vec::with_capacity(MAX_ANALYSIS_NESTING_DEPTH + 1);
-    let mut parenthesis_depth = 0usize;
-    let mut control_depth = 0usize;
-    let mut pending_controls = 0usize;
-    let mut pending_control_retirement = None;
-    let mut unary_depth = 0usize;
     loop {
         let item = scanner.scan_item();
         let kind = match item.kind {
@@ -111,75 +105,6 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
             ));
         }
 
-        if let ScannerItemKind::Token(token_type) = item.kind {
-            if let Some(completed_controls) = pending_control_retirement.take() {
-                if token_type == TokenType::Else {
-                    pending_controls += completed_controls;
-                } else {
-                    control_depth -= completed_controls;
-                }
-            }
-
-            match token_type {
-                TokenType::LeftParen => {
-                    delimiters.push((TokenType::LeftParen, 0));
-                    parenthesis_depth += 1;
-                }
-                TokenType::LeftBracket => delimiters.push((TokenType::LeftBracket, 0)),
-                TokenType::LeftBrace => {
-                    delimiters.push((TokenType::LeftBrace, pending_controls));
-                    pending_controls = 0;
-                }
-                TokenType::If | TokenType::While | TokenType::For | TokenType::Switch => {
-                    control_depth += 1;
-                    pending_controls += 1;
-                }
-                TokenType::Bang | TokenType::Minus => unary_depth += 1,
-                _ => {}
-            }
-
-            let preflight_depth = delimiters.len() + control_depth + unary_depth;
-            if preflight_depth > MAX_ANALYSIS_NESTING_DEPTH {
-                return Err(limit_error(
-                    AnalysisLimit::NestingDepth,
-                    MAX_ANALYSIS_NESTING_DEPTH,
-                    preflight_depth,
-                ));
-            }
-
-            match token_type {
-                TokenType::RightParen => {
-                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftParen) {
-                        delimiters.pop();
-                        parenthesis_depth -= 1;
-                    }
-                }
-                TokenType::RightBracket
-                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftBracket) =>
-                {
-                    delimiters.pop();
-                }
-                TokenType::RightBrace
-                    if delimiters.last().map(|frame| frame.0) == Some(TokenType::LeftBrace) =>
-                {
-                    if let Some((_, completed_controls)) = delimiters.pop() {
-                        pending_control_retirement = Some(completed_controls);
-                    }
-                }
-                TokenType::Semicolon if parenthesis_depth == 0 => {
-                    pending_control_retirement = Some(pending_controls);
-                    pending_controls = 0;
-                }
-                _ => {}
-            }
-            if !matches!(
-                token_type,
-                TokenType::Bang | TokenType::Minus | TokenType::LeftParen | TokenType::LeftBracket
-            ) {
-                unary_depth = 0;
-            }
-        }
-
         highlights.push(HighlightSpan {
             kind,
             span: item.token.span(document.id, document.revision),
@@ -188,8 +113,18 @@ pub fn analyze(document: &SourceDocument) -> Result<LanguageAnalysis, AnalysisEr
 
     let mut vm = VM::new();
     let mut host = RecordingHost::default();
-    let compile_outcome =
-        compile_with_diagnostic_limit(document, &mut vm, &mut host, Some(MAX_ANALYSIS_DIAGNOSTICS));
+    let compile_outcome = compile_with_options(
+        document,
+        &mut vm,
+        &mut host,
+        CompileOptions {
+            diagnostic_limit: Some(MAX_ANALYSIS_DIAGNOSTICS),
+            recursion_limit: Some(MAX_ANALYSIS_NESTING_DEPTH),
+        },
+    );
+    if let Some(CompileLimit::RecursionDepth { max, actual }) = compile_outcome.limit {
+        return Err(limit_error(AnalysisLimit::NestingDepth, max, actual));
+    }
     if compile_outcome.diagnostic_count > MAX_ANALYSIS_DIAGNOSTICS {
         return Err(limit_error(
             AnalysisLimit::Diagnostics,

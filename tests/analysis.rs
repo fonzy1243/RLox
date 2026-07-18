@@ -266,14 +266,17 @@ fn nesting_limit_accepts_the_exact_boundary_and_rejects_one_more() {
 }
 
 #[test]
-fn nesting_preflight_counts_control_bodies_across_for_header_semicolons() {
-    let at_limit = format!(
-        "{}print 1;",
-        "for (;;) ".repeat(MAX_ANALYSIS_NESTING_DEPTH - 1)
-    );
+fn statement_recursion_accepts_128_nested_controls_and_rejects_129() {
+    let nested_controls = |depth: usize| {
+        let prefixes = ["if (true) ", "while (true) ", "for (;;) "];
+        let controls = prefixes.into_iter().cycle().take(depth).collect::<String>();
+        format!("{controls}nil;")
+    };
+
+    let at_limit = nested_controls(MAX_ANALYSIS_NESTING_DEPTH);
     assert!(analyze(&document(&at_limit)).is_ok());
 
-    let over_limit = format!("{}print 1;", "for (;;) ".repeat(MAX_ANALYSIS_NESTING_DEPTH));
+    let over_limit = nested_controls(MAX_ANALYSIS_NESTING_DEPTH + 1);
     assert_limit(
         &over_limit,
         AnalysisLimit::NestingDepth,
@@ -282,7 +285,7 @@ fn nesting_preflight_counts_control_bodies_across_for_header_semicolons() {
 }
 
 #[test]
-fn nesting_preflight_combines_unary_and_grouping_depth() {
+fn pratt_recursion_combines_unary_and_grouping_depth() {
     let unary = MAX_ANALYSIS_NESTING_DEPTH / 2;
     let grouping = MAX_ANALYSIS_NESTING_DEPTH - unary;
     let at_limit = format!(
@@ -307,23 +310,62 @@ fn nesting_preflight_combines_unary_and_grouping_depth() {
 }
 
 #[test]
-fn mismatched_closers_do_not_hide_open_delimiter_depth() {
-    let braces = MAX_ANALYSIS_NESTING_DEPTH / 2;
-    let parentheses = MAX_ANALYSIS_NESTING_DEPTH - braces + 1;
-    let source = format!(
-        "{}{}{}nil{};{}",
-        "{".repeat(braces),
-        ")".repeat(braces),
-        "(".repeat(parentheses),
-        ")".repeat(parentheses),
-        "}".repeat(braces)
-    );
+fn pratt_recursion_covers_lists_calls_indexes_assignments_and_logical_chains() {
+    let sources = |depth: usize| {
+        [
+            format!("{}nil{};", "[".repeat(depth), "]".repeat(depth)),
+            format!("{}nil{};", "f(".repeat(depth), ")".repeat(depth)),
+            format!("{}nil{};", "a[".repeat(depth), "]".repeat(depth)),
+            format!("{}nil;", "a = ".repeat(depth)),
+            format!("{}true;", "true or ".repeat(depth)),
+        ]
+    };
 
+    for source in sources(MAX_ANALYSIS_NESTING_DEPTH) {
+        assert!(analyze(&document(source)).is_ok());
+    }
+
+    for source in sources(MAX_ANALYSIS_NESTING_DEPTH + 1) {
+        assert_limit(
+            source,
+            AnalysisLimit::NestingDepth,
+            MAX_ANALYSIS_NESTING_DEPTH + 1,
+        );
+    }
+}
+
+#[test]
+fn malformed_nested_expression_terminates_at_and_over_the_limit() {
+    let at_limit = format!("{}nil;", "(".repeat(MAX_ANALYSIS_NESTING_DEPTH));
+    let analysis = analyze(&document(at_limit)).expect("malformed source is still analyzable");
+    assert_eq!(analysis.semantic_status, SemanticStatus::Unavailable);
+    assert!(!analysis.diagnostics.is_empty());
+
+    let over_limit = format!("{}nil;", "(".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1));
+    assert_limit(
+        over_limit,
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
+}
+
+#[test]
+fn ordinary_compilation_is_not_bound_by_the_analysis_recursion_limit() {
+    let source = format!(
+        "{}nil{};",
+        "(".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1),
+        ")".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1)
+    );
     assert_limit(
         &source,
         AnalysisLimit::NestingDepth,
         MAX_ANALYSIS_NESTING_DEPTH + 1,
     );
+
+    let mut host = RecordingHost::default();
+    let status = Interpreter::new().run(document(source), &mut host);
+    assert_eq!(status, rlox::InterpretResult::Ok);
+    assert!(host.diagnostics().is_empty());
 }
 
 #[test]
@@ -346,19 +388,34 @@ fn sequential_block_controls_do_not_accumulate_nesting_depth() {
 }
 
 #[test]
-fn genuinely_nested_block_controls_still_enforce_the_combined_depth_limit() {
-    let at_limit = MAX_ANALYSIS_NESTING_DEPTH / 2;
-    let source = format!("{}{}", "if (true) {".repeat(at_limit), "}".repeat(at_limit));
+fn block_recursion_accepts_128_nested_blocks_and_rejects_129() {
+    let source = format!(
+        "{}nil;{}",
+        "{".repeat(MAX_ANALYSIS_NESTING_DEPTH),
+        "}".repeat(MAX_ANALYSIS_NESTING_DEPTH)
+    );
     assert!(analyze(&document(source)).is_ok());
 
-    let over_limit = at_limit + 1;
     let source = format!(
-        "{}{}",
-        "if (true) {".repeat(over_limit),
-        "}".repeat(over_limit)
+        "{}nil;{}",
+        "{".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1),
+        "}".repeat(MAX_ANALYSIS_NESTING_DEPTH + 1)
     );
     assert_limit(
         source,
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
+}
+
+#[test]
+fn nested_function_compilation_accepts_128_and_rejects_129() {
+    let nested_functions =
+        |depth: usize| format!("{}{}", "fun f() {".repeat(depth), "}".repeat(depth));
+
+    assert!(analyze(&document(nested_functions(MAX_ANALYSIS_NESTING_DEPTH))).is_ok());
+    assert_limit(
+        nested_functions(MAX_ANALYSIS_NESTING_DEPTH + 1),
         AnalysisLimit::NestingDepth,
         MAX_ANALYSIS_NESTING_DEPTH + 1,
     );
@@ -373,13 +430,11 @@ fn unbraced_else_if_chain(controls: usize) -> String {
 }
 
 #[test]
-fn unbraced_else_if_chains_enforce_exact_combined_depth_128_and_129() {
-    let at_limit_controls = MAX_ANALYSIS_NESTING_DEPTH - 1;
-    let at_limit = unbraced_else_if_chain(at_limit_controls);
+fn unbraced_else_if_chains_accept_128_and_reject_129() {
+    let at_limit = unbraced_else_if_chain(MAX_ANALYSIS_NESTING_DEPTH);
     assert!(analyze(&document(at_limit)).is_ok());
 
-    let over_limit_controls = MAX_ANALYSIS_NESTING_DEPTH;
-    let over_limit = unbraced_else_if_chain(over_limit_controls);
+    let over_limit = unbraced_else_if_chain(MAX_ANALYSIS_NESTING_DEPTH + 1);
     assert_limit(
         over_limit,
         AnalysisLimit::NestingDepth,
@@ -393,4 +448,56 @@ fn sequential_unbraced_if_statements_do_not_accumulate_nesting_depth() {
     let analysis = analyze(&document(source)).expect("sequential controls are not nested");
 
     assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+}
+
+fn dangling_else_unwind(initial_controls: usize, outer_else_controls: usize) -> String {
+    format!(
+        "{}nil;{} else {}nil;",
+        "if (true) ".repeat(initial_controls),
+        " else nil;".repeat(initial_controls - 1),
+        "if (true) ".repeat(outer_else_controls),
+    )
+}
+
+#[test]
+fn dangling_else_unwind_tracks_actual_parser_recursion() {
+    let source = dangling_else_unwind(64, 64);
+    let analysis = analyze(&document(source)).expect("maximum statement recursion is 65");
+    assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+
+    assert_limit(
+        dangling_else_unwind(64, MAX_ANALYSIS_NESTING_DEPTH),
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
+}
+
+#[test]
+fn ordinary_dangling_else_associates_with_the_innermost_if() {
+    let source = "if (true) if (false) nil; else nil; else nil;";
+    let analysis = analyze(&document(source)).expect("both else branches have matching ifs");
+
+    assert_eq!(analysis.semantic_status, SemanticStatus::Available);
+}
+
+#[test]
+fn one_budget_is_shared_across_statement_expression_and_function_recursion() {
+    let mixed = |unary: usize| {
+        format!(
+            "{}{}{}{}nil;{}{}",
+            "{".repeat(32),
+            "fun f() {".repeat(32),
+            "if (true) ".repeat(32),
+            "!".repeat(unary),
+            "}".repeat(32),
+            "}".repeat(32),
+        )
+    };
+
+    assert!(analyze(&document(mixed(32))).is_ok());
+    assert_limit(
+        mixed(33),
+        AnalysisLimit::NestingDepth,
+        MAX_ANALYSIS_NESTING_DEPTH + 1,
+    );
 }
