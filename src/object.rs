@@ -1,15 +1,20 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     alloc::{Layout, alloc, dealloc},
+    cell::OnceCell,
+    collections::HashSet,
     fmt,
 };
 
 use crate::chunk::Chunk;
+use crate::debug_info::{DebugPoint, FunctionDebugInfo};
 use crate::value::Value;
 use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
 use crate::vm::collect_garbage;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjType {
     Closure,
@@ -33,14 +38,27 @@ pub struct ObjFunction {
     pub arity: usize,
     pub upvalue_count: usize,
     pub chunk: Chunk,
+    pub debug_info: FunctionDebugInfo,
+    // Compiler-owned metadata is frozen into this validated projection before
+    // first use. Keeping it on the function avoids a growing VM-wide cache.
+    pub(crate) semantic_metadata_cache: OnceCell<SemanticMetadataCache>,
+    #[cfg(test)]
+    pub(crate) semantic_metadata_validation_runs: Cell<usize>,
     pub name: *mut ObjString,
+}
+
+pub(crate) struct SemanticMetadataCache {
+    pub(crate) opcode_starts: Box<[bool]>,
+    pub(crate) points: Box<[DebugPoint]>,
 }
 
 pub type NativeFn = fn(arg_count: usize, args: &[Value]) -> Value;
 
+#[repr(C)]
 pub struct ObjNative {
     pub obj: Obj,
     pub function: NativeFn,
+    pub name: Box<str>,
 }
 
 #[repr(C)]
@@ -92,47 +110,159 @@ impl ObjString {
 
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.obj_type {
-            ObjType::Closure => {
-                let closure = unsafe { &*(self as *const Obj as *const ObjClosure) };
-                let function = unsafe { &*closure.function };
+        let mut state = FormatState::new();
+        if state.consume_node() {
+            format_object(self as *const Obj, &mut state, 0);
+        }
+        f.write_str(&state.output)
+    }
+}
 
-                if function.name.is_null() {
-                    write!(f, "<script>")
-                } else {
-                    let name = ObjString::as_str(function.name);
-                    write!(f, "<fn {}>", name)
-                }
-            }
-            ObjType::Function => {
-                let function = unsafe { &*(self as *const Obj as *const ObjFunction) };
-                if function.name.is_null() {
-                    write!(f, "<script>")
-                } else {
-                    let name = ObjString::as_str(function.name);
-                    write!(f, "<fn {}>", name)
-                }
-            }
-            ObjType::Native => {
-                write!(f, "<native fn>")
-            }
-            ObjType::String => {
-                let s = ObjString::as_str(self as *const Obj as *const ObjString);
-                write!(f, "{}", s)
-            }
-            ObjType::Upvalue => write!(f, "upvalue"),
-            ObjType::List => {
-                let list = unsafe { &*(self as *const Obj as *const ObjList) };
+pub(crate) const FORMAT_DEPTH_LIMIT: usize = 64;
+pub(crate) const FORMAT_ELEMENT_LIMIT: usize = 100;
+pub(crate) const FORMAT_NODE_LIMIT: usize = 1_024;
+pub(crate) const FORMAT_TOTAL_ELEMENT_LIMIT: usize = 1_024;
+pub(crate) const FORMAT_BYTE_LIMIT: usize = 8 * 1_024;
+pub(crate) const TRUNCATION_MARKER: &str = "<truncated>";
 
-                write!(f, "[]")?;
-                for (i, item) in list.items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, "]")
+struct FormatState {
+    output: String,
+    visited: HashSet<*const Obj>,
+    nodes_remaining: usize,
+    elements_remaining: usize,
+    truncated: bool,
+}
+
+impl FormatState {
+    fn new() -> Self {
+        Self {
+            output: String::new(),
+            visited: HashSet::new(),
+            nodes_remaining: FORMAT_NODE_LIMIT,
+            elements_remaining: FORMAT_TOTAL_ELEMENT_LIMIT,
+            truncated: false,
+        }
+    }
+
+    fn consume_node(&mut self) -> bool {
+        if self.nodes_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.nodes_remaining -= 1;
+        true
+    }
+
+    fn consume_element(&mut self) -> bool {
+        if self.elements_remaining == 0 {
+            self.truncate();
+            return false;
+        }
+        self.elements_remaining -= 1;
+        true
+    }
+
+    fn write_str(&mut self, value: &str) {
+        if self.truncated {
+            return;
+        }
+
+        let content_limit = FORMAT_BYTE_LIMIT - TRUNCATION_MARKER.len();
+        let remaining = content_limit.saturating_sub(self.output.len());
+        if value.len() <= remaining {
+            self.output.push_str(value);
+            return;
+        }
+
+        let mut end = remaining.min(value.len());
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.output.push_str(&value[..end]);
+        self.truncate();
+    }
+
+    fn truncate(&mut self) {
+        if !self.truncated {
+            self.output.push_str(TRUNCATION_MARKER);
+            self.truncated = true;
+        }
+    }
+}
+
+pub(crate) fn format_value(value: Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut state = FormatState::new();
+    format_value_nested(value, &mut state, 0);
+    f.write_str(&state.output)
+}
+
+fn format_value_nested(value: Value, state: &mut FormatState, depth: usize) {
+    if !state.consume_node() {
+        return;
+    }
+
+    match value {
+        Value::Bool(value) => state.write_str(if value { "true" } else { "false" }),
+        Value::Nil => state.write_str("nil"),
+        Value::Number(value) => state.write_str(&value.to_string()),
+        Value::Obj(ptr) => format_object(ptr, state, depth),
+    }
+}
+
+fn format_object(ptr: *const Obj, state: &mut FormatState, depth: usize) {
+    match unsafe { (*ptr).obj_type } {
+        ObjType::Closure => {
+            let closure = unsafe { &*(ptr as *const ObjClosure) };
+            let function = unsafe { &*closure.function };
+
+            if function.name.is_null() {
+                state.write_str("<script>");
+            } else {
+                state.write_str("<fn ");
+                state.write_str(ObjString::as_str(function.name));
+                state.write_str(">");
             }
+        }
+        ObjType::Function => {
+            let function = unsafe { &*(ptr as *const ObjFunction) };
+            if function.name.is_null() {
+                state.write_str("<script>");
+            } else {
+                state.write_str("<fn ");
+                state.write_str(ObjString::as_str(function.name));
+                state.write_str(">");
+            }
+        }
+        ObjType::Native => state.write_str("<native fn>"),
+        ObjType::String => state.write_str(ObjString::as_str(ptr as *const ObjString)),
+        ObjType::Upvalue => state.write_str("upvalue"),
+        ObjType::List => {
+            if depth >= FORMAT_DEPTH_LIMIT {
+                state.write_str("<depth-limit>");
+                return;
+            }
+            if !state.visited.insert(ptr) {
+                state.write_str("<cycle>");
+                return;
+            }
+
+            let list = unsafe { &*(ptr as *const ObjList) };
+            state.write_str("[");
+            for (index, item) in list.items.iter().take(FORMAT_ELEMENT_LIMIT).enumerate() {
+                if state.truncated || !state.consume_element() {
+                    break;
+                }
+                if index > 0 {
+                    state.write_str(", ");
+                }
+                format_value_nested(*item, state, depth + 1);
+            }
+            if !state.truncated && list.items.len() > FORMAT_ELEMENT_LIMIT {
+                state.truncate();
+            }
+            state.write_str("]");
+
+            state.visited.remove(&ptr);
         }
     }
 }
@@ -144,6 +274,7 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
         let obj_ptr = ptr as *mut Obj;
 
         (*obj_ptr).next = vm.objects;
+        vm.register_object(obj_ptr, (*obj_ptr).obj_type, None);
         vm.objects = obj_ptr;
     }
 
@@ -151,9 +282,11 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -174,15 +307,18 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
     });
 
     let ptr = Box::into_raw(closure);
+    vm.register_object(ptr as *mut Obj, ObjType::Closure, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -197,24 +333,31 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
         arity: 0,
         upvalue_count: 0,
         chunk: Chunk::new(),
+        debug_info: FunctionDebugInfo::default(),
+        semantic_metadata_cache: OnceCell::new(),
+        #[cfg(test)]
+        semantic_metadata_validation_runs: Cell::new(0),
         name: std::ptr::null_mut(),
     };
 
     let ptr = Box::into_raw(Box::new(function));
+    vm.register_object(ptr as *mut Obj, ObjType::Function, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
 
-pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
+pub fn allocate_native(vm: &mut VM, name: &str, function: NativeFn) -> *mut ObjNative {
     let native = ObjNative {
         obj: Obj {
             obj_type: ObjType::Native,
@@ -222,18 +365,22 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
             next: vm.objects,
         },
         function,
+        name: name.into(),
     };
 
     let ptr = Box::into_raw(Box::new(native));
+    vm.register_object(ptr as *mut Obj, ObjType::Native, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -260,6 +407,7 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         };
         (*ptr).length = len;
         (*ptr).hash = hash;
+        vm.register_object(ptr as *mut Obj, ObjType::String, Some(len));
         vm.objects = ptr as *mut Obj;
 
         let chars_ptr = (ptr as *mut u8).add(std::mem::size_of::<ObjString>());
@@ -269,7 +417,11 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         collect_garbage(vm);
 
         #[cfg(feature = "debug_log_gc")]
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        eprintln!(
+            "{:p} allocate for {:?}",
+            ptr,
+            Obj::obj_type(ptr as *mut Obj)
+        );
 
         ptr
     }
@@ -288,55 +440,20 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
     };
 
     let ptr = Box::into_raw(Box::new(upvalue));
+    vm.register_object(ptr as *mut Obj, ObjType::Upvalue, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
-}
-
-pub fn capture_upvalue(vm: &mut VM, local: *mut Value) -> *mut ObjUpvalue {
-    let mut prev_upvalue: *mut ObjUpvalue = std::ptr::null_mut();
-    let mut upvalue = vm.open_upvalues;
-
-    unsafe {
-        while !upvalue.is_null() && (*upvalue).location > local {
-            prev_upvalue = upvalue;
-            upvalue = (*upvalue).next;
-        }
-
-        if !upvalue.is_null() && (*upvalue).location == local {
-            return upvalue;
-        }
-
-        let created_upvalue = allocate_upvalue(vm, local);
-        (*created_upvalue).next = upvalue;
-
-        if prev_upvalue.is_null() {
-            vm.open_upvalues = created_upvalue;
-        } else {
-            (*prev_upvalue).next = created_upvalue;
-        }
-
-        created_upvalue
-    }
-}
-
-pub fn close_upvalues(vm: &mut VM, last: *mut Value) {
-    unsafe {
-        while !vm.open_upvalues.is_null() && (*vm.open_upvalues).location >= last {
-            let upvalue = vm.open_upvalues;
-            (*upvalue).closed = *(*upvalue).location;
-            (*upvalue).location = &mut (*upvalue).closed;
-            vm.open_upvalues = (*upvalue).next;
-        }
-    }
 }
 
 pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
@@ -350,15 +467,18 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
     };
 
     let ptr = Box::into_raw(Box::new(list));
+    vm.register_object(ptr as *mut Obj, ObjType::List, None);
     vm.objects = ptr as *mut Obj;
 
     #[cfg(feature = "debug_stress_gc")]
     collect_garbage(vm);
 
     #[cfg(feature = "debug_log_gc")]
-    unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
-    }
+    eprintln!(
+        "{:p} allocate for {:?}",
+        ptr,
+        Obj::obj_type(ptr as *mut Obj)
+    );
 
     ptr
 }
@@ -396,12 +516,12 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
     result
 }
 
-pub fn free_object(object: *mut Obj) {
+pub fn free_object(object: *mut Obj, kind: ObjType, string_len: Option<usize>) {
     #[cfg(feature = "debug_log_gc")]
-    println!("{:p} free type {:?}", object, (*object).obj_type);
+    eprintln!("{:p} free type {:?}", object, kind);
 
     unsafe {
-        match (*object).obj_type {
+        match kind {
             ObjType::Closure => {
                 let _ = Box::from_raw(object as *mut ObjClosure);
             }
@@ -412,9 +532,7 @@ pub fn free_object(object: *mut Obj) {
                 let _ = Box::from_raw(object as *mut ObjNative);
             }
             ObjType::String => {
-                let string_ptr = object as *mut ObjString;
-                let len = (*string_ptr).length;
-
+                let len = string_len.expect("string allocations retain their registered size");
                 let layout = Layout::from_size_align(
                     std::mem::size_of::<ObjString>() + len,
                     std::mem::align_of::<ObjString>(),

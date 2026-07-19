@@ -15,6 +15,8 @@ pub struct Table {
     pub count: usize,
     pub capacity: usize,
     pub entries: *mut Entry,
+    allocation_capacity: usize,
+    allocation_entries: *mut Entry,
 }
 
 impl Table {
@@ -23,6 +25,8 @@ impl Table {
             count: 0,
             capacity: 0,
             entries: std::ptr::null_mut(),
+            allocation_capacity: 0,
+            allocation_entries: std::ptr::null_mut(),
         }
     }
 
@@ -88,15 +92,18 @@ impl Table {
             }
         }
 
-        if !self.entries.is_null() {
+        if !self.allocation_entries.is_null() {
             unsafe {
-                let old_layout = std::alloc::Layout::array::<Entry>(self.capacity).unwrap();
-                std::alloc::dealloc(self.entries as *mut u8, old_layout);
+                let old_layout =
+                    std::alloc::Layout::array::<Entry>(self.allocation_capacity).unwrap();
+                std::alloc::dealloc(self.allocation_entries as *mut u8, old_layout);
             }
         }
 
         self.entries = entries;
         self.capacity = capacity;
+        self.allocation_entries = entries;
+        self.allocation_capacity = capacity;
     }
 
     pub fn add_all(&mut self, from: &Table) {
@@ -173,19 +180,44 @@ impl Table {
             true
         }
     }
+
+    pub(crate) fn visit_live(
+        &self,
+        mut visitor: impl FnMut(*mut ObjString, Value),
+    ) -> Result<(), ()> {
+        if self.count > self.capacity
+            || self.capacity != self.allocation_capacity
+            || self.entries != self.allocation_entries
+            || (self.capacity == 0 && !self.entries.is_null())
+            || (self.capacity > 0 && self.entries.is_null())
+        {
+            return Err(());
+        }
+
+        for index in 0..self.allocation_capacity {
+            let entry = unsafe { self.allocation_entries.add(index) };
+            let key = unsafe { (*entry).key };
+            if !key.is_null() {
+                visitor(key, unsafe { (*entry).value });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Table {
     fn drop(&mut self) {
-        if !self.entries.is_null() {
+        if !self.allocation_entries.is_null() {
             unsafe {
-                let layout = Layout::array::<Entry>(self.capacity).unwrap();
-                dealloc(self.entries as *mut u8, layout);
+                let layout = Layout::array::<Entry>(self.allocation_capacity).unwrap();
+                dealloc(self.allocation_entries as *mut u8, layout);
             }
 
             self.count = 0;
             self.capacity = 0;
             self.entries = std::ptr::null_mut();
+            self.allocation_capacity = 0;
+            self.allocation_entries = std::ptr::null_mut();
         }
     }
 }
