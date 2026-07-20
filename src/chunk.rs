@@ -25,6 +25,7 @@ pub enum OpCode {
     SetUpvalue,
     GetProperty,
     SetProperty,
+    GetSuper,
     BuildList,
     BuildListLong,
     GetIndex,
@@ -45,10 +46,12 @@ pub enum OpCode {
     Loop,
     Call,
     Invoke,
+    SuperInvoke,
     Closure,
     CloseUpvalue,
     Return,
     Class,
+    Inherit,
     Method,
 }
 

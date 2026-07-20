@@ -88,6 +88,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::SetProperty as u8 => {
             constant_instruction("OP_SET_PROPERTY", chunk, offset)
         }
+        x if x == OpCode::GetSuper as u8 => constant_instruction("OP_GET_SUPER", chunk, offset),
         x if x == OpCode::Equal as u8 => simple_instruction("OP_EQUAL", offset),
         x if x == OpCode::Greater as u8 => simple_instruction("OP_GREATER", offset),
         x if x == OpCode::Less as u8 => simple_instruction("OP_LESS", offset),
@@ -129,6 +130,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Loop as u8 => jump_instruction("OP_LOOP", -1, chunk, offset),
         x if x == OpCode::Call as u8 => byte_instruction("OP_CALL", chunk, offset),
         x if x == OpCode::Invoke as u8 => invoke_instruction("OP_INVOKE", chunk, offset),
+        x if x == OpCode::SuperInvoke as u8 => invoke_instruction("OP_SUPER_INVOKE", chunk, offset),
         x if x == OpCode::Closure as u8 => {
             let constant = chunk.code[offset + 1] as usize;
             let value = chunk.constants[constant];
@@ -155,6 +157,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::CloseUpvalue as u8 => simple_instruction("OP_CLOSE_UPVALUE", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         x if x == OpCode::Class as u8 => constant_instruction("OP_CLASS", chunk, offset),
+        x if x == OpCode::Inherit as u8 => simple_instruction("OP_INHERIT", offset),
         x if x == OpCode::Method as u8 => constant_instruction("OP_METHOD", chunk, offset),
         _ => {
             println!("Unknown opcode {}", instruction);

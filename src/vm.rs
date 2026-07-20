@@ -659,6 +659,14 @@ fn run(vm: &mut VM) -> InterpretResult {
                 vm.pop();
                 vm.push(value);
             }
+            x if x == OpCode::GetSuper as u8 => {
+                let name = read_string!(ip, chunk);
+                let superclass = vm.pop().as_class();
+
+                if !bind_method(vm, superclass, name) {
+                    return InterpretResult::RuntimeError;
+                }
+            }
             x if x == OpCode::Equal as u8 => {
                 let b = vm.pop();
                 let a = vm.pop();
@@ -911,6 +919,22 @@ fn run(vm: &mut VM) -> InterpretResult {
                 ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
                 slots = vm.frames[vm.frame_count - 1].slots;
             }
+            x if x == OpCode::SuperInvoke as u8 => {
+                let method = read_string!(ip, chunk);
+                let arg_count = read_byte!(ip) as usize;
+                let superclass = vm.pop().as_class();
+
+                let final_offset = unsafe { ip.offset_from(chunk.code.as_ptr()) } as usize;
+                vm.frames[vm.frame_count - 1].ip = final_offset;
+
+                if !invoke_from_class(vm, superclass, method, arg_count) {
+                    return InterpretResult::RuntimeError;
+                }
+
+                chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
+                ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
+                slots = vm.frames[vm.frame_count - 1].slots;
+            }
             x if x == OpCode::Closure as u8 => {
                 let function_val = read_constant!(ip, chunk);
                 let function_ptr = function_val.as_function();
@@ -960,6 +984,18 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let name = read_string!(ip, chunk);
                 let class = allocate_class(vm, name);
                 vm.push(Value::Obj(class as *mut Obj));
+            }
+            x if x == OpCode::Inherit as u8 => {
+                let superclass = vm.peek(1);
+                if !superclass.is_class() {
+                    vm.runtime_error("Superclass must be a class.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let subclass = unsafe { &mut *vm.peek(0).as_class() };
+                let superclass_methods = unsafe { &(*superclass.as_class()).methods };
+                subclass.methods.add_all(superclass_methods);
+                vm.pop();
             }
             x if x == OpCode::Method as u8 => {
                 let name = read_string!(ip, chunk);

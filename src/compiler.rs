@@ -77,6 +77,7 @@ struct Compiler<'a> {
 
 struct ClassCompiler {
     enclosing: Option<Box<ClassCompiler>>,
+    has_superclass: bool,
 }
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
@@ -367,7 +368,37 @@ fn class_declaration<'a>(
     define_variable(parser, chunk, name_constant as u8);
 
     let enclosing = parser.current_class.take();
-    parser.current_class = Some(Box::new(ClassCompiler { enclosing }));
+    parser.current_class = Some(Box::new(ClassCompiler {
+        enclosing,
+        has_superclass: false,
+    }));
+
+    if match_token(parser, scanner, TokenType::Less) {
+        consume(
+            parser,
+            scanner,
+            TokenType::Identifier,
+            "Expect superclass name.",
+        );
+
+        if &name_token.start[..name_token.length]
+            == &parser.previous.start[..parser.previous.length]
+        {
+            error(parser, "A class can't inherit from itself.");
+        }
+
+        variable(parser, scanner, chunk, vm, false); // load superclass
+
+        begin_scope(parser);
+        let super_token = synthetic_token("super");
+        add_local(parser, super_token);
+        define_variable(parser, chunk, 0);
+
+        named_variable(parser, scanner, chunk, vm, name_token, false);
+        emit_byte(parser, chunk, OpCode::Inherit as u8);
+
+        parser.current_class.as_mut().unwrap().has_superclass = true;
+    }
 
     named_variable(parser, scanner, chunk, vm, name_token, false);
 
@@ -388,6 +419,10 @@ fn class_declaration<'a>(
     );
 
     emit_byte(parser, chunk, OpCode::Pop as u8);
+
+    if parser.current_class.as_ref().unwrap().has_superclass {
+        end_scope(parser, chunk);
+    }
 
     let enclosing = parser.current_class.as_mut().unwrap().enclosing.take();
     parser.current_class = enclosing;
@@ -1192,6 +1227,60 @@ fn variable<'a>(
     named_variable(parser, scanner, chunk, vm, name, can_assign);
 }
 
+fn synthetic_token(text: &'static str) -> Token<'static> {
+    Token {
+        token_type: TokenType::Identifier,
+        start: text,
+        length: text.len(),
+        line: 0,
+        column: 0,
+    }
+}
+
+fn super_<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _can_assign: bool,
+) {
+    if parser.current_class.is_none() {
+        error(parser, "Can't use 'super' outside of a class.");
+    } else if !parser.current_class.as_ref().unwrap().has_superclass {
+        error(parser, "Can't use 'super' in a class with no superclass.");
+    }
+
+    consume(parser, scanner, TokenType::Dot, "Expect '.' after 'super'.");
+    consume(
+        parser,
+        scanner,
+        TokenType::Identifier,
+        "Expect superclass method name.",
+    );
+    let name = parser.previous;
+    let name_constant = identifier_constant(parser, chunk, vm, name);
+
+    let this_token = synthetic_token("this");
+    named_variable(parser, scanner, chunk, vm, this_token, false);
+
+    if match_token(parser, scanner, TokenType::LeftParen) {
+        let arg_count = argument_list(parser, scanner, chunk, vm);
+        let super_token = synthetic_token("super");
+        named_variable(parser, scanner, chunk, vm, super_token, false);
+        emit_bytes(
+            parser,
+            chunk,
+            OpCode::SuperInvoke as u8,
+            name_constant as u8,
+        );
+        emit_byte(parser, chunk, arg_count);
+    } else {
+        let super_token = synthetic_token("super");
+        named_variable(parser, scanner, chunk, vm, super_token, false);
+        emit_bytes(parser, chunk, OpCode::GetSuper as u8, name_constant as u8);
+    }
+}
+
 fn this<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -1639,6 +1728,11 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: Some(dot),
             precedence: Precedence::Call,
         },
+        TokenType::Super => ParseRule {
+            prefix: Some(super_),
+            infix: None,
+            precedence: Precedence::None,
+        },
         TokenType::This => ParseRule {
             prefix: Some(this),
             infix: None,
@@ -1674,7 +1768,6 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         | TokenType::Or
         | TokenType::Print
         | TokenType::Return
-        | TokenType::Super
         | TokenType::Var
         | TokenType::While
         | TokenType::Error
