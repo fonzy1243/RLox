@@ -308,7 +308,7 @@ fn function<'a>(
     block(parser, scanner, new_chunk, vm);
 
     let (function_ptr, upvalues) = end_compiler(parser, new_chunk, vm);
-    let constant = make_constant(parser, chunk, Value::Obj(function_ptr as *mut Obj));
+    let constant = make_constant(parser, chunk, vm, Value::Obj(function_ptr as *mut Obj));
     emit_bytes(parser, chunk, OpCode::Closure as u8, constant as u8);
 
     for upvalue in &upvalues {
@@ -815,12 +815,12 @@ fn emit_return(parser: &Parser, chunk: &mut Chunk) {
     emit_byte(parser, chunk, OpCode::Return as u8);
 }
 
-fn make_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) -> usize {
-    chunk.add_constant(value)
+fn make_constant(parser: &mut Parser, chunk: &mut Chunk, vm: &mut VM, value: Value) -> usize {
+    chunk.add_constant(value, vm)
 }
 
-fn emit_constant(parser: &mut Parser, chunk: &mut Chunk, value: Value) {
-    let constant = make_constant(parser, chunk, value);
+fn emit_constant(parser: &mut Parser, chunk: &mut Chunk, vm: &mut VM, value: Value) {
+    let constant = make_constant(parser, chunk, vm, value);
 
     if constant <= 255 {
         emit_bytes(parser, chunk, OpCode::Constant as u8, constant as u8);
@@ -958,13 +958,13 @@ fn number<'a>(
     parser: &mut Parser<'a>,
     _: &mut Scanner<'a>,
     chunk: &mut Chunk,
-    _: &mut VM,
+    vm: &mut VM,
     _: bool,
 ) {
     let value: f64 = parser.previous.start[..parser.previous.length]
         .parse()
         .unwrap();
-    emit_constant(parser, chunk, Value::Number(value));
+    emit_constant(parser, chunk, vm, Value::Number(value));
 }
 
 fn or<'a>(
@@ -993,7 +993,7 @@ fn string<'a>(
 ) {
     let s = &parser.previous.start[1..parser.previous.length - 1];
     let ptr = copy_string(vm, s);
-    emit_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
+    emit_constant(parser, chunk, vm, Value::Obj(ptr as *mut Obj));
 }
 
 fn list<'a>(
@@ -1177,7 +1177,7 @@ fn identifier_constant<'a>(
 ) -> u8 {
     let s = &name.start[..name.length];
     let ptr = copy_string(vm, s);
-    let constant = make_constant(parser, chunk, Value::Obj(ptr as *mut Obj));
+    let constant = make_constant(parser, chunk, vm, Value::Obj(ptr as *mut Obj));
 
     if constant > u8::MAX as usize {
         error(parser, "Too many globals in one chunk.");

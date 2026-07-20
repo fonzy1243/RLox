@@ -3,11 +3,11 @@ use std::{
     fmt,
 };
 
-use crate::chunk::Chunk;
 use crate::value::Value;
 use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
 use crate::vm::collect_garbage;
+use crate::{chunk::Chunk, vm::collect_garbage};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -137,6 +137,7 @@ impl fmt::Display for Obj {
     }
 }
 
+/*
 fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
     let ptr = Box::into_raw(Box::new(object));
 
@@ -157,6 +158,7 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
 
     ptr
 }
+*/
 
 pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClosure {
     let upvalue_count = unsafe { (*function).upvalue_count };
@@ -181,7 +183,13 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
 
     #[cfg(feature = "debug_log_gc")]
     unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjClosure>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
     }
 
     ptr
@@ -208,7 +216,13 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
 
     #[cfg(feature = "debug_log_gc")]
     unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjFunction>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
     }
 
     ptr
@@ -232,7 +246,13 @@ pub fn allocate_native(vm: &mut VM, function: NativeFn) -> *mut ObjNative {
 
     #[cfg(feature = "debug_log_gc")]
     unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjNative>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
     }
 
     ptr
@@ -269,7 +289,18 @@ pub fn allocate_string(vm: &mut VM, chars: &str, hash: u32) -> *mut ObjString {
         collect_garbage(vm);
 
         #[cfg(feature = "debug_log_gc")]
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+
+        let size = std::mem::size_of::<ObjString>() + len;
+        vm.bytes_allocated += size;
+
+        if vm.bytes_allocated > vm.next_gc {
+            collect_garbage(vm);
+        }
+
+        vm.push(Value::Obj(ptr as *mut Obj));
+        vm.strings.set(ptr, Value::Nil);
+        vm.pop();
 
         ptr
     }
@@ -295,7 +326,13 @@ pub fn allocate_upvalue(vm: &mut VM, slot: *mut Value) -> *mut ObjUpvalue {
 
     #[cfg(feature = "debug_log_gc")]
     unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjUpvalue>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
     }
 
     ptr
@@ -357,7 +394,13 @@ pub fn allocate_list(vm: &mut VM, items: Vec<Value>) -> *mut ObjList {
 
     #[cfg(feature = "debug_log_gc")]
     unsafe {
-        println!("{:p} allocate for {:?}", ptr, (*ptr).obj_type);
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjList>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
     }
 
     ptr
@@ -379,9 +422,7 @@ pub fn copy_string(vm: &mut VM, chars: &str) -> *mut ObjString {
         return interned;
     }
 
-    let result = allocate_string(vm, chars, hash);
-    vm.strings.set(result, Value::Nil);
-    result
+    allocate_string(vm, chars, hash)
 }
 
 pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
@@ -391,29 +432,33 @@ pub fn take_string(vm: &mut VM, chars: String) -> *mut ObjString {
         return interned;
     }
 
-    let result = allocate_string(vm, &chars, hash);
-    vm.strings.set(result, Value::Nil);
-    result
+    allocate_string(vm, &chars, hash)
 }
 
-pub fn free_object(object: *mut Obj) {
+pub fn free_object(vm: &mut VM, object: *mut Obj) {
     #[cfg(feature = "debug_log_gc")]
-    println!("{:p} free type {:?}", object, (*object).obj_type);
+    unsafe {
+        println!("{:p} free type {:?}", object, (*object).obj_type);
+    }
 
     unsafe {
         match (*object).obj_type {
             ObjType::Closure => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjClosure>();
                 let _ = Box::from_raw(object as *mut ObjClosure);
             }
             ObjType::Function => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjFunction>();
                 let _ = Box::from_raw(object as *mut ObjFunction);
             }
             ObjType::Native => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjNative>();
                 let _ = Box::from_raw(object as *mut ObjNative);
             }
             ObjType::String => {
                 let string_ptr = object as *mut ObjString;
                 let len = (*string_ptr).length;
+                vm.bytes_allocated -= std::mem::size_of::<ObjString>() + len;
 
                 let layout = Layout::from_size_align(
                     std::mem::size_of::<ObjString>() + len,
@@ -424,9 +469,11 @@ pub fn free_object(object: *mut Obj) {
                 dealloc(object as *mut u8, layout);
             }
             ObjType::Upvalue => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjUpvalue>();
                 let _ = Box::from_raw(object as *mut ObjUpvalue);
             }
             ObjType::List => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjList>();
                 // Rebox drops Vec memory
                 let _ = Box::from_raw(object as *mut ObjList);
             }

@@ -1,4 +1,7 @@
-use crate::value::{Value, values_equal};
+use crate::{
+    value::{Value, values_equal},
+    vm::VM,
+};
 
 #[derive(Debug)]
 #[repr(u8)]
@@ -89,19 +92,21 @@ impl Chunk {
         panic!("No line info for instruction {}", index);
     }
 
-    pub fn add_constant(&mut self, value: Value) -> usize {
+    pub fn add_constant(&mut self, value: Value, vm: &mut VM) -> usize {
         for (i, constant) in self.constants.iter().enumerate() {
             if values_equal(*constant, value) {
                 return i;
             }
         }
 
+        vm.push(value);
         self.constants.push(value);
+        vm.pop();
         self.constants.len() - 1
     }
 
-    pub fn write_constant(&mut self, value: Value, line: usize) {
-        let index = self.add_constant(value);
+    pub fn write_constant(&mut self, value: Value, line: usize, vm: &mut VM) {
+        let index = self.add_constant(value, vm);
         if index < 256 {
             self.write(OpCode::Constant, line);
             self.write(index as u8, line);

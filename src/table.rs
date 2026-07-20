@@ -139,6 +139,18 @@ impl Table {
         }
     }
 
+    pub fn remove_white(&mut self) {
+        for i in 0..self.capacity {
+            unsafe {
+                let entry = self.entries.add(i);
+                let key = (*entry).key;
+                if !key.is_null() && !(*key).obj.is_marked {
+                    self.delete(key);
+                }
+            }
+        }
+    }
+
     pub fn get(&self, key: *mut ObjString) -> Option<Value> {
         if self.count == 0 {
             return None;

@@ -3,9 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{
-    NativeFn, Obj, ObjClosure, ObjFunction, ObjString, ObjType, ObjUpvalue, allocate_closure,
-    allocate_list, allocate_native, allocate_string, capture_upvalue, close_upvalues, copy_string,
-    free_object, take_string,
+    NativeFn, Obj, ObjClosure, ObjFunction, ObjList, ObjString, ObjType, ObjUpvalue,
+    allocate_closure, allocate_list, allocate_native, allocate_string, capture_upvalue,
+    close_upvalues, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -15,6 +15,7 @@ use crate::debug::disassemble_instruction;
 
 const FRAMES_MAX: usize = 256;
 const STACK_MAX: usize = FRAMES_MAX * 256;
+const GC_HEAP_GROW_FACTOR: usize = 2;
 
 macro_rules! read_byte {
     ($ip:expr) => {{
@@ -85,6 +86,8 @@ pub struct VM {
     pub open_upvalues: *mut ObjUpvalue,
     pub compiler_roots: Vec<*mut ObjFunction>,
     pub gray_stack: Vec<*mut Obj>,
+    pub bytes_allocated: usize,
+    pub next_gc: usize,
 }
 
 pub enum InterpretResult {
@@ -112,6 +115,8 @@ impl VM {
             open_upvalues: std::ptr::null_mut(),
             compiler_roots: Vec::new(),
             gray_stack: Vec::new(),
+            bytes_allocated: 0,
+            next_gc: 1024 * 1024,
         };
 
         vm.stack_top = vm.stack.as_mut_ptr();
@@ -200,16 +205,14 @@ impl VM {
     }
 
     fn concatenate(&mut self) {
-        let b_val = self.pop();
-        let a_val = self.pop();
-
-        let b = b_val.as_cstring();
-        let a = a_val.as_cstring();
+        let b = self.peek(0).as_cstring().to_owned();
+        let a = self.peek(1).as_cstring().to_owned();
 
         let chars = format!("{}{}", a, b);
-
         let result = take_string(self, chars);
 
+        self.pop();
+        self.pop();
         self.push(Value::Obj(result as *mut Obj));
     }
 
@@ -253,7 +256,7 @@ impl Drop for VM {
         while !object.is_null() {
             unsafe {
                 let next = (*object).next;
-                free_object(object);
+                free_object(self, object);
                 object = next;
             }
         }
@@ -273,10 +276,26 @@ fn clock_native(_: usize, _: &[Value]) -> Value {
 // Garbage Collection
 pub fn collect_garbage(vm: &mut VM) {
     #[cfg(feature = "debug_log_gc")]
-    println!("-- gc begin");
+    let before = vm.bytes_allocated;
 
     #[cfg(feature = "debug_log_gc")]
-    println!("-- gc end");
+    println!("-- gc begin");
+
+    mark_roots(vm);
+    trace_references(vm);
+    vm.strings.remove_white();
+    sweep(vm);
+
+    vm.next_gc = vm.bytes_allocated * GC_HEAP_GROW_FACTOR;
+
+    #[cfg(feature = "debug_log_gc")]
+    println!(
+        "-- gc end. collected {} bytes (from {} to {}), next at {}",
+        before - vm.bytes_allocated,
+        before,
+        vm.bytes_allocated,
+        vm.next_gc
+    );
 }
 
 pub fn mark_object(vm: &mut VM, object: *mut Obj) {
@@ -290,7 +309,7 @@ pub fn mark_object(vm: &mut VM, object: *mut Obj) {
         }
 
         #[cfg(feature = "debug_log_gc")]
-        println!("{:p} mark {}", object, unsafe { Value::Obj(object) });
+        println!("{:p} mark {}", object, Value::Obj(object));
 
         (*object).is_marked = true;
     }
@@ -301,6 +320,43 @@ pub fn mark_object(vm: &mut VM, object: *mut Obj) {
 pub fn mark_value(vm: &mut VM, value: Value) {
     if let Value::Obj(ptr) = value {
         mark_object(vm, ptr);
+    }
+}
+
+fn blacken_object(vm: &mut VM, object: *mut Obj) {
+    #[cfg(feature = "debug_log_gc")]
+    println!("{:p} blacken {}", object, Value::Obj(object));
+
+    unsafe {
+        match (*object).obj_type {
+            ObjType::Native | ObjType::String => {}
+            ObjType::Upvalue => {
+                let upvalue = object as *mut ObjUpvalue;
+                mark_value(vm, (*upvalue).closed);
+            }
+            ObjType::Function => {
+                let function = object as *mut ObjFunction;
+                mark_object(vm, (*function).name as *mut Obj);
+                let constants: Vec<Value> = (*function).chunk.constants.clone();
+                for value in constants {
+                    mark_value(vm, value);
+                }
+            }
+            ObjType::Closure => {
+                let closure = object as *mut ObjClosure;
+                mark_object(vm, (*closure).function as *mut Obj);
+                for i in 0..(*closure).upvalue_count {
+                    mark_object(vm, (*closure).upvalues[i] as *mut Obj);
+                }
+            }
+            ObjType::List => {
+                let list = object as *mut ObjList;
+                let items: Vec<Value> = (*list).items.clone();
+                for item in items {
+                    mark_value(vm, item);
+                }
+            }
+        }
     }
 }
 
@@ -349,6 +405,38 @@ fn mark_roots(vm: &mut VM) {
 
     // Mark compiler roots
     mark_compiler_roots(vm);
+}
+
+fn trace_references(vm: &mut VM) {
+    while let Some(object) = vm.gray_stack.pop() {
+        blacken_object(vm, object);
+    }
+}
+
+fn sweep(vm: &mut VM) {
+    let mut previous: *mut Obj = std::ptr::null_mut();
+    let mut object = vm.objects;
+
+    while !object.is_null() {
+        unsafe {
+            if (*object).is_marked {
+                (*object).is_marked = false;
+                previous = object;
+                object = (*object).next;
+            } else {
+                let unreached = object;
+                object = (*object).next;
+
+                if !previous.is_null() {
+                    (*previous).next = object;
+                } else {
+                    vm.objects = object;
+                }
+
+                free_object(vm, unreached);
+            }
+        }
+    }
 }
 // -----------------
 
