@@ -317,6 +317,34 @@ fn function<'a>(
     }
 }
 
+fn class_declaration<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+) {
+    consume(parser, scanner, TokenType::Identifier, "Expect class name.");
+    let name_token = parser.previous;
+    let name_constant = identifier_constant(parser, chunk, vm, name_token);
+    declare_variable(parser);
+
+    emit_bytes(parser, chunk, OpCode::Class as u8, name_constant as u8);
+    define_variable(parser, chunk, name_constant as u8);
+
+    consume(
+        parser,
+        scanner,
+        TokenType::LeftBrace,
+        "Expect '{' before class body.",
+    );
+    consume(
+        parser,
+        scanner,
+        TokenType::RightBrace,
+        "Expect '}' after class body.",
+    );
+}
+
 fn fun_declaration<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -710,7 +738,9 @@ fn declaration<'a>(
     chunk: &mut Chunk,
     vm: &mut VM,
 ) {
-    if match_token(parser, scanner, TokenType::Fun) {
+    if match_token(parser, scanner, TokenType::Class) {
+        class_declaration(parser, scanner, chunk, vm);
+    } else if match_token(parser, scanner, TokenType::Fun) {
         fun_declaration(parser, scanner, chunk, vm);
     } else if match_token(parser, scanner, TokenType::Var) {
         var_declaration(parser, scanner, chunk, vm);
@@ -921,6 +951,40 @@ fn call<'a>(
 ) {
     let arg_count = argument_list(parser, scanner, chunk, vm);
     emit_bytes(parser, chunk, OpCode::Call as u8, arg_count);
+}
+
+fn dot<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    can_assign: bool,
+) {
+    consume(
+        parser,
+        scanner,
+        TokenType::Identifier,
+        "Expect property name after '.'.",
+    );
+    let name = parser.previous;
+    let name_constant = identifier_constant(parser, chunk, vm, name);
+
+    if can_assign && match_token(parser, scanner, TokenType::Equal) {
+        expression(parser, scanner, chunk, vm);
+        emit_bytes(
+            parser,
+            chunk,
+            OpCode::SetProperty as u8,
+            name_constant as u8,
+        );
+    } else {
+        emit_bytes(
+            parser,
+            chunk,
+            OpCode::GetProperty as u8,
+            name_constant as u8,
+        );
+    }
 }
 
 fn literal<'a>(
@@ -1497,6 +1561,11 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: Some(or),
             precedence: Precedence::Or,
         },
+        TokenType::Dot => ParseRule {
+            prefix: None,
+            infix: Some(dot),
+            precedence: Precedence::Call,
+        },
         TokenType::False | TokenType::Nil | TokenType::True => ParseRule {
             prefix: Some(literal),
             infix: None,
@@ -1517,7 +1586,6 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         | TokenType::GreaterGreater
         | TokenType::GreaterGreaterGreater
         | TokenType::Comma
-        | TokenType::Dot
         | TokenType::Semicolon
         | TokenType::Equal
         | TokenType::Class

@@ -1,4 +1,6 @@
-use crate::object::{Obj, ObjClosure, ObjFunction, ObjList, ObjNative, ObjString, ObjType};
+use crate::object::{
+    Obj, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList, ObjNative, ObjString, ObjType,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
@@ -48,8 +50,14 @@ impl Value {
     pub fn is_function(&self) -> bool {
         self.is_obj_type(ObjType::Function)
     }
+    pub fn is_instance(&self) -> bool {
+        self.is_obj_type(ObjType::Instance)
+    }
     pub fn is_native(&self) -> bool {
         self.is_obj_type(ObjType::Native)
+    }
+    pub fn is_class(&self) -> bool {
+        self.is_obj_type(ObjType::Class)
     }
     pub fn is_closure(&self) -> bool {
         self.is_obj_type(ObjType::Closure)
@@ -92,10 +100,22 @@ impl Value {
             _ => panic!("Value is not a function"),
         }
     }
+    pub fn as_instance(&self) -> *mut ObjInstance {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjInstance,
+            _ => panic!("Value is not an instance"),
+        }
+    }
     pub fn as_native(&self) -> *mut ObjNative {
         match self {
             Value::Obj(ptr) => *ptr as *mut ObjNative,
             _ => panic!("Value is not a native function"),
+        }
+    }
+    pub fn as_class(&self) -> *mut ObjClass {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjClass,
+            _ => panic!("Value is not a class"),
         }
     }
     pub fn as_closure(&self) -> *mut ObjClosure {

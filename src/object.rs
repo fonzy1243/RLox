@@ -3,17 +3,19 @@ use std::{
     fmt,
 };
 
-use crate::value::Value;
 use crate::vm::VM;
 #[cfg(feature = "debug_stress_gc")]
 use crate::vm::collect_garbage;
 use crate::{chunk::Chunk, vm::collect_garbage};
+use crate::{table::Table, value::Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ObjType {
+    Class,
     Closure,
     Function,
+    Instance,
     Native,
     String,
     Upvalue,
@@ -67,6 +69,19 @@ pub struct ObjClosure {
 }
 
 #[repr(C)]
+pub struct ObjClass {
+    pub obj: Obj,
+    pub name: *mut ObjString,
+}
+
+#[repr(C)]
+pub struct ObjInstance {
+    pub obj: Obj,
+    pub class: *mut ObjClass,
+    pub fields: Table,
+}
+
+#[repr(C)]
 pub struct ObjList {
     pub obj: Obj,
     pub items: Vec<Value>,
@@ -93,6 +108,11 @@ impl ObjString {
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.obj_type {
+            ObjType::Class => {
+                let class = unsafe { &*(self as *const Obj as *const ObjClass) };
+                let name = ObjString::as_str(class.name);
+                write!(f, "{}", name)
+            }
             ObjType::Closure => {
                 let closure = unsafe { &*(self as *const Obj as *const ObjClosure) };
                 let function = unsafe { &*closure.function };
@@ -112,6 +132,11 @@ impl fmt::Display for Obj {
                     let name = ObjString::as_str(function.name);
                     write!(f, "<fn {}>", name)
                 }
+            }
+            ObjType::Instance => {
+                let instance = unsafe { &*(self as *const Obj as *const ObjInstance) };
+                let name = ObjString::as_str(unsafe { (*instance.class).name });
+                write!(f, "{} instance", name)
             }
             ObjType::Native => {
                 write!(f, "<native fn>")
@@ -195,6 +220,36 @@ pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClos
     ptr
 }
 
+pub fn allocate_class(vm: &mut VM, name: *mut ObjString) -> *mut ObjClass {
+    let class = ObjClass {
+        obj: Obj {
+            obj_type: ObjType::Class,
+            is_marked: false,
+            next: vm.objects,
+        },
+        name,
+    };
+
+    let ptr = Box::into_raw(Box::new(class));
+    vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjClass>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
+    }
+
+    ptr
+}
+
 pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     let function = ObjFunction {
         obj: Obj {
@@ -220,6 +275,37 @@ pub fn allocate_function(vm: &mut VM) -> *mut ObjFunction {
     }
 
     vm.bytes_allocated += std::mem::size_of::<ObjFunction>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
+    }
+
+    ptr
+}
+
+pub fn allocate_instance(vm: &mut VM, class: *mut ObjClass) -> *mut ObjInstance {
+    let instance = ObjInstance {
+        obj: Obj {
+            obj_type: ObjType::Instance,
+            is_marked: false,
+            next: vm.objects,
+        },
+        class,
+        fields: Table::new(),
+    };
+
+    let ptr = Box::into_raw(Box::new(instance));
+    vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjInstance>();
 
     if vm.bytes_allocated > vm.next_gc {
         collect_garbage(vm);
@@ -443,6 +529,10 @@ pub fn free_object(vm: &mut VM, object: *mut Obj) {
 
     unsafe {
         match (*object).obj_type {
+            ObjType::Class => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjClass>();
+                let _ = Box::from_raw(object as *mut ObjClass);
+            }
             ObjType::Closure => {
                 vm.bytes_allocated -= std::mem::size_of::<ObjClosure>();
                 let _ = Box::from_raw(object as *mut ObjClosure);
@@ -450,6 +540,10 @@ pub fn free_object(vm: &mut VM, object: *mut Obj) {
             ObjType::Function => {
                 vm.bytes_allocated -= std::mem::size_of::<ObjFunction>();
                 let _ = Box::from_raw(object as *mut ObjFunction);
+            }
+            ObjType::Instance => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjInstance>();
+                let _ = Box::from_raw(object as *mut ObjInstance);
             }
             ObjType::Native => {
                 vm.bytes_allocated -= std::mem::size_of::<ObjNative>();

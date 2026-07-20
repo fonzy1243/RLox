@@ -23,6 +23,8 @@ pub enum OpCode {
     SetGlobal,
     GetUpvalue,
     SetUpvalue,
+    GetProperty,
+    SetProperty,
     BuildList,
     BuildListLong,
     GetIndex,
@@ -45,6 +47,7 @@ pub enum OpCode {
     Closure,
     CloseUpvalue,
     Return,
+    Class,
 }
 
 impl From<OpCode> for u8 {

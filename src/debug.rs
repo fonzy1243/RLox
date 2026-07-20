@@ -72,6 +72,12 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::Nil as u8 => simple_instruction("OP_NIL", offset),
         x if x == OpCode::True as u8 => simple_instruction("OP_TRUE", offset),
         x if x == OpCode::False as u8 => simple_instruction("OP_FALSE", offset),
+        x if x == OpCode::GetProperty as u8 => {
+            constant_instruction("OP_GET_PROPERTY", chunk, offset)
+        }
+        x if x == OpCode::SetProperty as u8 => {
+            constant_instruction("OP_SET_PROPERTY", chunk, offset)
+        }
         x if x == OpCode::Equal as u8 => simple_instruction("OP_EQUAL", offset),
         x if x == OpCode::Greater as u8 => simple_instruction("OP_GREATER", offset),
         x if x == OpCode::Less as u8 => simple_instruction("OP_LESS", offset),
@@ -137,6 +143,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         }
         x if x == OpCode::CloseUpvalue as u8 => simple_instruction("OP_CLOSE_UPVALUE", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
+        x if x == OpCode::Class as u8 => constant_instruction("OP_CLASS", chunk, offset),
         _ => {
             println!("Unknown opcode {}", instruction);
             offset + 1

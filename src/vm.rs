@@ -3,9 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{
-    NativeFn, Obj, ObjClosure, ObjFunction, ObjList, ObjString, ObjType, ObjUpvalue,
-    allocate_closure, allocate_list, allocate_native, allocate_string, capture_upvalue,
-    close_upvalues, copy_string, free_object, take_string,
+    NativeFn, Obj, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList, ObjString, ObjType,
+    ObjUpvalue, allocate_class, allocate_closure, allocate_instance, allocate_list,
+    allocate_native, allocate_string, capture_upvalue, close_upvalues, copy_string, free_object,
+    take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -185,7 +186,14 @@ impl VM {
     }
 
     fn call_value(&mut self, callee: Value, arg_count: usize) -> bool {
-        if callee.is_closure() {
+        if callee.is_class() {
+            let class = callee.as_class();
+            let instance = allocate_instance(self, class);
+            unsafe {
+                *self.stack_top.sub(arg_count + 1) = Value::Obj(instance as *mut Obj);
+            }
+            return true;
+        } else if callee.is_closure() {
             return self.call(callee.as_closure(), arg_count);
         } else if callee.is_native() {
             let native = callee.as_native();
@@ -341,6 +349,18 @@ fn blacken_object(vm: &mut VM, object: *mut Obj) {
                 for value in constants {
                     mark_value(vm, value);
                 }
+            }
+            ObjType::Instance => {
+                let instance = object as *mut ObjInstance;
+                unsafe {
+                    mark_object(vm, (*instance).class as *mut Obj);
+                    let fields_ptr = &(*instance).fields as *const Table;
+                    mark_table(vm, &*fields_ptr);
+                }
+            }
+            ObjType::Class => {
+                let class = object as *mut ObjClass;
+                mark_object(vm, unsafe { (*class).name as *mut Obj });
             }
             ObjType::Closure => {
                 let closure = object as *mut ObjClosure;
@@ -502,6 +522,40 @@ fn run(vm: &mut VM) -> InterpretResult {
                     let upvalue = (*vm.frames[vm.frame_count - 1].closure).upvalues[slot];
                     *(*upvalue).location = value;
                 }
+            }
+            x if x == OpCode::GetProperty as u8 => {
+                if !vm.peek(0).is_instance() {
+                    vm.runtime_error("Only instances have properties.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let instance = unsafe { &*vm.peek(0).as_instance() };
+                let name = read_string!(ip, chunk);
+
+                if let Some(value) = instance.fields.get(name) {
+                    vm.pop();
+                    vm.push(value);
+                } else {
+                    let name_str = unsafe { ObjString::as_str(name) };
+                    vm.runtime_error(&format!("Undefined property '{}'.", name_str));
+                    return InterpretResult::RuntimeError;
+                }
+            }
+            x if x == OpCode::SetProperty as u8 => {
+                if !vm.peek(1).is_instance() {
+                    vm.runtime_error("Only instances have fields.");
+                    return InterpretResult::RuntimeError;
+                }
+
+                let instance = unsafe { &mut *vm.peek(1).as_instance() };
+                let name = read_string!(ip, chunk);
+                let value = vm.peek(0);
+
+                instance.fields.set(name, value);
+
+                let value = vm.pop();
+                vm.pop();
+                vm.push(value);
             }
             x if x == OpCode::Equal as u8 => {
                 let b = vm.pop();
@@ -783,6 +837,11 @@ fn run(vm: &mut VM) -> InterpretResult {
                 chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
                 ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
                 slots = vm.frames[vm.frame_count - 1].slots;
+            }
+            x if x == OpCode::Class as u8 => {
+                let name = read_string!(ip, chunk);
+                let class = allocate_class(vm, name);
+                vm.push(Value::Obj(class as *mut Obj));
             }
             _ => {
                 println!("Unknown opcode {}", instruction);
