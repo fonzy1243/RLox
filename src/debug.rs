@@ -53,6 +53,16 @@ pub fn jump_instruction(name: &str, sign: isize, chunk: &Chunk, offset: usize) -
     offset + 3
 }
 
+pub fn invoke_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+    let constant = chunk.code[offset + 1] as usize;
+    let arg_count = chunk.code[offset + 2];
+    println!(
+        "{:-16} ({} args) {:4} '{}'",
+        name, arg_count, constant, chunk.constants[constant]
+    );
+    offset + 3
+}
+
 pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
     print!("{:04} ", offset);
 
@@ -118,6 +128,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         }
         x if x == OpCode::Loop as u8 => jump_instruction("OP_LOOP", -1, chunk, offset),
         x if x == OpCode::Call as u8 => byte_instruction("OP_CALL", chunk, offset),
+        x if x == OpCode::Invoke as u8 => invoke_instruction("OP_INVOKE", chunk, offset),
         x if x == OpCode::Closure as u8 => {
             let constant = chunk.code[offset + 1] as usize;
             let value = chunk.constants[constant];
@@ -144,6 +155,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         x if x == OpCode::CloseUpvalue as u8 => simple_instruction("OP_CLOSE_UPVALUE", offset),
         x if x == OpCode::Return as u8 => simple_instruction("OP_RETURN", offset),
         x if x == OpCode::Class as u8 => constant_instruction("OP_CLASS", chunk, offset),
+        x if x == OpCode::Method as u8 => constant_instruction("OP_METHOD", chunk, offset),
         _ => {
             println!("Unknown opcode {}", instruction);
             offset + 1

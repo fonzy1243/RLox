@@ -15,6 +15,7 @@ struct Parser<'a> {
     had_error: bool,
     panic_mode: bool,
     compiler: Compiler<'a>,
+    current_class: Option<Box<ClassCompiler>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -57,6 +58,8 @@ struct Upvalue {
 #[derive(Copy, Clone, PartialEq)]
 pub enum FunctionType {
     Function,
+    Initializer,
+    Method,
     Script,
 }
 
@@ -70,6 +73,10 @@ struct Compiler<'a> {
     scope_depth: i32,
     locals_map: HashMap<&'a str, Vec<usize>>,
     upvalues: Vec<Upvalue>,
+}
+
+struct ClassCompiler {
+    enclosing: Option<Box<ClassCompiler>>,
 }
 
 fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionType) {
@@ -107,8 +114,15 @@ fn init_compiler<'a>(parser: &mut Parser<'a>, vm: &mut VM, func_type: FunctionTy
     };
     new_compiler.locals[0].depth = 0;
     new_compiler.locals[0].is_captured = false;
-    new_compiler.locals[0].name.start = "";
-    new_compiler.locals[0].name.length = 0;
+
+    if func_type == FunctionType::Method || func_type == FunctionType::Initializer {
+        new_compiler.locals[0].name.start = "this";
+        new_compiler.locals[0].name.length = 4;
+        new_compiler.locals_map.entry("this").or_default().push(0);
+    } else {
+        new_compiler.locals[0].name.start = "";
+        new_compiler.locals[0].name.length = 0;
+    }
 
     let old_compiler = std::mem::replace(&mut parser.compiler, new_compiler);
     parser.compiler.enclosing = Some(Box::new(old_compiler));
@@ -184,6 +198,7 @@ pub fn compile(source: &str, vm: &mut VM) -> Option<*mut ObjFunction> {
         had_error: false,
         panic_mode: false,
         compiler,
+        current_class: None,
     };
 
     advance(&mut parser, &mut scanner);
@@ -317,6 +332,26 @@ fn function<'a>(
     }
 }
 
+fn method<'a>(parser: &mut Parser<'a>, scanner: &mut Scanner<'a>, chunk: &mut Chunk, vm: &mut VM) {
+    consume(
+        parser,
+        scanner,
+        TokenType::Identifier,
+        "Expect method name.",
+    );
+    let name = parser.previous;
+    let name_constant = identifier_constant(parser, chunk, vm, name);
+
+    let func_type = if &name.start[..name.length] == "init" {
+        FunctionType::Initializer
+    } else {
+        FunctionType::Method
+    };
+    function(parser, scanner, chunk, vm, func_type);
+
+    emit_bytes(parser, chunk, OpCode::Method as u8, name_constant as u8);
+}
+
 fn class_declaration<'a>(
     parser: &mut Parser<'a>,
     scanner: &mut Scanner<'a>,
@@ -331,18 +366,31 @@ fn class_declaration<'a>(
     emit_bytes(parser, chunk, OpCode::Class as u8, name_constant as u8);
     define_variable(parser, chunk, name_constant as u8);
 
+    let enclosing = parser.current_class.take();
+    parser.current_class = Some(Box::new(ClassCompiler { enclosing }));
+
+    named_variable(parser, scanner, chunk, vm, name_token, false);
+
     consume(
         parser,
         scanner,
         TokenType::LeftBrace,
         "Expect '{' before class body.",
     );
+    while !check(parser, TokenType::RightBrace) && !check(parser, TokenType::Eof) {
+        method(parser, scanner, chunk, vm);
+    }
     consume(
         parser,
         scanner,
         TokenType::RightBrace,
         "Expect '}' after class body.",
     );
+
+    emit_byte(parser, chunk, OpCode::Pop as u8);
+
+    let enclosing = parser.current_class.as_mut().unwrap().enclosing.take();
+    parser.current_class = enclosing;
 }
 
 fn fun_declaration<'a>(
@@ -667,6 +715,9 @@ fn return_statement<'a>(
     if match_token(parser, scanner, TokenType::Semicolon) {
         emit_return(parser, chunk);
     } else {
+        if parser.compiler.function_type == FunctionType::Initializer {
+            error(parser, "Can't return a value from an initializer.");
+        }
         expression(parser, scanner, chunk, vm);
         consume(
             parser,
@@ -841,7 +892,11 @@ fn emit_jump(parser: &mut Parser, chunk: &mut Chunk, instruction: u8) -> usize {
 }
 
 fn emit_return(parser: &Parser, chunk: &mut Chunk) {
-    emit_byte(parser, chunk, OpCode::Nil as u8);
+    if parser.compiler.function_type == FunctionType::Initializer {
+        emit_bytes(parser, chunk, OpCode::GetLocal as u8, 0);
+    } else {
+        emit_byte(parser, chunk, OpCode::Nil as u8);
+    }
     emit_byte(parser, chunk, OpCode::Return as u8);
 }
 
@@ -977,6 +1032,10 @@ fn dot<'a>(
             OpCode::SetProperty as u8,
             name_constant as u8,
         );
+    } else if match_token(parser, scanner, TokenType::LeftParen) {
+        let arg_count = argument_list(parser, scanner, chunk, vm);
+        emit_bytes(parser, chunk, OpCode::Invoke as u8, name_constant as u8);
+        emit_byte(parser, chunk, arg_count);
     } else {
         emit_bytes(
             parser,
@@ -1131,6 +1190,20 @@ fn variable<'a>(
 ) {
     let name = parser.previous;
     named_variable(parser, scanner, chunk, vm, name, can_assign);
+}
+
+fn this<'a>(
+    parser: &mut Parser<'a>,
+    scanner: &mut Scanner<'a>,
+    chunk: &mut Chunk,
+    vm: &mut VM,
+    _can_assign: bool,
+) {
+    if parser.current_class.is_none() {
+        error(parser, "Can't use 'this' outside of a class.");
+        return;
+    }
+    variable(parser, scanner, chunk, vm, false);
 }
 
 fn named_variable<'a>(
@@ -1566,6 +1639,11 @@ fn get_rule(token_type: TokenType) -> ParseRule {
             infix: Some(dot),
             precedence: Precedence::Call,
         },
+        TokenType::This => ParseRule {
+            prefix: Some(this),
+            infix: None,
+            precedence: Precedence::None,
+        },
         TokenType::False | TokenType::Nil | TokenType::True => ParseRule {
             prefix: Some(literal),
             infix: None,
@@ -1597,7 +1675,6 @@ fn get_rule(token_type: TokenType) -> ParseRule {
         | TokenType::Print
         | TokenType::Return
         | TokenType::Super
-        | TokenType::This
         | TokenType::Var
         | TokenType::While
         | TokenType::Error

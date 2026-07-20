@@ -3,10 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::compile;
 use crate::object::{
-    NativeFn, Obj, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList, ObjString, ObjType,
-    ObjUpvalue, allocate_class, allocate_closure, allocate_instance, allocate_list,
-    allocate_native, allocate_string, capture_upvalue, close_upvalues, copy_string, free_object,
-    take_string,
+    NativeFn, Obj, ObjBoundMethod, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList,
+    ObjString, ObjType, ObjUpvalue, allocate_bound_method, allocate_class, allocate_closure,
+    allocate_instance, allocate_list, allocate_native, allocate_string, capture_upvalue,
+    close_upvalues, copy_string, free_object, take_string,
 };
 use crate::table::Table;
 use crate::value::{Value, values_equal};
@@ -89,6 +89,7 @@ pub struct VM {
     pub gray_stack: Vec<*mut Obj>,
     pub bytes_allocated: usize,
     pub next_gc: usize,
+    pub init_string: *mut ObjString,
 }
 
 pub enum InterpretResult {
@@ -118,11 +119,14 @@ impl VM {
             gray_stack: Vec::new(),
             bytes_allocated: 0,
             next_gc: 1024 * 1024,
+            init_string: std::ptr::null_mut(),
         };
 
         vm.stack_top = vm.stack.as_mut_ptr();
 
         vm.define_native("clock", clock_native);
+        vm.init_string = copy_string(&mut vm, "init");
+
         vm
     }
 
@@ -186,12 +190,29 @@ impl VM {
     }
 
     fn call_value(&mut self, callee: Value, arg_count: usize) -> bool {
-        if callee.is_class() {
+        if callee.is_bound_method() {
+            let bound = unsafe { &*callee.as_bound_method() };
+            let receiver = bound.receiver;
+            let method = bound.method;
+            unsafe {
+                *self.stack_top.sub(arg_count + 1) = receiver;
+            }
+            return self.call(method, arg_count);
+        } else if callee.is_class() {
             let class = callee.as_class();
             let instance = allocate_instance(self, class);
             unsafe {
                 *self.stack_top.sub(arg_count + 1) = Value::Obj(instance as *mut Obj);
             }
+
+            let init_string = self.init_string;
+            if let Some(initializer) = unsafe { (*class).methods.get(init_string) } {
+                return self.call(initializer.as_closure(), arg_count);
+            } else if arg_count != 0 {
+                self.runtime_error(&format!("Expected 0 arguments but got {}.", arg_count));
+                return false;
+            }
+
             return true;
         } else if callee.is_closure() {
             return self.call(callee.as_closure(), arg_count);
@@ -260,6 +281,7 @@ impl VM {
 
 impl Drop for VM {
     fn drop(&mut self) {
+        self.init_string = std::ptr::null_mut();
         let mut object = self.objects;
         while !object.is_null() {
             unsafe {
@@ -358,9 +380,20 @@ fn blacken_object(vm: &mut VM, object: *mut Obj) {
                     mark_table(vm, &*fields_ptr);
                 }
             }
+            ObjType::BoundMethod => {
+                let bound = object as *mut ObjBoundMethod;
+                unsafe {
+                    mark_value(vm, (*bound).receiver);
+                    mark_object(vm, (*bound).method as *mut Obj);
+                }
+            }
             ObjType::Class => {
                 let class = object as *mut ObjClass;
-                mark_object(vm, unsafe { (*class).name as *mut Obj });
+                unsafe {
+                    mark_object(vm, (*class).name as *mut Obj);
+                    let methods_ptr = &(*class).methods as *const Table;
+                    mark_table(vm, &*methods_ptr);
+                }
             }
             ObjType::Closure => {
                 let closure = object as *mut ObjClosure;
@@ -425,6 +458,9 @@ fn mark_roots(vm: &mut VM) {
 
     // Mark compiler roots
     mark_compiler_roots(vm);
+
+    // Mark init string
+    mark_object(vm, vm.init_string as *mut Obj);
 }
 
 fn trace_references(vm: &mut VM) {
@@ -459,6 +495,71 @@ fn sweep(vm: &mut VM) {
     }
 }
 // -----------------
+
+// Methods ---------
+fn define_method(vm: &mut VM, name: *mut ObjString) {
+    let method = vm.peek(0);
+    let class = unsafe { &mut *vm.peek(1).as_class() };
+    class.methods.set(name, method);
+    vm.pop();
+}
+
+pub fn bind_method(vm: &mut VM, class: *mut ObjClass, name: *mut ObjString) -> bool {
+    let method = unsafe { (*class).methods.get(name) };
+
+    match method {
+        None => {
+            let name_str = unsafe { ObjString::as_str(name) };
+            vm.runtime_error(&format!("Undefined property '{}'.", name_str));
+            false
+        }
+        Some(method) => {
+            let receiver = vm.peek(0);
+            let bound = allocate_bound_method(vm, receiver, method.as_closure());
+            vm.pop();
+            vm.push(Value::Obj(bound as *mut Obj));
+            true
+        }
+    }
+}
+
+fn invoke_from_class(
+    vm: &mut VM,
+    class: *mut ObjClass,
+    name: *mut ObjString,
+    arg_count: usize,
+) -> bool {
+    let method = unsafe { (*class).methods.get(name) };
+    match method {
+        None => {
+            let name_str = unsafe { ObjString::as_str(name) };
+            vm.runtime_error(&format!("Undefined property '{}'.", name_str));
+            false
+        }
+        Some(method) => vm.call(method.as_closure(), arg_count),
+    }
+}
+
+fn invoke(vm: &mut VM, name: *mut ObjString, arg_count: usize) -> bool {
+    let receiver = vm.peek(arg_count);
+
+    if !receiver.is_instance() {
+        vm.runtime_error("Only instances have methods.");
+        return false;
+    }
+
+    let instance = receiver.as_instance();
+
+    if let Some(value) = unsafe { (*instance).fields.get(name) } {
+        unsafe {
+            *vm.stack_top.sub(arg_count + 1) = value;
+        }
+        return vm.call_value(value, arg_count);
+    }
+
+    invoke_from_class(vm, unsafe { (*instance).class }, name, arg_count)
+}
+// ---------------
 
 fn run(vm: &mut VM) -> InterpretResult {
     let mut chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
@@ -529,16 +630,17 @@ fn run(vm: &mut VM) -> InterpretResult {
                     return InterpretResult::RuntimeError;
                 }
 
-                let instance = unsafe { &*vm.peek(0).as_instance() };
+                let instance_ptr = vm.peek(0).as_instance();
                 let name = read_string!(ip, chunk);
 
-                if let Some(value) = instance.fields.get(name) {
+                if let Some(value) = unsafe { (*instance_ptr).fields.get(name) } {
                     vm.pop();
                     vm.push(value);
                 } else {
-                    let name_str = unsafe { ObjString::as_str(name) };
-                    vm.runtime_error(&format!("Undefined property '{}'.", name_str));
-                    return InterpretResult::RuntimeError;
+                    let class = unsafe { (*instance_ptr).class };
+                    if !bind_method(vm, class, name) {
+                        return InterpretResult::RuntimeError;
+                    }
                 }
             }
             x if x == OpCode::SetProperty as u8 => {
@@ -793,6 +895,22 @@ fn run(vm: &mut VM) -> InterpretResult {
                 ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
                 slots = vm.frames[vm.frame_count - 1].slots;
             }
+            x if x == OpCode::Invoke as u8 => {
+                let method = read_string!(ip, chunk);
+                let arg_count = unsafe { *ip } as usize;
+                ip = unsafe { ip.add(1) };
+
+                let final_offset = unsafe { ip.offset_from(chunk.code.as_ptr()) } as usize;
+                vm.frames[vm.frame_count - 1].ip = final_offset;
+
+                if !invoke(vm, method, arg_count) {
+                    return InterpretResult::RuntimeError;
+                }
+
+                chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
+                ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
+                slots = vm.frames[vm.frame_count - 1].slots;
+            }
             x if x == OpCode::Closure as u8 => {
                 let function_val = read_constant!(ip, chunk);
                 let function_ptr = function_val.as_function();
@@ -842,6 +960,10 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let name = read_string!(ip, chunk);
                 let class = allocate_class(vm, name);
                 vm.push(Value::Obj(class as *mut Obj));
+            }
+            x if x == OpCode::Method as u8 => {
+                let name = read_string!(ip, chunk);
+                define_method(vm, name);
             }
             _ => {
                 println!("Unknown opcode {}", instruction);

@@ -1,5 +1,6 @@
 use crate::object::{
-    Obj, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList, ObjNative, ObjString, ObjType,
+    Obj, ObjBoundMethod, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjList, ObjNative,
+    ObjString, ObjType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,6 +57,9 @@ impl Value {
     pub fn is_native(&self) -> bool {
         self.is_obj_type(ObjType::Native)
     }
+    pub fn is_bound_method(&self) -> bool {
+        self.is_obj_type(ObjType::BoundMethod)
+    }
     pub fn is_class(&self) -> bool {
         self.is_obj_type(ObjType::Class)
     }
@@ -110,6 +114,12 @@ impl Value {
         match self {
             Value::Obj(ptr) => *ptr as *mut ObjNative,
             _ => panic!("Value is not a native function"),
+        }
+    }
+    pub fn as_bound_method(&self) -> *mut ObjBoundMethod {
+        match self {
+            Value::Obj(ptr) => *ptr as *mut ObjBoundMethod,
+            _ => panic!("Value is not a bound method"),
         }
     }
     pub fn as_class(&self) -> *mut ObjClass {

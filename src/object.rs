@@ -12,6 +12,7 @@ use crate::{table::Table, value::Value};
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ObjType {
+    BoundMethod,
     Class,
     Closure,
     Function,
@@ -72,6 +73,7 @@ pub struct ObjClosure {
 pub struct ObjClass {
     pub obj: Obj,
     pub name: *mut ObjString,
+    pub methods: Table,
 }
 
 #[repr(C)]
@@ -79,6 +81,13 @@ pub struct ObjInstance {
     pub obj: Obj,
     pub class: *mut ObjClass,
     pub fields: Table,
+}
+
+#[repr(C)]
+pub struct ObjBoundMethod {
+    pub obj: Obj,
+    pub receiver: Value,
+    pub method: *mut ObjClosure,
 }
 
 #[repr(C)]
@@ -108,6 +117,15 @@ impl ObjString {
 impl fmt::Display for Obj {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.obj_type {
+            ObjType::BoundMethod => {
+                let bound = unsafe { &*(self as *const Obj as *const ObjBoundMethod) };
+                let function = unsafe { &*(*bound.method).function };
+                if function.name.is_null() {
+                    write!(f, "<script>")
+                } else {
+                    write!(f, "<fn {}>", ObjString::as_str(function.name))
+                }
+            }
             ObjType::Class => {
                 let class = unsafe { &*(self as *const Obj as *const ObjClass) };
                 let name = ObjString::as_str(class.name);
@@ -185,6 +203,41 @@ fn allocate_object<T>(vm: &mut VM, object: T) -> *mut T {
 }
 */
 
+pub fn allocate_bound_method(
+    vm: &mut VM,
+    receiver: Value,
+    method: *mut ObjClosure,
+) -> *mut ObjBoundMethod {
+    let bound = ObjBoundMethod {
+        obj: Obj {
+            obj_type: ObjType::BoundMethod,
+            is_marked: false,
+            next: vm.objects,
+        },
+        receiver,
+        method,
+    };
+
+    let ptr = Box::into_raw(Box::new(bound));
+    vm.objects = ptr as *mut Obj;
+
+    #[cfg(feature = "debug_stress_gc")]
+    collect_garbage(vm);
+
+    #[cfg(feature = "debug_log_gc")]
+    unsafe {
+        println!("{:p} allocate for {:?}", ptr, (*ptr).obj.obj_type);
+    }
+
+    vm.bytes_allocated += std::mem::size_of::<ObjBoundMethod>();
+
+    if vm.bytes_allocated > vm.next_gc {
+        collect_garbage(vm);
+    }
+
+    ptr
+}
+
 pub fn allocate_closure(vm: &mut VM, function: *mut ObjFunction) -> *mut ObjClosure {
     let upvalue_count = unsafe { (*function).upvalue_count };
     let upvalues = vec![std::ptr::null_mut(); upvalue_count].into_boxed_slice();
@@ -228,6 +281,7 @@ pub fn allocate_class(vm: &mut VM, name: *mut ObjString) -> *mut ObjClass {
             next: vm.objects,
         },
         name,
+        methods: Table::new(),
     };
 
     let ptr = Box::into_raw(Box::new(class));
@@ -529,6 +583,10 @@ pub fn free_object(vm: &mut VM, object: *mut Obj) {
 
     unsafe {
         match (*object).obj_type {
+            ObjType::BoundMethod => {
+                vm.bytes_allocated -= std::mem::size_of::<ObjBoundMethod>();
+                let _ = Box::from_raw(object as *mut ObjBoundMethod);
+            }
             ObjType::Class => {
                 vm.bytes_allocated -= std::mem::size_of::<ObjClass>();
                 let _ = Box::from_raw(object as *mut ObjClass);
