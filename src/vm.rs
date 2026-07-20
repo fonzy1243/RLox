@@ -559,6 +559,75 @@ fn invoke(vm: &mut VM, name: *mut ObjString, arg_count: usize) -> bool {
 
     invoke_from_class(vm, unsafe { (*instance).class }, name, arg_count)
 }
+
+fn call_list_method(vm: &mut VM, list_ptr: *mut ObjList, name: &str, arg_count: usize) -> bool {
+    match name {
+        "append" => {
+            if arg_count != 1 {
+                vm.runtime_error("append() takes 1 argument.");
+                return false;
+            }
+            let value = vm.pop();
+            vm.pop();
+            unsafe {
+                (*list_ptr).items.push(value);
+            }
+            vm.push(Value::Nil);
+            true
+        }
+        "pop" => {
+            if arg_count != 0 {
+                vm.runtime_error("pop() takes 0 arguments.");
+                return false;
+            }
+            vm.pop();
+            let result = unsafe { (*list_ptr).items.pop().unwrap_or(Value::Nil) };
+            vm.push(result);
+            true
+        }
+        "len" => {
+            if arg_count != 0 {
+                vm.runtime_error("len() takes 0 arguments.");
+                return false;
+            }
+            vm.pop();
+            let len = unsafe { (*list_ptr).items.len() };
+            vm.push(Value::Number(len as f64));
+            true
+        }
+        "delete" => {
+            if arg_count != 1 {
+                vm.runtime_error("delete() takes 1 argument.");
+                return false;
+            }
+            let index_val = vm.pop();
+            vm.pop();
+            if !index_val.is_number() {
+                vm.runtime_error("delete() index must be a number.");
+                return false;
+            }
+            let list = unsafe { &mut *list_ptr };
+            let raw = index_val.as_number() as isize;
+            let index = if raw < 0 {
+                (list.items.len() as isize + raw) as usize
+            } else {
+                raw as usize
+            };
+            if index >= list.items.len() {
+                vm.runtime_error("List index out of bounds.");
+                return false;
+            }
+            list.items.remove(index);
+            vm.push(Value::Nil);
+            true
+        }
+        _ => {
+            let msg = format!("List has no method '{}'.", name);
+            vm.runtime_error(&msg);
+            false
+        }
+    }
+}
 // ---------------
 
 fn run(vm: &mut VM) -> InterpretResult {
@@ -681,6 +750,15 @@ fn run(vm: &mut VM) -> InterpretResult {
                     let b = vm.pop().as_number();
                     let a = vm.pop().as_number();
                     vm.push(Value::Number(a + b));
+                } else if vm.peek(0).is_list() && vm.peek(1).is_list() {
+                    let b_items = unsafe { (*vm.peek(0).as_list()).items.clone() };
+                    let a_items = unsafe { (*vm.peek(1).as_list()).items.clone() };
+                    vm.pop();
+                    vm.pop();
+                    let mut combined = a_items;
+                    combined.extend(b_items);
+                    let result = allocate_list(vm, combined);
+                    vm.push(Value::Obj(result as *mut Obj));
                 } else {
                     vm.frames[vm.frame_count - 1].ip = current_offset + 1;
                     vm.runtime_error("Operands must be two numbers or two strings.");
@@ -688,7 +766,21 @@ fn run(vm: &mut VM) -> InterpretResult {
                 }
             }
             x if x == OpCode::Subtract as u8 => binary_op!(vm, ip, chunk, Value::Number, -),
-            x if x == OpCode::Multiply as u8 => binary_op!(vm, ip, chunk, Value::Number, *),
+            x if x == OpCode::Multiply as u8 => {
+                if vm.peek(0).is_number() && vm.peek(1).is_list() {
+                    let count = vm.pop().as_number() as usize;
+                    let list_ptr = vm.pop().as_list();
+                    let items = unsafe { (*list_ptr).items.clone() };
+                    let mut repeated = Vec::with_capacity(items.len() * count);
+                    for _ in 0..count {
+                        repeated.extend_from_slice(&items);
+                    }
+                    let result = allocate_list(vm, repeated);
+                    vm.push(Value::Obj(result as *mut Obj));
+                } else {
+                    binary_op!(vm, ip, chunk, Value::Number, *)
+                }
+            }
             x if x == OpCode::Divide as u8 => binary_op!(vm, ip, chunk, Value::Number, /),
             x if x == OpCode::IntDivide as u8 => {
                 if !vm.peek(0).is_number() || !vm.peek(1).is_number() {
@@ -825,7 +917,12 @@ fn run(vm: &mut VM) -> InterpretResult {
                 }
 
                 let list = unsafe { &*list_val.as_list() };
-                let index = index_val.as_number() as usize;
+                let raw = index_val.as_number() as isize;
+                let index = if raw < 0 {
+                    (list.items.len() as isize + raw) as usize
+                } else {
+                    raw as usize
+                };
 
                 if index >= list.items.len() {
                     vm.frames[vm.frame_count - 1].ip = current_offset + 1;
@@ -852,7 +949,12 @@ fn run(vm: &mut VM) -> InterpretResult {
                 }
 
                 let list = unsafe { &mut *list_val.as_list() };
-                let index = index_val.as_number() as usize;
+                let raw = index_val.as_number() as isize;
+                let index = if raw < 0 {
+                    (list.items.len() as isize + raw) as usize
+                } else {
+                    raw as usize
+                };
 
                 if index >= list.items.len() {
                     vm.frames[vm.frame_count - 1].ip = current_offset + 1;
@@ -911,13 +1013,22 @@ fn run(vm: &mut VM) -> InterpretResult {
                 let final_offset = unsafe { ip.offset_from(chunk.code.as_ptr()) } as usize;
                 vm.frames[vm.frame_count - 1].ip = final_offset;
 
-                if !invoke(vm, method, arg_count) {
-                    return InterpretResult::RuntimeError;
-                }
+                let receiver = vm.peek(arg_count);
+                if receiver.is_list() {
+                    let list_ptr = receiver.as_list();
+                    let name = unsafe { ObjString::as_str(method) };
+                    if !call_list_method(vm, list_ptr, name, arg_count) {
+                        return InterpretResult::RuntimeError;
+                    }
+                } else {
+                    if !invoke(vm, method, arg_count) {
+                        return InterpretResult::RuntimeError;
+                    }
 
-                chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
-                ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
-                slots = vm.frames[vm.frame_count - 1].slots;
+                    chunk = unsafe { &(*(*vm.frames[vm.frame_count - 1].closure).function).chunk };
+                    ip = unsafe { chunk.code.as_ptr().add(vm.frames[vm.frame_count - 1].ip) };
+                    slots = vm.frames[vm.frame_count - 1].slots;
+                }
             }
             x if x == OpCode::SuperInvoke as u8 => {
                 let method = read_string!(ip, chunk);
