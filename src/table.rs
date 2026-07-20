@@ -3,7 +3,7 @@ use std::alloc::{Layout, dealloc};
 use crate::object::ObjString;
 use crate::value::Value;
 
-const TABLE_MAX_LOAD: f64 = 0.75; // TODO: Benchmark best max load
+const TABLE_MAX_LOAD: f64 = 0.85; // TODO: Benchmark best max load
 
 #[derive(Clone, Copy)]
 pub struct Entry {
@@ -115,7 +115,7 @@ impl Table {
             return None;
         }
 
-        let mut index = (hash as usize) % self.capacity;
+        let mut index = (hash as usize) & (self.capacity - 1);
 
         loop {
             let entry = unsafe { self.entries.add(index) };
@@ -135,7 +135,7 @@ impl Table {
                 }
             }
 
-            index = (index + 1) % self.capacity;
+            index = (index + 1) & (self.capacity - 1);
         }
     }
 
@@ -204,7 +204,7 @@ impl Drop for Table {
 
 fn find_entry(entries: *mut Entry, capacity: usize, key: *mut ObjString) -> *mut Entry {
     let hash = unsafe { (*key).hash };
-    let mut index = (hash as usize) % capacity;
+    let mut index = (hash as usize) & (capacity - 1);
     let mut tombstone: *mut Entry = std::ptr::null_mut();
 
     loop {
@@ -229,6 +229,6 @@ fn find_entry(entries: *mut Entry, capacity: usize, key: *mut ObjString) -> *mut
             return entry;
         }
 
-        index = (index + 1) % capacity;
+        index = (index + 1) & (capacity - 1);
     }
 }
